@@ -28,6 +28,7 @@ import {
   ContainerOutput,
   runContainerAgent,
   runHostAgent,
+  runAgentWithModelFallback,
   willClearSessionOnProviderSwitch,
   writeGroupsSnapshot,
   writeTasksSnapshot,
@@ -4752,7 +4753,8 @@ async function runAgent(
     let output: ContainerOutput;
 
     if (executionMode === 'host') {
-      output = await runHostAgent(
+      output = await runAgentWithModelFallback(
+        runHostAgent,
         group,
         {
           prompt,
@@ -4772,7 +4774,8 @@ async function runAgent(
         ownerHomeFolder,
       );
     } else {
-      output = await runContainerAgent(
+      output = await runAgentWithModelFallback(
+        runContainerAgent,
         group,
         {
           prompt,
@@ -7709,7 +7712,8 @@ async function processAgentConversation(
 
     let output: ContainerOutput;
     if (executionMode === 'host') {
-      output = await runHostAgent(
+      output = await runAgentWithModelFallback(
+        runHostAgent,
         effectiveGroup,
         containerInput,
         onProcessCb,
@@ -7717,7 +7721,8 @@ async function processAgentConversation(
         ownerHomeFolder,
       );
     } else {
-      output = await runContainerAgent(
+      output = await runAgentWithModelFallback(
+        runContainerAgent,
         effectiveGroup,
         containerInput,
         onProcessCb,

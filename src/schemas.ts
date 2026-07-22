@@ -289,6 +289,7 @@ export const SystemSettingsSchema = z.object({
     )
     .optional(),
   subagentModel: z.string().min(1).max(64).optional(),
+  fallbackModel: z.string().max(64).optional(),
   disableMemoryLayerForAdminHost: z.boolean().optional(),
   pluginAutoScan: z.boolean().optional(),
   taskBackfillGraceMs: z

@@ -15,6 +15,7 @@ import {
   ContainerOutput,
   runContainerAgent,
   runHostAgent,
+  runAgentWithModelFallback,
   writeTasksSnapshot,
 } from './container-runner.js';
 import {
@@ -616,7 +617,8 @@ async function runTaskInner(
       ? getUserHomeGroup(workspaceGroup.created_by)?.folder || workspace.folder
       : workspace.folder;
 
-    const output = await runAgent(
+    const output = await runAgentWithModelFallback(
+      runAgent,
       workspaceGroup,
       {
         prompt: task.prompt,

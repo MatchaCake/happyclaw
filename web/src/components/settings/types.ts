@@ -105,6 +105,7 @@ export interface SystemSettings {
   externalClaudeDir: string;
   autoCompactWindow: number;
   subagentModel: string;
+  fallbackModel: string;
   disableMemoryLayerForAdminHost: boolean;
   pluginAutoScan: boolean;
   taskBackfillGraceMs: number;

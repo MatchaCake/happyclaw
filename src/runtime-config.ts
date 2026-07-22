@@ -3682,6 +3682,11 @@ export interface SystemSettings {
   // 预定义 SubAgent（code-reviewer / web-researcher）使用的模型别名或完整 ID。
   // 经 SUBAGENT_MODEL 注入容器；默认 inherit（继承主会话模型，不擅自改变），可在设置页改。
   subagentModel: string;
+  // 撞额度墙自动切模型：主模型在一轮里返回账号用量上限通知（如「You've reached
+  // your Fable 5 limit」）时，用该模型（别名或完整 ID）在同一轮无缝重跑一次。
+  // 空 = 关闭（保留原行为：把上限通知直接回给用户）。同账号切不同模型有独立额度桶，
+  // 因此 fable→opus 这类回退在同一 OAuth 账号内也能生效。
+  fallbackModel: string;
   // 关闭 admin host 模式下 HappyClaw 自带的 memory 注入层（MCP 工具、模板 CLAUDE.md、WORKSPACE_GLOBAL/MEMORY env）
   // 启用后 admin 可以在 host 模式下完全按原生 Claude Code 的 Playbook 使用 ~/.claude/ 下的 memory/skills/rules
   disableMemoryLayerForAdminHost: boolean;
@@ -3722,6 +3727,7 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   externalClaudeDir: '',
   autoCompactWindow: 0,
   subagentModel: 'inherit',
+  fallbackModel: '',
   disableMemoryLayerForAdminHost: false,
   pluginAutoScan: true,
   taskBackfillGraceMs: 300000,
@@ -3827,6 +3833,12 @@ function readSystemSettingsFromFile(): SystemSettings | null {
       typeof raw.subagentModel === 'string' && raw.subagentModel.trim()
         ? raw.subagentModel.trim()
         : DEFAULT_SYSTEM_SETTINGS.subagentModel,
+    fallbackModel:
+      typeof raw.fallbackModel === 'string' && raw.fallbackModel.trim()
+        ? raw.fallbackModel.trim().slice(0, 64)
+        : process.env.FALLBACK_MODEL?.trim()
+          ? process.env.FALLBACK_MODEL.trim().slice(0, 64)
+          : DEFAULT_SYSTEM_SETTINGS.fallbackModel,
     disableMemoryLayerForAdminHost:
       typeof raw.disableMemoryLayerForAdminHost === 'boolean'
         ? raw.disableMemoryLayerForAdminHost
@@ -3905,6 +3917,9 @@ function buildEnvFallbackSettings(): SystemSettings {
     ),
     subagentModel:
       process.env.SUBAGENT_MODEL || DEFAULT_SYSTEM_SETTINGS.subagentModel,
+    fallbackModel:
+      process.env.FALLBACK_MODEL?.trim() ||
+      DEFAULT_SYSTEM_SETTINGS.fallbackModel,
     disableMemoryLayerForAdminHost:
       process.env.DISABLE_MEMORY_LAYER_FOR_ADMIN_HOST === 'true' ||
       DEFAULT_SYSTEM_SETTINGS.disableMemoryLayerForAdminHost,
@@ -4011,6 +4026,12 @@ export function saveSystemSettings(
   } else {
     merged.subagentModel = merged.subagentModel.trim().slice(0, 64);
   }
+
+  // fallbackModel: 空字符串合法（= 关闭撞墙自动切模型），仅去空白并限长。
+  merged.fallbackModel =
+    typeof merged.fallbackModel === 'string'
+      ? merged.fallbackModel.trim().slice(0, 64)
+      : DEFAULT_SYSTEM_SETTINGS.fallbackModel;
 
   // taskBackfillGraceMs: 0 = 关闭（旧行为：无视逾期全 backfill）；
   // >0 限制在 [1s, 24h]，避免误配置成几毫秒导致正常任务也被跳过。

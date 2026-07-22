@@ -169,6 +169,7 @@ export function SystemSettingsSection() {
   const [disableMemoryLayerForAdminHost, setDisableMemoryLayerForAdminHost] = useState(false);
   const [pluginAutoScan, setPluginAutoScan] = useState<boolean>(true);
   const [subagentModel, setSubagentModel] = useState('inherit');
+  const [fallbackModel, setFallbackModel] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
@@ -197,6 +198,7 @@ export function SystemSettingsSection() {
         setDisableMemoryLayerForAdminHost(data.disableMemoryLayerForAdminHost ?? false);
         setPluginAutoScan(data.pluginAutoScan ?? true);
         setSubagentModel(data.subagentModel ?? 'inherit');
+        setFallbackModel(data.fallbackModel ?? '');
       } catch (err) {
         toast.error(getErrorMessage(err, '加载系统参数失败'));
       } finally {
@@ -245,6 +247,7 @@ export function SystemSettingsSection() {
         disableMemoryLayerForAdminHost,
         pluginAutoScan,
         subagentModel,
+        fallbackModel: fallbackModel.trim(),
       };
       for (const f of fields) {
         const val = displayValues[f.key];
@@ -267,6 +270,7 @@ export function SystemSettingsSection() {
       setDisableMemoryLayerForAdminHost(data.disableMemoryLayerForAdminHost ?? false);
       setPluginAutoScan(data.pluginAutoScan ?? true);
       setSubagentModel(data.subagentModel ?? 'inherit');
+      setFallbackModel(data.fallbackModel ?? '');
       // 刷新计费状态，更新导航栏可见性
       loadBillingStatus();
       toast.success('系统参数已保存，新参数将对后续启动的容器/进程生效');
@@ -342,6 +346,21 @@ export function SystemSettingsSection() {
           </select>
           <p className="text-xs text-muted-foreground mt-1">
             预定义 SubAgent（代码审查 / 网页调研）使用的模型。默认 inherit（继承主会话模型，与原行为一致）；想给子任务单独指定更便宜/更强的模型时再改。第三方 provider 用别名需配 ANTHROPIC_DEFAULT_* 映射。仅在主 Agent 委派任务时生效。
+          </p>
+        </div>
+
+        {/* 撞额度墙自动切模型（字符串型） */}
+        <div>
+          <Label className="mb-1">额度墙回退模型</Label>
+          <Input
+            type="text"
+            value={fallbackModel}
+            onChange={(e) => setFallbackModel(e.target.value)}
+            placeholder="留空 = 关闭（如 opus / claude-opus-4-8）"
+            className="max-w-64"
+          />
+          <p className="text-xs text-muted-foreground mt-1">
+            主模型在一轮里撞到账号用量上限（如「You've reached your Fable 5 limit」）时，用该模型在同一轮无缝重跑一次，上限通知不外发给用户。填模型别名或完整 ID（如 <code>opus</code>、<code>claude-opus-4-8</code>）。留空关闭，保留原行为。同一 OAuth 账号下不同模型有独立额度桶，因此 fable→opus 这类回退无需额外配置第二个 provider。
           </p>
         </div>
       </div>
