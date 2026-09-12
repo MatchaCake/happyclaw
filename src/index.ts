@@ -20052,7 +20052,9 @@ function handleCardInterrupt(
 
   const session = getStreamingSession(chatJid);
   if (session?.isActive()) {
-    session.abort('已停止').catch((err) => {
+    // Let the callback acknowledge immediately; the session preserves the
+    // generated answer and exclusively owns the asynchronous card finalization.
+    void session.abort('已停止').catch((err) => {
       logger.debug({ err, chatJid }, 'Failed to abort streaming card');
     });
   }

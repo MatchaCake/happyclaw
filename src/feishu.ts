@@ -4125,6 +4125,17 @@ export function createFeishuConnection(
                 return;
               }
               result = connectOptions?.onCardInterrupt?.(chatJid, operatorImId);
+              // The active streaming session owns its terminal card update.
+              // Replacing this card with a follow-up receipt would erase the
+              // generated answer and race the session's CardKit finalization.
+              // Return promptly so Feishu can release the interaction lock.
+              if (!result) return;
+              return {
+                toast: {
+                  type: result.ok ? 'success' : 'warning',
+                  content: result.message,
+                },
+              };
             } else if (
               action === 'steer_queued' ||
               action === 'cancel_queued' ||
