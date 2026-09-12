@@ -5,6 +5,8 @@
  */
 
 import { optimizeMarkdownStyle } from '../feishu-markdown-style.js';
+import { CARDKIT_MARKDOWN_MAX_CHARS } from './capacity.js';
+import { splitCardPages } from './pagination.js';
 import type { AgentCardInput, CardMeta, FeishuCardV2 } from './types.js';
 import {
   buildHeader,
@@ -25,6 +27,21 @@ export const STREAMING_CONFIG = {
   print_step: { default: 2, android: 3, ios: 4, pc: 5 },
   print_strategy: 'fast' as const,
 };
+
+/** Several live content slots can share one card without exceeding the
+ * per-content-update character limit. Keep the first established ID stable. */
+export function buildStreamingContentElements(text: string) {
+  return splitCardPages(text, { maxChars: CARDKIT_MARKDOWN_MAX_CHARS }).map(
+    (page, index) => ({
+      tag: 'markdown' as const,
+      content: page.text,
+      element_id:
+        index === 0
+          ? CARD_ELEMENT_IDS.MAIN_CONTENT
+          : `${CARD_ELEMENT_IDS.MAIN_CONTENT}_${index}`,
+    }),
+  );
+}
 
 export function buildAgentReplyCard(input: AgentCardInput): FeishuCardV2 {
   // Apply Feishu-friendly markdown transformation once, up front.
@@ -143,11 +160,7 @@ export function buildStreamingAgentCard(
     meta: opts.meta ? { model: opts.meta.model } : undefined,
   });
 
-  const mainContentEl = {
-    tag: 'markdown',
-    content: visibleInitialText,
-    element_id: CARD_ELEMENT_IDS.MAIN_CONTENT,
-  };
+  const mainContentElements = buildStreamingContentElements(visibleInitialText);
   const interruptBtn = {
     tag: 'button',
     text: { tag: 'plain_text', content: '⏹ 停止回复' },
@@ -186,7 +199,7 @@ export function buildStreamingAgentCard(
             element_id: CARD_ELEMENT_IDS.AUX_BEFORE,
             text_size: 'notation',
           },
-          mainContentEl,
+          ...mainContentElements,
           {
             tag: 'markdown',
             content: '',
@@ -225,7 +238,7 @@ export function buildStreamingAgentCard(
       vertical_spacing: 'medium',
       elements: [
         ...buildStreamingPanels(panelsInit),
-        mainContentEl,
+        ...mainContentElements,
         ...buildStreamingDetails(panelsInit),
         interruptBtn,
         footerNote,

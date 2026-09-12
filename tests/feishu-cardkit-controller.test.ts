@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import {
   CARD_ELEMENT_IDS,
@@ -8,6 +9,10 @@ import {
   streamingCardSnapshotText,
   resolveInterruptedStreamingCardRewrite,
 } from '../src/feishu-streaming-card.js';
+import {
+  CARDKIT_JSON_MAX_BYTES,
+  CARDKIT_MARKDOWN_MAX_CHARS,
+} from '../src/feishu-cards/capacity.js';
 import { finalizeChannelCardAfterDelivery } from '../src/channel-card-finalization.js';
 
 function makeClient() {
@@ -299,7 +304,7 @@ describe('Feishu CardKit streaming controller', () => {
       client: mock.client as any,
       chatId: 'oc_long',
     });
-    const full = `\`\`\`typescript\n${'const value = 1;\n'.repeat(2500)}\`\`\``;
+    const full = `\`\`\`typescript\n${'const value = 1;\n'.repeat(25000)}\`\`\``;
     controller.append(full);
     await vi.waitFor(() => expect(controller.currentState).toBe('streaming'));
 
@@ -308,7 +313,9 @@ describe('Feishu CardKit streaming controller', () => {
       initialCard,
       CARD_ELEMENT_IDS.MAIN_CONTENT,
     )!;
-    expect(main.length).toBeLessThanOrEqual(30000);
+    expect(Array.from(main).length).toBeLessThanOrEqual(
+      CARDKIT_MARKDOWN_MAX_CHARS,
+    );
     expect(main).toMatch(/```\n?$/);
     await (controller as any).nativePageChain;
     expect(mock.cardCreate.mock.calls.length).toBeGreaterThan(1);
@@ -320,7 +327,9 @@ describe('Feishu CardKit streaming controller', () => {
       findElementContent(tailCard, CARD_ELEMENT_IDS.MAIN_CONTENT),
     ).toContain('const value = 1;');
     for (const call of mock.cardCreate.mock.calls) {
-      expect(Buffer.byteLength(call[0].data.data)).toBeLessThan(25 * 1024);
+      expect(Buffer.byteLength(call[0].data.data)).toBeLessThan(
+        CARDKIT_JSON_MAX_BYTES,
+      );
     }
     expect((controller as any).accumulatedText).toBe(full);
     controller.dispose();
@@ -709,10 +718,7 @@ describe('Feishu CardKit streaming controller', () => {
     },
   );
 
-  // Regression: finalize enters the split branch on raw text length as well as
-  // on card JSON size, and splitOnFinalize can still emit a SINGLE group. The
-  // tail is then the reused streaming card rather than a continuation card.
-  test('a reply crossing the page budget patches usage on its current tail', async () => {
+  test('a 15K reply remains one card and patches usage in place', async () => {
     const mock = makeClient();
     const controller = new StreamingCardController({
       client: mock.client as any,
@@ -735,7 +741,7 @@ describe('Feishu CardKit streaming controller', () => {
 
     await controller.complete(body);
     expect(controller.currentState).toBe('completed');
-    expect((controller as any).nativeCards.length).toBeGreaterThan(1);
+    expect((controller as any).nativeCards.length).toBe(1);
 
     mock.cardUpdate.mockClear();
     mock.batchUpdate.mockClear();
@@ -797,7 +803,7 @@ describe('Feishu CardKit streaming controller', () => {
       chatId: 'oc_split_race',
     });
     const body = Array.from(
-      { length: 40 },
+      { length: 900 },
       (_, i) => `paragraph ${i} ${'a'.repeat(370)}`,
     ).join('\n\n');
     controller.append(body);
@@ -834,7 +840,7 @@ describe('Feishu CardKit streaming controller', () => {
       chatId: 'oc_split_groups',
     });
     const body = Array.from(
-      { length: 60 },
+      { length: 900 },
       (_, i) => `block ${i} ${'b'.repeat(400)}`,
     ).join('\n\n');
     expect(Buffer.byteLength(body, 'utf-8')).toBeGreaterThan(16 * 1024);
@@ -1017,7 +1023,7 @@ describe('Feishu CardKit streaming controller', () => {
     controller.dispose();
   });
 
-  test('final pages preserve a 12.5K paragraph reply and revised text removes stale pages', async () => {
+  test('a 12.5K reply remains one card and oversized revised text removes stale pages', async () => {
     const mock = makeClient();
     const snapshots: any[] = [];
     const controller = new StreamingCardController({
@@ -1030,12 +1036,10 @@ describe('Feishu CardKit streaming controller', () => {
     controller.append(text);
     await vi.waitFor(() => expect(controller.currentState).toBe('streaming'));
     await (controller as any).nativePageChain;
-    expect((controller as any).nativeCards.length).toBeGreaterThan(1);
+    expect((controller as any).nativeCards.length).toBe(1);
     const activeSnapshot = snapshots.at(-1).snapshot;
     expect(activeSnapshot.text).toBe(text);
-    expect(streamingCardSnapshotText(activeSnapshot).length).toBeLessThan(
-      text.length,
-    );
+    expect(streamingCardSnapshotText(activeSnapshot)).toBe(text);
 
     await controller.complete(text);
     const lastPerCard = new Map<string, any>();
@@ -1060,7 +1064,7 @@ describe('Feishu CardKit streaming controller', () => {
       client: mock.client as any,
       chatId: 'oc_retraction',
     });
-    second.append(text);
+    second.append(text.repeat(30));
     await vi.waitFor(() => expect(second.currentState).toBe('streaming'));
     await (second as any).nativePageChain;
     const createdCount = mock.cardCreate.mock.calls.length;
@@ -1107,7 +1111,7 @@ describe('Feishu CardKit streaming controller', () => {
       });
       controller.append('初始正文');
       await vi.waitFor(() => expect(controller.currentState).toBe('streaming'));
-      const full = '续页正文。'.repeat(1800);
+      const full = '续页正文。'.repeat(24000);
       controller.append(full);
       await started;
       const ending = (
@@ -1175,6 +1179,366 @@ describe('Feishu CardKit streaming controller', () => {
           ? (controller as any).multiCard.getVisibleText(full)
           : full;
       expect(streamingCardSnapshotText(snapshot)).toBe(expected.trim());
+      controller.dispose();
+    },
+  );
+
+  test('a 40K live reply streams every character on one card and finalizes in place', async () => {
+    const { controller, elementContent, cardCreate, cardUpdate } =
+      await createThinkingController();
+    const text = '完整正文'.repeat(10000);
+    controller.append(text);
+    await vi.waitFor(() =>
+      expect(
+        elementContent.mock.calls.some(
+          ([request]) => request.data.content === text,
+        ),
+      ).toBe(true),
+    );
+    await (controller as any).nativePageChain;
+    expect(cardCreate).toHaveBeenCalledOnce();
+    await controller.complete(text);
+    expect(cardCreate).toHaveBeenCalledOnce();
+    const final = JSON.parse(cardUpdate.mock.calls.at(-1)![0].data.card.data);
+    const contents = final.body.elements
+      .filter((element: any) => element.tag === 'markdown')
+      .map((element: any) => element.content)
+      .join('');
+    expect(contents).toContain(text);
+    expect(contents).not.toContain('完成后将展示完整结果');
+    controller.dispose();
+  });
+
+  test.each(['create', 'content', 'final'] as const)(
+    'definite hidden-render capacity rejection during %s reduces pages without losing or resending visible text',
+    async (phase) => {
+      const mock = makeClient();
+      const originalCreate = mock.cardCreate.getMockImplementation()!;
+      const text = 'a'.repeat(90000);
+      const rejected = { code: 200860, msg: 'card exceeds rendered capacity' };
+      const bodySize = (card: any) =>
+        card.body.elements
+          .filter(
+            (element: any) =>
+              element.tag === 'markdown' &&
+              (!element.element_id ||
+                element.element_id === CARD_ELEMENT_IDS.MAIN_CONTENT ||
+                element.element_id.startsWith('body_')),
+          )
+          .reduce(
+            (sum: number, element: any) => sum + element.content.length,
+            0,
+          );
+      let rejections = 0;
+      const tooLarge = (length: number) => {
+        if (length <= 65000) return false;
+        rejections++;
+        return true;
+      };
+      if (phase === 'create')
+        mock.cardCreate.mockImplementation(async (request) =>
+          tooLarge(bodySize(JSON.parse(request.data.data)))
+            ? rejected
+            : originalCreate(request),
+        );
+      if (phase === 'content')
+        mock.elementContent.mockImplementation(async (request) =>
+          request.path.element_id === CARD_ELEMENT_IDS.MAIN_CONTENT &&
+          tooLarge(request.data.content.length)
+            ? rejected
+            : { code: 0 },
+        );
+      mock.cardUpdate.mockImplementation(async (request) =>
+        tooLarge(bodySize(JSON.parse(request.data.card.data)))
+          ? rejected
+          : { code: 0 },
+      );
+      const controller = new StreamingCardController({
+        client: mock.client as any,
+        chatId: `oc_capacity_${phase}`,
+      });
+      controller.append(phase === 'create' ? text : 'initial');
+      await vi.waitFor(() => expect(controller.currentState).toBe('streaming'));
+      if (phase !== 'create') {
+        controller.append(text);
+        await vi.waitFor(
+          () =>
+            expect((controller as any).nativeCanonicalText === text).toBe(true),
+          { timeout: 5000 },
+        );
+      }
+      await controller.complete(text);
+      expect(rejections).toBeGreaterThan(0);
+      expect((controller as any).backendMode).toBe('streaming');
+      const pages = (controller as any).nativeCards;
+      expect(pages.map((page: any) => page.text).join('')).toBe(text);
+      expect(pages.every((page: any) => page.text.length <= 65000)).toBe(true);
+      expect(mock.client.im.v1.message.create).toHaveBeenCalledTimes(
+        pages.length,
+      );
+      for (const page of pages) {
+        const sequences = mock.cardUpdate.mock.calls
+          .filter(
+            ([request]) => request.path.card_id === page.backend.getCardId(),
+          )
+          .map(([request]) => request.data.sequence);
+        expect(sequences).toEqual([...sequences].sort((a, b) => a - b));
+        expect(new Set(sequences).size).toBe(sequences.length);
+      }
+      const updates = mock.cardUpdate.mock.calls.length;
+      await controller.patchUsageNote({
+        inputTokens: 1000,
+        outputTokens: 200,
+        costUSD: 0.1,
+        durationMs: 5000,
+        numTurns: 1,
+      });
+      expect(mock.cardUpdate).toHaveBeenCalledTimes(updates);
+      expect(mock.batchUpdate.mock.calls.at(-1)![0].path.card_id).toBe(
+        pages.at(-1).backend.getCardId(),
+      );
+      controller.dispose();
+    },
+  );
+
+  test('append freezes acknowledged prefix pages and only streams the growing tail', async () => {
+    const mock = makeClient();
+    const controller = new StreamingCardController({
+      client: mock.client as any,
+      chatId: 'oc_stable_prefix',
+    });
+    const text = 'prefix\n\n' + 'a'.repeat(400000);
+    controller.append(text);
+    await vi.waitFor(() => expect(controller.currentState).toBe('streaming'));
+    await (controller as any).nativePageChain;
+    const first = (controller as any).nativeCards[0];
+    const frozenText = first.text;
+    const frozenEnd = first.rawEnd;
+    mock.cardUpdate.mockClear();
+    controller.append(text + 'TAIL'.repeat(1000));
+    await vi.waitFor(() =>
+      expect((controller as any).nativeCanonicalText).toBe(
+        text + 'TAIL'.repeat(1000),
+      ),
+    );
+    expect(first.text).toBe(frozenText);
+    expect(first.rawEnd).toBe(frozenEnd);
+    expect(
+      mock.cardUpdate.mock.calls.some(
+        ([request]) => request.path.card_id === first.backend.getCardId(),
+      ),
+    ).toBe(false);
+    expect(mock.cardCreate).toHaveBeenCalledTimes(2);
+    // The second page has a lower provider-rendered limit. Shrinking that
+    // page must not touch the already acknowledged first card.
+    const tailId = (controller as any).streamingBackend.getCardId();
+    mock.elementContent.mockImplementation(async (request) =>
+      request.path.card_id === tailId &&
+      /^main_content/.test(request.path.element_id)
+        ? { code: 200860, msg: 'rendered card over max size' }
+        : { code: 0 },
+    );
+    mock.cardUpdate.mockImplementation(async (request) =>
+      request.path.card_id === tailId &&
+      JSON.stringify(request.data.card).length > 65000
+        ? { code: 200860, msg: 'rendered card over max size' }
+        : { code: 0 },
+    );
+    const grown = text + 'TAIL'.repeat(1001);
+    controller.append(grown);
+    await vi.waitFor(
+      () =>
+        expect((controller as any).nativeCanonicalText === grown).toBe(true),
+      { timeout: 5000 },
+    );
+    expect((controller as any).nativeCapacityScale).toBeLessThan(1);
+    expect(first.rawEnd).toBe(frozenEnd);
+    expect(first.text).toBe(frozenText);
+    expect(
+      mock.cardUpdate.mock.calls.some(
+        ([request]) => request.path.card_id === first.backend.getCardId(),
+      ),
+    ).toBe(false);
+    expect(
+      (controller as any).nativeCards.map((page: any) => page.text).join(''),
+    ).toBe(grown);
+    // Retired cards remain in the delivery ledger but cannot freeze a newly
+    // shortened active page when the canonical reducer appends again.
+    controller.append('small');
+    await vi.waitFor(() =>
+      expect((controller as any).nativeCanonicalText).toBe('small'),
+    );
+    controller.append('small extended');
+    await vi.waitFor(() =>
+      expect((controller as any).nativeCanonicalText).toBe('small extended'),
+    );
+    expect(
+      (controller as any).nativeCards.filter((page: any) => page.text !== ''),
+    ).toHaveLength(1);
+    expect((controller as any).nativeCards[0].text).toBe('small extended');
+    controller.dispose();
+  });
+
+  test('the real 90-item answer fits one card and retains its original tail', async () => {
+    const text = readFileSync(
+      new URL('./fixtures/feishu-card-long-answer.txt', import.meta.url),
+      'utf8',
+    );
+    expect(Buffer.byteLength(text)).toBeGreaterThan(25000);
+    const mock = makeClient();
+    const controller = new StreamingCardController({
+      client: mock.client as any,
+      chatId: 'oc_real_answer',
+    });
+    controller.append(text);
+    await vi.waitFor(() => expect(controller.currentState).toBe('streaming'));
+    await (controller as any).nativePageChain;
+    expect(mock.cardCreate).toHaveBeenCalledOnce();
+    expect((controller as any).nativeCards[0].text).toBe(text);
+    expect(
+      findElementContent(
+        JSON.parse(mock.cardCreate.mock.calls[0][0].data.data),
+        CARD_ELEMENT_IDS.MAIN_CONTENT,
+      ),
+    ).toBe(text);
+    await controller.complete(text);
+    expect(mock.cardCreate).toHaveBeenCalledOnce();
+    expect((controller as any).nativeCards[0].text).toBe(text);
+    const rendered = JSON.stringify(
+      JSON.parse(mock.cardUpdate.mock.calls.at(-1)![0].data.card.data),
+    );
+    expect(rendered).toContain(text.trimEnd().split('\n').at(-1));
+    controller.dispose();
+  });
+
+  test('200K ASCII uses native Markdown slots inside one card, adds a growing tail, and removes stale slots on revision', async () => {
+    const { controller, cardCreate, elementContent, batchUpdate } =
+      await createThinkingController();
+    const text = 'a'.repeat(200000);
+    controller.append(text);
+    await vi.waitFor(
+      () => expect((controller as any).nativeCanonicalText === text).toBe(true),
+      { timeout: 5000 },
+    );
+    expect(cardCreate).toHaveBeenCalledOnce();
+    const contents = elementContent.mock.calls.filter(([request]) =>
+      /^main_content(?:_\d+)?$/.test(request.path.element_id),
+    );
+    expect(contents.map(([request]) => request.data.content).join('')).toBe(
+      text,
+    );
+    expect(
+      contents.every(
+        ([request]) =>
+          Array.from(request.data.content).length <= CARDKIT_MARKDOWN_MAX_CHARS,
+      ),
+    ).toBe(true);
+    expect(contents.map(([request]) => request.path.element_id)).toEqual([
+      'main_content',
+      'main_content_1',
+      'main_content_2',
+    ]);
+    expect(
+      batchUpdate.mock.calls.some(([request]) =>
+        JSON.parse(request.data.actions).some(
+          (action: any) =>
+            action.action === 'add_elements' &&
+            action.params.elements.some(
+              (element: any) => element.element_id === 'main_content_1',
+            ),
+        ),
+      ),
+    ).toBe(true);
+    elementContent.mockClear();
+    controller.append(text + 'TAIL');
+    await vi.waitFor(() =>
+      expect((controller as any).nativeCanonicalText).toBe(text + 'TAIL'),
+    );
+    expect(elementContent).toHaveBeenCalledOnce();
+    expect(elementContent.mock.calls[0][0].path.element_id).toBe(
+      'main_content_2',
+    );
+    controller.append('revised answer');
+    await vi.waitFor(() =>
+      expect((controller as any).nativeCanonicalText).toBe('revised answer'),
+    );
+    expect(
+      batchUpdate.mock.calls.some(([request]) =>
+        JSON.parse(request.data.actions).some(
+          (action: any) =>
+            action.action === 'delete_elements' &&
+            action.params.element_ids.includes('main_content_2'),
+        ),
+      ),
+    ).toBe(true);
+    expect(cardCreate).toHaveBeenCalledOnce();
+    await controller.complete('revised answer');
+    controller.dispose();
+  });
+
+  test.each([
+    ['add_elements', 'complete'],
+    ['add_elements', 'abort'],
+    ['delete_elements', 'complete'],
+    ['delete_elements', 'abort'],
+  ] as const)(
+    '%s unknown ACK fences concurrent %s without publishing another body',
+    async (action, terminal) => {
+      const mock = makeClient();
+      const controller = new StreamingCardController({
+        client: mock.client as any,
+        chatId: `oc_slots_ack_${action}_${terminal}`,
+      });
+      const long = 'a'.repeat(200000);
+      controller.append(action === 'add_elements' ? 'initial' : long);
+      await vi.waitFor(() => expect(controller.currentState).toBe('streaming'));
+      await (controller as any).nativePageChain;
+      let release!: (error: Error) => void;
+      let signal!: () => void;
+      const started = new Promise<void>((resolve) => {
+        signal = resolve;
+      });
+      mock.batchUpdate.mockImplementation(async (request) => {
+        if (
+          JSON.parse(request.data.actions).some(
+            (entry: any) =>
+              entry.action === action &&
+              (entry.params.elements?.some((element: any) =>
+                /^main_content_/.test(element.element_id),
+              ) ||
+                entry.params.element_ids?.some((id: string) =>
+                  /^main_content_/.test(id),
+                )),
+          )
+        ) {
+          signal();
+          return new Promise((_resolve, reject) => {
+            release = reject;
+          });
+        }
+        return { code: 0 };
+      });
+      const text = action === 'add_elements' ? long : 'revised';
+      controller.append(text);
+      await started;
+      const ending = (
+        terminal === 'complete'
+          ? controller.complete(text)
+          : controller.abort('stopped')
+      ).then(
+        () => ({ ok: true, error: undefined }),
+        (error) => ({ ok: false, error }),
+      );
+      const contents = mock.elementContent.mock.calls.length;
+      const updates = mock.cardUpdate.mock.calls.length;
+      release(new Error('provider accepted body structure but ACK was lost'));
+      const result = await ending;
+      expect(result.ok).toBe(false);
+      expect(result.error).toMatchObject({ code: 'CHANNEL_DELIVERY_PARTIAL' });
+      expect(mock.cardCreate).toHaveBeenCalledOnce();
+      expect(mock.client.im.v1.message.create).toHaveBeenCalledOnce();
+      expect(mock.elementContent).toHaveBeenCalledTimes(contents);
+      expect(mock.cardUpdate).toHaveBeenCalledTimes(updates);
       controller.dispose();
     },
   );

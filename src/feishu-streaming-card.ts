@@ -13,7 +13,7 @@
  * - Code-block-safe text splitting (no truncation inside fenced code blocks)
  * - Schema 2.0 card format with body.elements
  * - Multi-card support for extremely long outputs (auto-split at ~45 elements)
- * - Conservative 30K character live-element budget with full-content finalization
+ * - Measured CardKit capacity with lossless, adaptive continuation pages
  */
 import * as lark from '@larksuiteoapi/node-sdk';
 import { createHash } from 'crypto';
@@ -22,9 +22,14 @@ import { optimizeMarkdownStyle } from './feishu-markdown-style.js';
 import {
   buildAgentReplyCard,
   buildStreamingAgentCard,
+  buildStreamingContentElements,
   STREAMING_CONFIG,
 } from './feishu-cards/builder.js';
-import { splitCardPages } from './feishu-cards/pagination.js';
+import { splitCardPages, type CardPage } from './feishu-cards/pagination.js';
+import {
+  CARDKIT_JSON_MAX_BYTES,
+  fitsCardCapacity,
+} from './feishu-cards/capacity.js';
 import type { CardStatus, ToolCallStat } from './feishu-cards/types.js';
 import {
   formatFeishuUsageNote,
@@ -336,15 +341,6 @@ function splitCodeBlockSafe(text: string, maxLen: number): string[] {
 const CARD_MD_LIMIT = 4000;
 const CARD_SIZE_LIMIT = 25 * 1024; // Feishu limit ~30KB, 5KB safety margin
 /**
- * Raw-char threshold above which the finalize path must split into multiple
- * cards. buildAgentReplyCard truncates the body to ~16K chars (4 sections ×
- * 4000); judging "fits in one card" by the byte size of the ALREADY-truncated
- * JSON can never trigger the split for ASCII/code replies — the tail would
- * silently vanish at completion.
- */
-const MAX_FINAL_SINGLE_CARD_CHARS = 15000;
-
-/**
  * Per-card BODY byte budget for rollover/finalize splitting. Must be measured
  * in UTF-8 BYTES, not chars: CJK is 3 bytes/char, so an 18000-CHAR budget
  * yields ~54KB cards that the Feishu ~30KB API rejects — the exact failure
@@ -450,25 +446,7 @@ const ELEMENT_IDS = {
   STATUS_NOTE: 'status_note',
 } as const;
 
-/**
- * CardKit may accept larger values, but the official SDK uses a conservative
- * 30K live-element budget. Staying below it also leaves room for Markdown
- * fence repair and avoids a late provider rejection after a long run.
- * Finalization still renders the complete accumulated text across cards.
- */
-const MAX_STREAMING_CONTENT = 30000;
 const STREAMING_PLACEHOLDER = '> 正在处理请求…';
-
-function limitStreamingContent(text: string): string {
-  if (text.length <= MAX_STREAMING_CONTENT) return text;
-  const hint = '\n\n> ⚠️ 内容较长，完成后将展示完整结果';
-  // Reserve space for splitCodeBlockSafe's synthetic closing fence.
-  const [head] = splitCodeBlockSafe(
-    text,
-    MAX_STREAMING_CONTENT - hint.length - 16,
-  );
-  return `${head}${hint}`;
-}
 
 // ─── Tool Progress & Elapsed Helpers ─────────────────────────
 
@@ -1376,7 +1354,6 @@ class StreamingModeBackend {
   private sequence = 0;
   /** Highest provider-acknowledged sequence exposed to durable lifecycle. */
   private acknowledgedSequence = 0;
-  private lastMainHash = '';
   private lastAuxBeforeHash = '';
   private lastAuxAfterHash = '';
   private readonly richSlotHashes = new Map<string, string>();
@@ -1466,7 +1443,6 @@ class StreamingModeBackend {
     this.sequence = 1;
     this.acknowledgedSequence = 1;
     collectElementContentHashes(cardJson, this.richSlotHashes);
-    this.lastMainHash = this.richSlotHashes.get(ELEMENT_IDS.MAIN_CONTENT) ?? '';
     this.lastAuxBeforeHash =
       this.richSlotHashes.get(ELEMENT_IDS.AUX_BEFORE) ?? '';
     this.lastAuxAfterHash =
@@ -1517,18 +1493,73 @@ class StreamingModeBackend {
    * MD5 dedup to avoid redundant pushes.
    * Auto-retries once on streaming timeout/closed errors.
    */
-  async streamContent(text: string): Promise<void> {
+  async streamBody(text: string): Promise<void> {
+    const elements = buildStreamingContentElements(text);
+    await this.enqueue(async () => {
+      const ids = elements.map((element) => String(element.element_id));
+      const existing = [...this.richSlotHashes.keys()].filter(
+        (id) =>
+          id === ELEMENT_IDS.MAIN_CONTENT || /^main_content_\d+$/.test(id),
+      );
+      const missing = elements.filter(
+        (element) => !this.richSlotHashes.has(String(element.element_id)),
+      );
+      const removed = existing.filter((id) => !ids.includes(id));
+      const actions: object[] = [];
+      if (missing.length)
+        actions.push({
+          action: 'add_elements',
+          params: {
+            type: 'insert_after',
+            target_element_id: existing.at(-1) ?? ELEMENT_IDS.MAIN_CONTENT,
+            elements: missing.map((element) => ({ ...element, content: '' })),
+          },
+        });
+      if (removed.length)
+        actions.push({
+          action: 'delete_elements',
+          params: { element_ids: removed },
+        });
+      if (!actions.length) return;
+      const data = JSON.stringify(actions);
+      const mutation = this.mutationIdentity(
+        'card.batchUpdate:body-slots',
+        quickHash(data),
+      );
+      const response = await this.mutations.request(() =>
+        this.client.cardkit.v1.card.batchUpdate({
+          path: { card_id: this.cardId! },
+          data: { actions: data, ...mutation },
+        }),
+      );
+      assertCardKitAcknowledged(response, 'card.batchUpdate:body-slots');
+      this.acknowledgedSequence = mutation.sequence;
+      for (const element of missing)
+        this.richSlotHashes.set(String(element.element_id), quickHash(''));
+      for (const id of removed) this.richSlotHashes.delete(id);
+    });
+    for (const element of elements)
+      await this.streamContent(
+        String(element.content),
+        String(element.element_id),
+      );
+  }
+
+  async streamContent(
+    text: string,
+    elementId: string = ELEMENT_IDS.MAIN_CONTENT,
+  ): Promise<void> {
     if (!this.cardId) return;
 
-    // Bound the live element conservatively. Finalization uses accumulatedText
-    // and therefore still publishes the complete answer across cards.
-    const content = limitStreamingContent(text);
+    // The controller budgets the complete page against measured CardKit limits.
+    // Never truncate an accepted canonical page inside the transport.
+    const content = text;
 
     return this.enqueue(async () => {
       const hash = quickHash(content);
-      if (hash === this.lastMainHash) return;
+      if (hash === this.richSlotHashes.get(elementId)) return;
       const mutation = this.mutationIdentity(
-        `cardElement.content:${ELEMENT_IDS.MAIN_CONTENT}`,
+        `cardElement.content:${elementId}`,
         hash,
       );
 
@@ -1537,14 +1568,14 @@ class StreamingModeBackend {
           this.client.cardkit.v1.cardElement.content({
             path: {
               card_id: this.cardId!,
-              element_id: ELEMENT_IDS.MAIN_CONTENT,
+              element_id: elementId,
             },
             data: { content, ...mutation },
           }),
         );
         assertCardKitAcknowledged(response, 'cardElement.content');
         this.acknowledgedSequence = mutation.sequence;
-        this.lastMainHash = hash;
+        this.richSlotHashes.set(elementId, hash);
       } catch (err: any) {
         const code = err?.code ?? err?.response?.data?.code;
         // 200850 = streaming timeout, 300309 = streaming closed
@@ -1562,21 +1593,21 @@ class StreamingModeBackend {
           // ambiguous transport timeout; the first content mutation was not
           // accepted.
           const retryMutation = this.mutationIdentity(
-            `cardElement.content:${ELEMENT_IDS.MAIN_CONTENT}:reenabled`,
+            `cardElement.content:${elementId}:reenabled`,
             hash,
           );
           const response = await this.mutations.request(() =>
             this.client.cardkit.v1.cardElement.content({
               path: {
                 card_id: this.cardId!,
-                element_id: ELEMENT_IDS.MAIN_CONTENT,
+                element_id: elementId,
               },
               data: { content, ...retryMutation },
             }),
           );
           assertCardKitAcknowledged(response, 'cardElement.content retry');
           this.acknowledgedSequence = retryMutation.sequence;
-          this.lastMainHash = hash;
+          this.richSlotHashes.set(elementId, hash);
         } else {
           throw err;
         }
@@ -1933,8 +1964,6 @@ class StreamingModeBackend {
       this.acknowledgedSequence = mutation.sequence;
       this.richSlotHashes.clear();
       collectElementContentHashes(cardJson, this.richSlotHashes);
-      this.lastMainHash =
-        this.richSlotHashes.get(ELEMENT_IDS.MAIN_CONTENT) ?? '';
       this.lastAuxBeforeHash =
         this.richSlotHashes.get(ELEMENT_IDS.AUX_BEFORE) ?? '';
       this.lastAuxAfterHash =
@@ -2373,7 +2402,10 @@ export class StreamingCardController {
     backend: StreamingModeBackend;
     text: string;
     streaming: boolean;
+    rawEnd: number;
   }> = [];
+  private nativeCanonicalText = '';
+  private nativeCapacityScale = 1;
   private nativePageChain: Promise<unknown> = Promise.resolve();
   private nativeFullUpdates = false;
   private textFlushCtrl: FlushController | null = null;
@@ -2459,8 +2491,7 @@ export class StreamingCardController {
     if (!this.lifecycle) return;
     const identity = this.lifecycleIdentity();
     const visibleText =
-      this.backendMode === 'streaming' &&
-      (this.nativeCards.length > 1 || byteLen(this.accumulatedText) > 12000)
+      this.backendMode === 'streaming' && this.nativeCards.length > 0
         ? this.nativeCards.find(
             (page) => page.backend === this.streamingBackend,
           )?.text
@@ -3003,6 +3034,7 @@ export class StreamingCardController {
   // ─── Internal Methods ──────────────────────────────────
 
   private async createInitialCard(): Promise<void> {
+    // Keep the independent fallback transports on their existing small budget.
     const initialText = splitCardPages(
       this.accumulatedText || STREAMING_PLACEHOLDER,
       { maxBytes: 12000 },
@@ -3011,8 +3043,18 @@ export class StreamingCardController {
     // ── Level 0: Try streaming mode (cardElement.content typewriter) ──
     try {
       const backend = new StreamingModeBackend(this.client);
-      const cardJson = buildStreamingModeCard(initialText);
-      await backend.createCard(cardJson);
+      let page: CardPage;
+      for (;;) {
+        page = this.planNativePages(
+          this.accumulatedText || STREAMING_PLACEHOLDER,
+        )[0];
+        try {
+          await backend.createCard(buildStreamingModeCard(page.text));
+          break;
+        } catch (error) {
+          if (!this.reduceNativeCapacity(error)) throw error;
+        }
+      }
       const messageId = await backend.sendCard(
         this.chatId,
         this.replyToMsgId,
@@ -3020,7 +3062,15 @@ export class StreamingCardController {
       );
 
       this.streamingBackend = backend;
-      this.nativeCards = [{ backend, text: initialText, streaming: true }];
+      this.nativeCards = [
+        {
+          backend,
+          text: page.text,
+          streaming: true,
+          rawEnd: this.accumulatedText ? page.rawEnd : 0,
+        },
+      ];
+      this.nativeCanonicalText = this.accumulatedText;
       this.messageId = messageId;
       this.backendMode = 'streaming';
       this.useCardKit = true;
@@ -3335,13 +3385,94 @@ export class StreamingCardController {
    * Schedule an auxiliary content flush for streaming mode.
    * Falls back to schedulePatch() if streaming backend is not available.
    */
-  /** Reconcile pages from canonical text, keeping only the current tail live. */
+  /** Explicit platform size rejections are safe to repartition; uncertain
+   * visible ACKs must escape unchanged to the existing sticky delivery fence. */
+  private reduceNativeCapacity(error: unknown): boolean {
+    if (!canSwitchFeishuCardBackend(error)) return false;
+    let cause: unknown = error;
+    for (let depth = 0; cause && depth < 8; depth++) {
+      const code = feishuErrorCode(cause);
+      if (code === 200860) {
+        if (this.nativeCapacityScale < 0.08) return false;
+        this.nativeCapacityScale *= 0.8;
+        logger.info(
+          { chatId: this.chatId, code, scale: this.nativeCapacityScale },
+          'CardKit rejected page capacity; retrying smaller canonical pages',
+        );
+        return true;
+      }
+      cause = (cause as { cause?: unknown }).cause;
+    }
+    return false;
+  }
+
+  private planNativePages(
+    text: string,
+    frozenBoundaries: number[] = [],
+  ): CardPage[] {
+    const panels = this.buildRichPanelPatches();
+    const budget = Math.floor(
+      CARDKIT_JSON_MAX_BYTES * this.nativeCapacityScale,
+    );
+    return splitCardPages(text, {
+      frozenBoundaries,
+      preserveFrozenCapacity: true,
+      fits: (pageText) => {
+        if (byteLen(JSON.stringify(pageText)) > budget - 3000) return false;
+        const live = buildStreamingAgentCard({ initialText: pageText, panels });
+        const final = this.buildStructuredFinalCard(
+          'completed',
+          undefined,
+          pageText,
+        );
+        // Current diagnostics are measured; reserve room for later diagnostic
+        // growth, the warning state and the in-place usage/footer update.
+        return (
+          fitsCardCapacity(live, { maxBytes: budget - 3000 }) &&
+          fitsCardCapacity(final, { maxBytes: budget - 3000 })
+        );
+      },
+    });
+  }
+
+  /** Keep accepted prefix boundaries stable on append. On a definite size
+   * rejection only the rejected page and following pages are repartitioned. */
   private async syncNativePages(
     text: string,
     terminal?: 'completed' | 'aborted',
   ): Promise<void> {
-    const pages = splitCardPages(text, { maxBytes: 12000 });
-    for (let i = 0; i < pages.length; i++) {
+    let boundaries = text.startsWith(this.nativeCanonicalText)
+      ? this.nativeCards
+          .filter((entry) => entry.text !== '')
+          .slice(0, -1)
+          .map((entry) => entry.rawEnd)
+      : [];
+    let retryFrom = 0;
+    for (;;) {
+      const pages = this.planNativePages(text, boundaries);
+      let pageIndex = 0;
+      try {
+        await this.applyNativePages(pages, terminal, retryFrom, (index) => {
+          pageIndex = index;
+        });
+        this.nativeCanonicalText = text;
+        return;
+      } catch (error) {
+        if (!this.reduceNativeCapacity(error)) throw error;
+        boundaries = pages.slice(0, pageIndex).map((page) => page.rawEnd);
+        retryFrom = pageIndex;
+      }
+    }
+  }
+
+  private async applyNativePages(
+    pages: CardPage[],
+    terminal: 'completed' | 'aborted' | undefined,
+    startAt: number,
+    onPage: (index: number) => void,
+  ): Promise<void> {
+    for (let i = startAt; i < pages.length; i++) {
+      onPage(i);
       const page = pages[i];
       const tail = i === pages.length - 1;
       const live = tail && !terminal;
@@ -3356,7 +3487,12 @@ export class StreamingCardController {
           this.replyToMsgId,
           this.replyInThread,
         );
-        entry = { backend, text: page.text, streaming: true };
+        entry = {
+          backend,
+          text: page.text,
+          streaming: true,
+          rawEnd: page.rawEnd,
+        };
         this.nativeCards.push(entry);
         this.streamingBackend = backend;
         this.messageId = messageId;
@@ -3370,12 +3506,7 @@ export class StreamingCardController {
           await entry.backend.disableStreamingMode();
           entry.streaming = false;
         }
-        if (
-          terminal ||
-          wasStreaming ||
-          entry.text !== page.text ||
-          i === this.nativeCards.length - 1
-        ) {
+        if (terminal || wasStreaming || entry.text !== page.text) {
           const card =
             tail && terminal
               ? this.buildStructuredFinalCard(terminal, undefined, page.text)
@@ -3405,9 +3536,10 @@ export class StreamingCardController {
         await entry.backend.updateCardFull(card);
         entry.streaming = !this.nativeFullUpdates;
       } else {
-        await entry.backend.streamContent(page.text);
+        await entry.backend.streamBody(page.text);
       }
       entry.text = page.text;
+      entry.rawEnd = page.rawEnd;
     }
     // The canonical reducer can retract provisional text. Never leave stale
     // output on previously visible continuation cards after such a revision.
@@ -3845,46 +3977,17 @@ export class StreamingCardController {
     await this.nativePageChain;
     if (this.terminalDeliveryError !== undefined)
       throw this.terminalDeliveryError;
-    if (
-      this.nativeCards.length > 1 ||
-      splitCardPages(this.accumulatedText, { maxBytes: 12000 }).length > 1
-    ) {
-      await this.syncNativePages(this.accumulatedText, finalState);
-      return;
-    }
     const backend = this.streamingBackend!;
-
     try {
-      // 1. Let any provider mutation already accepted by the shared queue
-      // settle before crossing the terminal boundary.
-      await backend.drain();
-
-      // 2. Disable streaming mode (allows header/button changes)
-      await backend.disableStreamingMode();
-
-      // 3. Build structured final card (usage note comes later via patchUsageNote)
-      const cardJson = this.buildStructuredFinalCard(finalState);
-      const cardSize = Buffer.byteLength(JSON.stringify(cardJson), 'utf-8');
-
-      if (
-        cardSize <= CARD_SIZE_LIMIT &&
-        this.accumulatedText.length <= MAX_FINAL_SINGLE_CARD_CHARS
-      ) {
-        // 4a. Single card fits (both built JSON and RAW text length — the
-        // latter catches ASCII replies whose truncated JSON looks small)
-        await backend.updateCardFull(cardJson);
-      } else {
-        // Oversized presentation: reconcile the same byte-bounded page set.
-        // Usage stays parked until all terminal provider mutations settle.
-        await this.splitOnFinalize(finalState);
-      }
+      await this.syncNativePages(this.accumulatedText, finalState);
     } catch (err) {
-      if (!canSwitchFeishuCardBackend(err)) throw err;
+      if (!canSwitchFeishuCardBackend(err) || this.nativeCards.length > 1)
+        throw err;
       logger.debug(
         { err, chatId: this.chatId },
         'Streaming finalize was rejected, trying a simpler answer card',
       );
-      // This path owns a single page (at most 12KB of raw text). Strip
+      // This path owns a single page. Strip
       // optional presentation detail on a schema rejection, retaining the
       // complete answer instead of silently truncating it.
       try {
@@ -3913,16 +4016,6 @@ export class StreamingCardController {
         throw fallbackErr;
       }
     }
-  }
-
-  /**
-   * Split content into multiple cards on finalize (only when streaming card content exceeds CARD_SIZE_LIMIT).
-   * The first card (existing streaming card) gets frozen, subsequent cards are new.
-   */
-  private async splitOnFinalize(
-    finalState: 'completed' | 'aborted',
-  ): Promise<void> {
-    await this.syncNativePages(this.accumulatedText, finalState);
   }
 
   private async patchCard(

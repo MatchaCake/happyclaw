@@ -1,7 +1,10 @@
 import { describe, expect, test } from 'vitest';
 import { splitCardPages } from '../src/feishu-cards/pagination.js';
 import { splitIntoBodySections } from '../src/feishu-cards/length.js';
-import { buildAgentReplyCard } from '../src/feishu-cards/builder.js';
+import {
+  buildAgentReplyCard,
+  buildStreamingAgentCard,
+} from '../src/feishu-cards/builder.js';
 
 function verifyCoverage(source: string, maxBytes: number) {
   const pages = splitCardPages(source, { maxBytes });
@@ -135,5 +138,146 @@ describe('card pagination', () => {
   test('empty content and invalid byte budgets have explicit behavior', () => {
     expect(splitCardPages('')).toEqual([{ rawStart: 0, rawEnd: 0, text: '' }]);
     expect(() => splitCardPages('hello', { maxBytes: 0 })).toThrow('256');
+  });
+
+  test('a fitting 20K answer uses one card when actual JSON capacity is available', () => {
+    const source = 'a'.repeat(20_000);
+    const fits = (text: string) =>
+      [
+        buildStreamingAgentCard({ initialText: text }),
+        buildAgentReplyCard({ text, status: 'done' }),
+      ].every((card) => Buffer.byteLength(JSON.stringify(card)) <= 25 * 1024);
+    expect(splitCardPages(source, { fits })).toEqual([
+      { rawStart: 0, rawEnd: source.length, text: source },
+    ]);
+  });
+
+  test('actual JSON escaping determines capacity instead of raw-text bytes', () => {
+    const source = '\\'.repeat(20_000);
+    const fits = (text: string) =>
+      Buffer.byteLength(
+        JSON.stringify(buildStreamingAgentCard({ initialText: text })),
+      ) <=
+      25 * 1024;
+    const pages = splitCardPages(source, { fits });
+    expect(pages).toHaveLength(2);
+    expect(pages.every((page) => fits(page.text))).toBe(true);
+    expect(pages[0].rawEnd).toBeGreaterThan(12_000);
+    expect(
+      pages.map((page) => source.slice(page.rawStart, page.rawEnd)).join(''),
+    ).toBe(source);
+  });
+
+  test('short introduction and a long code line do not create tiny fence pages', () => {
+    const source = 'intro\n\n~~~txt\n' + 'a'.repeat(15_000) + '\n~~~\n';
+    const pages = verifyCoverage(source, 12_000);
+    expect(pages).toHaveLength(2);
+    expect(pages[0].rawEnd).toBeGreaterThan(11_000);
+    expect(
+      pages.every(
+        (page) =>
+          page.text.split('\n').filter((line) => line.startsWith('~~~'))
+            .length === 2,
+      ),
+    ).toBe(true);
+    expect(
+      splitCardPages(source, {
+        fits: (text) =>
+          Buffer.byteLength(
+            JSON.stringify(buildStreamingAgentCard({ initialText: text })),
+          ) <=
+          25 * 1024,
+      }),
+    ).toHaveLength(1);
+  });
+
+  test('early paragraph boundaries do not waste most of an available card', () => {
+    const source = 'a'.repeat(4000) + '\n\n' + 'b'.repeat(15_000);
+    const pages = verifyCoverage(source, 12_000);
+    expect(pages).toHaveLength(2);
+    expect(pages[0].rawEnd).toBe(12_000);
+  });
+
+  test('character budgets count Unicode code points and include repaired fences', () => {
+    const source = '~~~text\n' + '🙂'.repeat(1100) + '\n~~~\n';
+    const pages = splitCardPages(source, { maxChars: 1000 });
+    expect(pages).toHaveLength(2);
+    for (const page of pages)
+      expect(Array.from(page.text).length).toBeLessThanOrEqual(1000);
+    expect(pages[0].rawEnd).toBeGreaterThan(1900);
+    expect(
+      pages.map((page) => source.slice(page.rawStart, page.rawEnd)).join(''),
+    ).toBe(source);
+    expect(
+      splitCardPages('🙂'.repeat(99_000), { maxChars: 99_000 }),
+    ).toHaveLength(1);
+  });
+
+  test('frozen raw boundaries stay fixed when more content is appended inside a fence', () => {
+    const initial = '```ts\n' + 'const x = 1;\n'.repeat(100);
+    const previous = splitCardPages(initial, { maxBytes: 600 });
+    const boundaries = previous.slice(0, -1).map((page) => page.rawEnd);
+    const extended = initial + 'const y = 2;\n'.repeat(100) + '```\n';
+    const pages = splitCardPages(extended, {
+      maxBytes: 600,
+      frozenBoundaries: boundaries,
+    });
+    expect(pages.slice(0, boundaries.length)).toEqual(previous.slice(0, -1));
+    expect(
+      pages.map((page) => extended.slice(page.rawStart, page.rawEnd)).join(''),
+    ).toBe(extended);
+    expect(pages.every((page) => Buffer.byteLength(page.text) <= 600)).toBe(
+      true,
+    );
+  });
+
+  test('new rendering capacity can shorten an affected frozen page without losing text', () => {
+    const source = 'a'.repeat(2000);
+    const pages = splitCardPages(source, {
+      maxChars: 700,
+      frozenBoundaries: [500, 1500],
+    });
+    expect(pages[0].rawEnd).toBe(500);
+    expect(pages[1].rawEnd).toBe(1200);
+    expect(pages.every((page) => page.text.length <= 700)).toBe(true);
+    expect(pages.map((page) => page.text).join('')).toBe(source);
+  });
+
+  test('provider-accepted pages keep their capacity when only a later page needs a smaller retry', () => {
+    const source = 'a'.repeat(2300);
+    const pages = splitCardPages(source, {
+      maxChars: 600,
+      frozenBoundaries: [1000],
+      preserveFrozenCapacity: true,
+    });
+    expect(pages[0]).toEqual({
+      rawStart: 0,
+      rawEnd: 1000,
+      text: source.slice(0, 1000),
+    });
+    expect(pages.slice(1).every((page) => page.text.length <= 600)).toBe(true);
+    expect(pages.map((page) => page.text).join('')).toBe(source);
+  });
+
+  test('a later oversized table row does not reformat already frozen pages', () => {
+    const initial = 'Intro\n\n' + 'a'.repeat(1400) + '\n\n';
+    const previous = splitCardPages(initial, { maxBytes: 600 });
+    const boundaries = previous.slice(0, -1).map((page) => page.rawEnd);
+    const source =
+      initial +
+      '| Name | Value |\n| --- | --- |\n| One | ' +
+      '字'.repeat(1000) +
+      ' |\n';
+    const pages = splitCardPages(source, {
+      maxBytes: 600,
+      frozenBoundaries: boundaries,
+    });
+    expect(pages.slice(0, boundaries.length)).toEqual(previous.slice(0, -1));
+    expect(
+      pages.map((page) => source.slice(page.rawStart, page.rawEnd)).join(''),
+    ).toBe(source);
+    expect(pages.every((page) => Buffer.byteLength(page.text) <= 600)).toBe(
+      true,
+    );
   });
 });
