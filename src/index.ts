@@ -303,12 +303,15 @@ import {
   cleanupChannelReliability,
   getDeliveredChannelOutboxForTurn,
   getFailedChannelOutboxForTurn,
+  getChannelOutboxItem,
+  markFeishuCapacityReplacementDelivered,
   getChannelTurnRun,
   getUncertainChannelOutboxForTurn,
   CHANNEL_RELIABILITY_TERMINAL_STATUSES,
   type ChannelOutboxItem,
 } from './channel-reliability-store.js';
 import { prepareWeChatTextChunks } from './wechat-outbound.js';
+import { deliverFeishuScopedText } from './feishu-scoped-text-delivery.js';
 import { ChannelTurnRuntime } from './channel-turn-runtime.js';
 import {
   createChannelInboundRouter,
@@ -2681,17 +2684,19 @@ function childChannelOutboxRef(
 
 class ScopedChannelDeliveryError extends Error {
   readonly deliveryPhase: 'rejected' | 'uncertain';
+  readonly outboxItemId?: string;
 
   constructor(
     readonly status: Exclude<ChannelOutboxDeliveryOutcome, 'delivered'>,
     message: string,
-    options: { cause?: unknown } = {},
+    options: { cause?: unknown; outboxItemId?: string } = {},
   ) {
     super(
       message,
       options.cause === undefined ? undefined : { cause: options.cause },
     );
     this.name = 'ScopedChannelDeliveryError';
+    this.outboxItemId = options.outboxItemId;
     this.deliveryPhase = status === 'failed' ? 'rejected' : 'uncertain';
   }
 }
@@ -2896,6 +2901,7 @@ async function deliverScopedChannelOutput(
       input.failure.error = new ScopedChannelDeliveryError(
         result.status,
         result.error ?? `Channel delivery ended as ${result.status}`,
+        { outboxItemId: result.itemId },
       );
     }
     logger.warn(
@@ -2946,6 +2952,25 @@ async function retryImOperation(
   return result.ok;
 }
 
+async function settleFeishuCapacityReplacement(
+  failure: unknown,
+  budget: number,
+): Promise<void> {
+  const id =
+    failure instanceof ScopedChannelDeliveryError
+      ? failure.outboxItemId
+      : undefined;
+  const item = id ? getChannelOutboxItem(id) : undefined;
+  if (
+    !item ||
+    !markFeishuCapacityReplacementDelivered(item.id, item.payloadHash, budget)
+  ) {
+    throw new Error(
+      'Feishu replacement pages were acknowledged but their rejected parent could not be durably retired',
+    );
+  }
+}
+
 /**
  * Send an IM message with retry.
  * On final failure, increments imSendFailCounts and may auto-unbind the IM group.
@@ -2969,12 +2994,16 @@ async function sendImWithRetry(
   if (durableScoped) {
     ok = true;
     const weChat = getChannelType(imJid) === 'wechat';
+    const feishuNative =
+      getChannelType(imJid) === 'feishu' &&
+      deliveryOptions?.presentation === 'native';
     const textChunks = text
       ? weChat
         ? prepareWeChatTextChunks(text)
         : [text]
       : [];
-    const totalPhysicalOutputs = textChunks.length + localImagePaths.length;
+    let textPhysicalOutputs = textChunks.length;
+    let totalPhysicalOutputs = textPhysicalOutputs + localImagePaths.length;
     let deliveredOutputs = 0;
 
     const recordTailFailure = (tail: unknown): void => {
@@ -2998,35 +3027,70 @@ async function sendImWithRetry(
           : scopedTail;
     };
 
-    for (let index = 0; index < textChunks.length; index++) {
-      const chunk = textChunks[index]!;
-      const chunkFailure: { error?: unknown } = {};
-      const delivered = await deliverScopedChannelOutput(
-        imJid,
-        childChannelOutboxRef(outbox!, weChat ? `text:${index}` : 'text'),
-        {
-          kind: 'text',
-          payload: buildInteractionTextOutboxPayload(
-            chunk,
-            deliveryOptions?.presentation,
-            outboxMetadata,
-          ),
-          send: (item) =>
-            imManager.sendMessage(imJid, chunk, [], {
-              ...deliveryOptions,
-              deliveryId: item.id,
-              chunkIndex: index,
-              physicalOutput: weChat,
-            }),
-          failure: chunkFailure,
+    if (feishuNative && text) {
+      const textResult = await deliverFeishuScopedText(text, {
+        onCapacityResolved: settleFeishuCapacityReplacement,
+        send: async (page) => {
+          const pageFailure: { error?: unknown } = {};
+          const delivered = await deliverScopedChannelOutput(
+            imJid,
+            childChannelOutboxRef(outbox!, page.slot),
+            {
+              kind: 'text',
+              payload: buildInteractionTextOutboxPayload(
+                page.text,
+                'native',
+                outboxMetadata,
+              ),
+              send: (item) =>
+                imManager.sendMessage(imJid, page.text, [], {
+                  ...deliveryOptions,
+                  deliveryId: item.id,
+                  chunkIndex: page.index,
+                  physicalOutput: true,
+                }),
+              failure: pageFailure,
+            },
+          );
+          return { delivered: delivered === true, error: pageFailure.error };
         },
-      );
-      if (delivered !== true) {
-        ok = false;
-        recordTailFailure(chunkFailure.error);
-        break;
+      });
+      deliveredOutputs = textResult.deliveredOutputs;
+      textPhysicalOutputs = textResult.totalOutputs;
+      totalPhysicalOutputs = textPhysicalOutputs + localImagePaths.length;
+      ok = textResult.delivered;
+      if (!ok) recordTailFailure(textResult.error);
+    } else {
+      for (let index = 0; index < textChunks.length; index++) {
+        const chunk = textChunks[index]!;
+        const chunkFailure: { error?: unknown } = {};
+        const delivered = await deliverScopedChannelOutput(
+          imJid,
+          childChannelOutboxRef(outbox!, weChat ? `text:${index}` : 'text'),
+          {
+            kind: 'text',
+            payload: buildInteractionTextOutboxPayload(
+              chunk,
+              deliveryOptions?.presentation,
+              outboxMetadata,
+            ),
+            send: (item) =>
+              imManager.sendMessage(imJid, chunk, [], {
+                ...deliveryOptions,
+                deliveryId: item.id,
+                chunkIndex: index,
+                physicalOutput: weChat,
+              }),
+            failure: chunkFailure,
+          },
+        );
+        if (delivered !== true) {
+          ok = false;
+          recordTailFailure(chunkFailure.error);
+          break;
+        }
+        deliveredOutputs += 1;
       }
-      deliveredOutputs += 1;
     }
 
     for (let index = 0; ok && index < localImagePaths.length; index++) {
@@ -3072,7 +3136,7 @@ async function sendImWithRetry(
               path.basename(imagePath),
               {
                 deliveryId: item.id,
-                chunkIndex: textChunks.length + index,
+                chunkIndex: textPhysicalOutputs + index,
                 physicalOutput: weChat,
               },
             ),
@@ -3507,6 +3571,65 @@ async function sendTaskImageWithRetry(
 ): Promise<boolean> {
   if (!imManager.isChannelAvailableForJid(targetJid)) return false;
   const channelType = getChannelType(targetJid);
+  if (channelType === 'feishu' && outbox && caption) {
+    // Feishu historically publishes the image before its caption. Keep that
+    // order while giving each caption page its own durable physical receipt.
+    const imageDelivered = await sendTaskImageWithRetry(
+      targetJid,
+      imageBuffer,
+      mimeType,
+      undefined,
+      fileName,
+      childChannelOutboxRef(outbox, 'image'),
+      failure,
+    );
+    if (!imageDelivered) return false;
+    const captions = await deliverFeishuScopedText(caption, {
+      slot: 'caption',
+      onCapacityResolved: settleFeishuCapacityReplacement,
+      send: async (page) => {
+        const pageFailure: { error?: unknown } = {};
+        const delivered = await deliverScopedChannelOutput(
+          targetJid,
+          childChannelOutboxRef(outbox, page.slot),
+          {
+            kind: 'text',
+            payload: {
+              text: page.text,
+              role: 'image_caption',
+              presentation: 'native',
+            },
+            send: (item) =>
+              imManager.sendMessage(targetJid, page.text, [], {
+                presentation: 'native',
+                deliveryId: item.id,
+                chunkIndex: page.index + 1,
+                physicalOutput: true,
+              }),
+            failure: pageFailure,
+          },
+        );
+        return { delivered: delivered === true, error: pageFailure.error };
+      },
+    });
+    if (!captions.delivered && failure) {
+      const tail =
+        captions.error instanceof ScopedChannelDeliveryError
+          ? captions.error
+          : new ScopedChannelDeliveryError(
+              'busy',
+              'Feishu caption was not acknowledged',
+              { cause: captions.error },
+            );
+      failure.error = new ScopedChannelPartialDeliveryError(
+        1 + captions.deliveredOutputs,
+        1 + captions.totalOutputs,
+        tail,
+      );
+    }
+    return captions.delivered;
+  }
+
   const separatesImageCaption =
     channelType === 'wechat' ||
     channelType === 'dingtalk' ||
