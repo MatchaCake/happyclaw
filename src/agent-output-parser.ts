@@ -64,6 +64,30 @@ function findJsonObjectEnd(buf: string, start: number): number {
 
 // ─── Stdout Stream Parser ────────────────────────────────────────────
 
+/**
+ * Classification carried from the last streamed provider-failure frame to the
+ * close-handler outputs below.
+ *
+ * The host kills the runner right after such a frame, so the final
+ * ContainerOutput is synthesized by a close handler rather than parsed from the
+ * stream. Re-attaching these fields is what keeps the failure class alive
+ * across that boundary: without them `resolveProviderFailureClass()` falls
+ * back to its 'account' default, so a transient stall reads as a quota verdict
+ * downstream — the scheduled-task replay loop then sees "no availability
+ * progress" (a transient failure quarantines nothing) and cancels the very
+ * replay the transient ledger just granted, and the user notice degrades to
+ * the quota wording.
+ */
+export type ProviderFailureCarryover = Pick<
+  ContainerOutput,
+  | 'providerFailureClass'
+  | 'providerLivenessTimeout'
+  | 'providerFailureNotice'
+  | 'providerRateLimitScope'
+  | 'providerRateLimitModel'
+  | 'providerRateLimitResetsAt'
+>;
+
 export interface StdoutParserState {
   stdout: string;
   stdoutTruncated: boolean;
@@ -75,6 +99,8 @@ export interface StdoutParserState {
   hasClosedOutput: boolean;
   /** True when SDK returned an API/provider failure as a successful final text. */
   hasProviderFailureOutput: boolean;
+  /** Classification of the latest provider-failure frame, if any was streamed. */
+  providerFailureCarryover: ProviderFailureCarryover | null;
   /** True when agent emitted a stream event with statusText='interrupted'. */
   hasInterruptedOutput: boolean;
 }
@@ -97,8 +123,49 @@ export function createStdoutParserState(): StdoutParserState {
     hasSuccessOutput: false,
     hasClosedOutput: false,
     hasProviderFailureOutput: false,
+    providerFailureCarryover: null,
     hasInterruptedOutput: false,
   };
+}
+
+function captureProviderFailureCarryover(
+  output: ContainerOutput,
+): ProviderFailureCarryover {
+  const carry: ProviderFailureCarryover = {};
+  if (output.providerFailureClass) {
+    carry.providerFailureClass = output.providerFailureClass;
+  }
+  if (output.providerLivenessTimeout !== undefined) {
+    carry.providerLivenessTimeout = output.providerLivenessTimeout;
+  }
+  if (output.providerFailureNotice) {
+    carry.providerFailureNotice = output.providerFailureNotice;
+  }
+  if (output.providerRateLimitScope) {
+    carry.providerRateLimitScope = output.providerRateLimitScope;
+  }
+  if (output.providerRateLimitModel) {
+    carry.providerRateLimitModel = output.providerRateLimitModel;
+  }
+  if (output.providerRateLimitResetsAt !== undefined) {
+    carry.providerRateLimitResetsAt = output.providerRateLimitResetsAt;
+  }
+  return carry;
+}
+
+/**
+ * The provider-failure projection a close handler must attach to its
+ * synthesized output: the boolean flag plus the classification of the latest
+ * streamed failure frame. Deliberately excludes turn-identity fields
+ * (`inputTurnId`, `ipcReceipts`) — those are read as delivery evidence and
+ * reply-correlation keys elsewhere, and a synthesized close output carries no
+ * such evidence.
+ */
+function providerFailureCloseFields(
+  state: StdoutParserState,
+): Partial<ContainerOutput> {
+  if (!state.hasProviderFailureOutput) return { providerFailure: false };
+  return { providerFailure: true, ...(state.providerFailureCarryover ?? {}) };
 }
 
 export function attachStdoutHandler(
@@ -244,6 +311,8 @@ export function attachStdoutHandler(
           // rate_limit_event, so it remains authoritative even when the
           // accompanying result is null or the CLI banner wording changes.
           state.hasProviderFailureOutput = true;
+          state.providerFailureCarryover =
+            captureProviderFailureCarryover(parsed);
         }
         if (parsed.status === 'success') {
           state.hasSuccessOutput = true;
@@ -253,6 +322,8 @@ export function attachStdoutHandler(
           ) {
             state.hasProviderFailureOutput = true;
             parsed.providerFailure = true;
+            state.providerFailureCarryover =
+              captureProviderFailureCarryover(parsed);
           }
         }
         if (parsed.status === 'closed') {
@@ -549,7 +620,7 @@ export function handleNonZeroExit(
           status: 'success',
           result: null,
           newSessionId,
-          providerFailure: ctx.stdoutState.hasProviderFailureOutput,
+          ...providerFailureCloseFields(ctx.stdoutState),
         });
       },
     );
@@ -585,7 +656,7 @@ export function handleNonZeroExit(
           status: finalStatus,
           result: null,
           newSessionId,
-          providerFailure: ctx.stdoutState.hasProviderFailureOutput,
+          ...providerFailureCloseFields(ctx.stdoutState),
         });
       },
     );
@@ -630,7 +701,7 @@ export function handleNonZeroExit(
       status: 'error',
       result: enriched.result,
       error: enriched.error,
-      providerFailure: ctx.stdoutState.hasProviderFailureOutput,
+      ...providerFailureCloseFields(ctx.stdoutState),
     });
   };
 
@@ -660,7 +731,7 @@ export function handleSuccessClose(
 
   // Streaming mode: wait for output chain to settle
   if (ctx.onOutput) {
-    const { hasClosedOutput, hasProviderFailureOutput } = ctx.stdoutState;
+    const { hasClosedOutput } = ctx.stdoutState;
     waitForOutputChain(
       outputChain,
       ctx.groupName,
@@ -679,7 +750,7 @@ export function handleSuccessClose(
           status: finalStatus,
           result: null,
           newSessionId,
-          providerFailure: hasProviderFailureOutput,
+          ...providerFailureCloseFields(ctx.stdoutState),
         });
       },
     );
