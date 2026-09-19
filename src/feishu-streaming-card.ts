@@ -1060,6 +1060,16 @@ function canSwitchFeishuCardBackend(error: unknown): boolean {
   );
 }
 
+function isNativeCardCapacityRejection(error: unknown): boolean {
+  if (!canSwitchFeishuCardBackend(error)) return false;
+  let cause: unknown = error;
+  for (let depth = 0; cause && depth < 8; depth++) {
+    if (feishuErrorCode(cause) === 200860) return true;
+    cause = (cause as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
 function requireFeishuCardMessageId(
   response: unknown,
   operation: string,
@@ -1368,6 +1378,10 @@ class StreamingModeBackend {
   private chain: Promise<unknown> = Promise.resolve();
   /** An unresolved auxiliary ACK also fences work already queued behind it. */
   private uncertainAuxiliaryError: unknown;
+
+  hasRuntimeDetails(): boolean {
+    return this.richSlotHashes.has(CARD_ELEMENT_IDS.PROGRESS_CONTENT);
+  }
 
   constructor(
     client: lark.Client,
@@ -1809,7 +1823,11 @@ class StreamingModeBackend {
       if (batchFailure !== undefined) {
         // A structural batch must not fall back to content requests against
         // slots that have not been created (or may have been removed).
-        if (structural.length > 0 || !canSwitchFeishuCardBackend(batchFailure))
+        if (
+          structural.length > 0 ||
+          isNativeCardCapacityRejection(batchFailure) ||
+          !canSwitchFeishuCardBackend(batchFailure)
+        )
           throw batchFailure;
         logger.debug(
           {
@@ -2428,6 +2446,8 @@ export class StreamingCardController {
   private nativeCapacityScale = 1;
   private nativePageChain: Promise<unknown> = Promise.resolve();
   private nativeFullUpdates = false;
+  /** Hidden provider rendering limits may require omitting optional details. */
+  private nativeSuppressDetails = false;
   private textFlushCtrl: FlushController | null = null;
   private auxFlushCtrl: FlushController | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -3408,29 +3428,64 @@ export class StreamingCardController {
   /** Explicit platform size rejections are safe to repartition; uncertain
    * visible ACKs must escape unchanged to the existing sticky delivery fence. */
   private reduceNativeCapacity(error: unknown): boolean {
-    if (!canSwitchFeishuCardBackend(error)) return false;
-    let cause: unknown = error;
-    for (let depth = 0; cause && depth < 8; depth++) {
-      const code = feishuErrorCode(cause);
-      if (code === 200860) {
-        if (this.nativeCapacityScale < 0.08) return false;
-        this.nativeCapacityScale *= 0.8;
-        logger.info(
-          { chatId: this.chatId, code, scale: this.nativeCapacityScale },
-          'CardKit rejected page capacity; retrying smaller canonical pages',
-        );
-        return true;
-      }
-      cause = (cause as { cause?: unknown }).cause;
+    if (
+      !isNativeCardCapacityRejection(error) ||
+      this.nativeCapacityScale < 0.08
+    )
+      return false;
+    this.nativeCapacityScale *= 0.8;
+    logger.info(
+      { chatId: this.chatId, code: 200860, scale: this.nativeCapacityScale },
+      'CardKit rejected page capacity; retrying smaller canonical pages',
+    );
+    return true;
+  }
+
+  /** Size optional diagnostics against the actual visible answer, including
+   * JSON escaping. Growing process details must not evict accepted prose. */
+  private nativePanelPatches(text: string) {
+    const panels = this.buildRichPanelPatches();
+    const keys = [
+      'progressContent',
+      'taskContent',
+      'toolsContent',
+      'thinkingContent',
+      'timelineContent',
+    ] as const;
+    if (this.nativeSuppressDetails || keys.every((key) => !panels[key])) {
+      for (const key of keys) panels[key] = '';
+      return panels;
     }
-    return false;
+    const budget =
+      Math.floor(CARDKIT_JSON_MAX_BYTES * this.nativeCapacityScale) - 3000;
+    const card = buildStreamingAgentCard({ initialText: text, panels });
+    const body = card.body as { elements: Array<Record<string, unknown>> };
+    for (let attempt = 0; attempt < 7; attempt++) {
+      if (attempt === 6) {
+        for (const key of keys) panels[key] = '';
+        return panels;
+      }
+      if (fitsCardCapacity(card, { maxBytes: budget })) return panels;
+      for (const key of keys) {
+        const plain = (panels[key] ?? '').replace(/<[^>]*>/g, '');
+        const points = Array.from(plain);
+        panels[key] =
+          points.length > 80
+            ? points.slice(0, Math.floor(points.length / 2)).join('') + '…'
+            : '';
+      }
+      body.elements = body.elements.filter(
+        (element) => element.element_id !== CARD_ELEMENT_IDS.DETAILS_PANEL,
+      );
+      body.elements.push(...buildStreamingDetails(panels));
+    }
+    return panels;
   }
 
   private planNativePages(
     text: string,
     frozenBoundaries: number[] = [],
   ): CardPage[] {
-    const panels = this.buildRichPanelPatches();
     const budget = Math.floor(
       CARDKIT_JSON_MAX_BYTES * this.nativeCapacityScale,
     );
@@ -3439,7 +3494,10 @@ export class StreamingCardController {
       preserveFrozenCapacity: true,
       fits: (pageText) => {
         if (byteLen(JSON.stringify(pageText)) > budget - 3000) return false;
-        const live = buildStreamingAgentCard({ initialText: pageText, panels });
+        const live = buildStreamingAgentCard({
+          initialText: pageText,
+          panels: this.nativePanelPatches(pageText),
+        });
         const final = this.buildStructuredFinalCard(
           'completed',
           undefined,
@@ -3548,7 +3606,7 @@ export class StreamingCardController {
       } else if (!entry.streaming || this.nativeFullUpdates) {
         const card = buildStreamingAgentCard({
           initialText: page.text,
-          panels: this.buildRichPanelPatches(),
+          panels: this.nativePanelPatches(page.text),
         });
         if (this.nativeFullUpdates) {
           (card.config as Record<string, unknown>).streaming_mode = false;
@@ -3556,6 +3614,51 @@ export class StreamingCardController {
         await entry.backend.updateCardFull(card);
         entry.streaming = !this.nativeFullUpdates;
       } else {
+        if (entry.backend.hasRuntimeDetails()) {
+          // Existing details occupy provider capacity until their shrink is
+          // acknowledged. Reserve space before increasing the main body.
+          const candidates = [entry.text, page.text].map((text) => {
+            const panels = this.nativePanelPatches(text);
+            const details = buildStreamingDetails(panels)[0] ?? null;
+            return { panels, details, size: byteLen(JSON.stringify(details)) };
+          });
+          const { panels, details } = candidates.sort(
+            (a, b) => a.size - b.size,
+          )[0];
+          try {
+            await entry.backend.updateMarkdownContents(
+              [
+                {
+                  elementId: CARD_ELEMENT_IDS.PROGRESS_CONTENT,
+                  content: panels.progressContent ?? '',
+                },
+                {
+                  elementId: CARD_ELEMENT_IDS.TASK_CONTENT,
+                  content: panels.taskContent,
+                },
+                {
+                  elementId: CARD_ELEMENT_IDS.TOOLS_CONTENT,
+                  content: panels.toolsContent,
+                },
+                {
+                  elementId: CARD_ELEMENT_IDS.THINKING_CONTENT,
+                  content: panels.thinkingContent ?? '',
+                },
+                {
+                  elementId: CARD_ELEMENT_IDS.TIMELINE_CONTENT,
+                  content: panels.timelineContent ?? '',
+                },
+              ],
+              details,
+            );
+          } catch (error) {
+            if (!isNativeCardCapacityRejection(error)) throw error;
+            // Hidden Markdown expansion can reject even the locally bounded
+            // detail projection. Drop diagnostics before shrinking prose.
+            this.nativeSuppressDetails = true;
+            await entry.backend.updateMarkdownContents([], null);
+          }
+        }
         await entry.backend.streamBody(page.text);
       }
       entry.text = page.text;
@@ -3794,7 +3897,11 @@ export class StreamingCardController {
         this.backendTransition
       )
         return;
-      const patches = this.buildRichPanelPatches();
+      const visibleText =
+        this.nativeCards.find(
+          (entry) => entry.backend === this.streamingBackend,
+        )?.text ?? this.liveDisplayText();
+      const patches = this.nativePanelPatches(visibleText);
       const details = buildStreamingDetails(patches)[0] ?? null;
 
       let result: { updated: string[]; failed: string[] };
@@ -3844,6 +3951,21 @@ export class StreamingCardController {
           return;
         }
         if (this.state !== 'streaming') return;
+        if (isNativeCardCapacityRejection(error)) {
+          if (!this.nativeSuppressDetails) {
+            this.nativeSuppressDetails = true;
+            this.scheduleAuxFlush();
+            return;
+          }
+          if (this.reduceNativeCapacity(error)) {
+            // The text path owns native page changes and preserves its sticky
+            // unknown-ACK fence. Never hand a capacity-only failure to v1.
+            this.scheduleTextFlush();
+            return;
+          }
+          this.fenceVisibleCardMutation(error);
+          return;
+        }
         this.patchFailCount++;
         if (this.patchFailCount >= this.maxPatchFailures) this.degradeToV1();
         return;
@@ -3987,6 +4109,17 @@ export class StreamingCardController {
       text_size: 'notation',
       content: this.traceFooterLink() ?? '',
     });
+    const budget =
+      Math.floor(CARDKIT_JSON_MAX_BYTES * this.nativeCapacityScale) - 3000;
+    if (
+      this.nativeSuppressDetails ||
+      !fitsCardCapacity(card, { maxBytes: budget })
+    ) {
+      const body = card.body as { elements: Array<Record<string, unknown>> };
+      body.elements = body.elements.filter(
+        (element) => element.element_id !== CARD_ELEMENT_IDS.DETAILS_PANEL,
+      );
+    }
     return card;
   }
 

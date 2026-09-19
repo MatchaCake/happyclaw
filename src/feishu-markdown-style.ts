@@ -29,7 +29,7 @@ export function optimizeMarkdownStyle(text: string, cardVersion = 2): string {
 
 function _optimizeMarkdownStyle(text: string, cardVersion = 2): string {
   // ── 1. Extract code blocks, protect with placeholders ──────────
-  const { content, codeBlocks } = protectFencedCode(text);
+  const { content, codeBlocks, tokenPattern } = protectFencedCode(text);
   let r = content;
 
   // ── 2. Heading demotion ────────────────────────────────────────
@@ -61,11 +61,11 @@ function _optimizeMarkdownStyle(text: string, cardVersion = 2): string {
 
     // Add spacing while the code itself is still protected. An unfinished
     // upstream fence must not acquire a literal <br> inside its code body.
-    codeBlocks.forEach(({ token, closed }) => {
-      r = r.replace(token, () =>
-        closed ? `\n<br>\n${token}\n<br>\n` : `\n<br>\n${token}`,
-      );
-    });
+    r = r.replace(tokenPattern, (token, index: string) =>
+      codeBlocks[Number(index)].closed
+        ? `\n<br>\n${token}\n<br>\n`
+        : `\n<br>\n${token}`,
+    );
   }
 
   // Cleanup only prose: code blank lines and image syntax are literal data.
@@ -73,9 +73,13 @@ function _optimizeMarkdownStyle(text: string, cardVersion = 2): string {
   r = stripInvalidImageKeys(r);
 
   // Function replacers preserve literal $&, $', $`, and $1 in source code.
-  codeBlocks.forEach(({ token, source }) => {
-    r = r.replace(token, () => source);
-  });
+  // Restore every placeholder in one pass. Replacing each block separately
+  // rescans/copies the growing answer once per fence and becomes quadratic
+  // for long answers containing thousands of short examples.
+  r = r.replace(
+    tokenPattern,
+    (_token, index: string) => codeBlocks[Number(index)].source,
+  );
 
   return r;
 }
@@ -84,6 +88,7 @@ function _optimizeMarkdownStyle(text: string, cardVersion = 2): string {
 function protectFencedCode(text: string): {
   content: string;
   codeBlocks: Array<{ token: string; source: string; closed: boolean }>;
+  tokenPattern: RegExp;
 } {
   let prefix = '\uE000HC_CODE_';
   while (text.includes(prefix)) prefix += '_';
@@ -115,7 +120,11 @@ function protectFencedCode(text: string): {
     content += text.slice(cursor, start) + token;
     cursor = end;
   }
-  return { content: content + text.slice(cursor), codeBlocks };
+  return {
+    content: content + text.slice(cursor),
+    codeBlocks,
+    tokenPattern: new RegExp(`${prefix}(\\d+)\uE001`, 'g'),
+  };
 }
 
 // ---------------------------------------------------------------------------

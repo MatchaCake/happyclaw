@@ -27,6 +27,35 @@ function verifyCoverage(source: string, maxBytes: number) {
 }
 
 describe('card pagination', () => {
+  test('thousands of short fences share continuation capacity checks without losing source', () => {
+    const source = Array.from({ length: 6000 }, (_, index) => {
+      const marker = index % 2 ? '```' : '~~~';
+      return `${marker}js\nconst value_${index} = "中文🙂";\n${marker}\n\n`;
+    }).join('');
+    const maxBytes = 60_000;
+    let capacityChecks = 0;
+    const pages = splitCardPages(source, {
+      fits: (text) => {
+        capacityChecks++;
+        return Buffer.byteLength(text) <= maxBytes;
+      },
+    });
+    expect(pages.length).toBeGreaterThan(1);
+    expect(
+      pages.map((page) => source.slice(page.rawStart, page.rawEnd)).join(''),
+    ).toBe(source);
+    for (const page of pages) {
+      expect(Buffer.byteLength(page.text)).toBeLessThanOrEqual(maxBytes);
+      expect(page.text).toContain(source.slice(page.rawStart, page.rawEnd));
+      expect(page.text).not.toMatch(
+        /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u,
+      );
+    }
+    // The callback may render complete cards. Its cost should follow the
+    // number of pages/boundary probes, not every repeated source fence.
+    expect(capacityChecks).toBeLessThan(pages.length * 50 + 10);
+  });
+
   test('five 2500-character paragraphs survive final rendering (12508-character regression)', () => {
     const source = Array.from({ length: 5 }, (_, i) =>
       String(i).repeat(2500),

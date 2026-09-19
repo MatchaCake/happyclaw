@@ -156,9 +156,21 @@ export function splitCardPages(
 
   // An oversized header, fence info string or table row cannot be repeated
   // safely. Degrade from the affected page, preserving earlier frozen pages.
+  // A capacity predicate can build complete live/final cards. Repeated fence
+  // languages share the same continuation, so measure that syntax once per
+  // pagination call rather than rebuilding cards once per source block.
+  const continuationFits = new Map<string, boolean>();
+  const fitsContinuation = (block: MarkdownBlock): boolean => {
+    const value = block.prefix + block.suffix;
+    const cached = continuationFits.get(value);
+    if (cached !== undefined) return cached;
+    const accepted = fits(value);
+    continuationFits.set(value, accepted);
+    return accepted;
+  };
   const indivisible = blocks.filter(
     (block) =>
-      !fits(block.prefix + block.suffix) ||
+      !fitsContinuation(block) ||
       (!block.suffix &&
         text
           .slice(block.start + block.prefix.length, block.end)

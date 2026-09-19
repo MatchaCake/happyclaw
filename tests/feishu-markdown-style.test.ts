@@ -1,7 +1,50 @@
-import { describe, expect, test } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import { optimizeMarkdownStyle } from '../src/feishu-markdown-style.js';
 
 describe('optimizeMarkdownStyle 代码块保护', () => {
+  test.each([1, 2])(
+    '版本 %s 处理数千代码块时保留原文且替换扫描量随正文线性增长',
+    (version) => {
+      const blocks = Array.from(
+        { length: 6000 },
+        (_, index) =>
+          `~~~markdown\n# Literal ${index}\n\n\n![local](./image.png)\n$& $1\n~~~`,
+      );
+      const literalToken = '\uE000HC_CODE_0\uE001';
+      const tail = '~~~markdown\n# Unfinished\n\n\n![tail](./tail.png)';
+      const input = `${literalToken}\n\n${blocks.join('\n\n')}\n\n${tail}`;
+      const replace = String.prototype.replace;
+      let scannedCharacters = 0;
+      const spy = vi
+        .spyOn(String.prototype, 'replace')
+        .mockImplementation(function (
+          this: string,
+          pattern: unknown,
+          replacement: unknown,
+        ) {
+          scannedCharacters += this.length;
+          return Reflect.apply(replace, this, [pattern, replacement]) as string;
+        });
+      let output: string;
+      try {
+        output = optimizeMarkdownStyle(input, version);
+      } finally {
+        spy.mockRestore();
+      }
+      // Count source scanned by replacement operations instead of wall-clock
+      // timing: this stays stable on slow CI and rejects per-block full scans.
+      expect(scannedCharacters).toBeLessThan(input.length * 30);
+      expect(output).toContain(literalToken);
+      expect(output.endsWith(tail)).toBe(true);
+      expect(
+        [...output.matchAll(/~~~markdown\n[\s\S]*?\n~~~/g)].map(
+          (match) => match[0],
+        ),
+      ).toEqual(blocks);
+      if (version === 1) expect(output).toBe(input);
+    },
+  );
+
   test("代码块中的 $& / $' / $` / $1 不被 GetSubstitution 损坏", () => {
     // shell / regex / perl 代码块中这些模式极常见。
     // 历史 bug: String.replace(str, block) 的字符串替换形式会把 $& 展开为

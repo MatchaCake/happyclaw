@@ -1619,3 +1619,322 @@ describe('Feishu CardKit streaming controller', () => {
     },
   );
 });
+
+describe('native card diagnostic capacity', () => {
+  function statefulCards(maxBytes = 307200) {
+    const mock = makeClient();
+    const cards = new Map<string, any>();
+    const rejections: number[] = [];
+    let cardNumber = 0;
+    const locate = (value: any, id: string): any => {
+      if (!value || typeof value !== 'object') return undefined;
+      if (value.element_id === id) return value;
+      for (const child of Object.values(value)) {
+        if (Array.isArray(child)) {
+          for (const entry of child) {
+            const found = locate(entry, id);
+            if (found) return found;
+          }
+        } else {
+          const found = locate(child, id);
+          if (found) return found;
+        }
+      }
+    };
+    const accept = (id: string, card: any) => {
+      const bytes = Buffer.byteLength(JSON.stringify(card));
+      if (bytes > maxBytes) {
+        rejections.push(bytes);
+        return { code: 200860, msg: 'card capacity exceeded' };
+      }
+      cards.set(id, card);
+      return { code: 0 };
+    };
+    mock.cardCreate.mockImplementation(async (request) => {
+      const id = `card_${++cardNumber}`;
+      const result = accept(id, JSON.parse(request.data.data));
+      return result.code === 0 ? { ...result, data: { card_id: id } } : result;
+    });
+    mock.cardUpdate.mockImplementation(async (request) =>
+      accept(request.path.card_id, JSON.parse(request.data.card.data)),
+    );
+    mock.batchUpdate.mockImplementation(async (request) => {
+      const card = structuredClone(cards.get(request.path.card_id));
+      for (const action of JSON.parse(request.data.actions)) {
+        const params = action.params;
+        if (action.action === 'partial_update_element') {
+          const element = locate(card, params.element_id);
+          if (!element) throw new Error(`missing slot ${params.element_id}`);
+          Object.assign(element, params.partial_element);
+        } else if (action.action === 'add_elements') {
+          const at = card.body.elements.findIndex(
+            (entry: any) => entry.element_id === params.target_element_id,
+          );
+          card.body.elements.splice(
+            at + (params.type === 'insert_after' ? 1 : 0),
+            0,
+            ...params.elements,
+          );
+        } else if (action.action === 'delete_elements') {
+          card.body.elements = card.body.elements.filter(
+            (entry: any) => !params.element_ids.includes(entry.element_id),
+          );
+        }
+      }
+      return accept(request.path.card_id, card);
+    });
+    mock.elementContent.mockImplementation(async (request) => {
+      const card = structuredClone(cards.get(request.path.card_id));
+      const element = locate(card, request.path.element_id);
+      if (!element) throw new Error(`missing slot ${request.path.element_id}`);
+      element.content = request.data.content;
+      return accept(request.path.card_id, card);
+    });
+    return { ...mock, cards, rejections };
+  }
+
+  async function nearCapacityController(
+    text = 'Answer\n\n' + 'x'.repeat(295500),
+  ) {
+    const mock = statefulCards();
+    const controller = new StreamingCardController({
+      client: mock.client as any,
+      chatId: 'oc_diagnostic_capacity',
+    });
+    controller.append(text);
+    await vi.waitFor(() => expect(controller.currentState).toBe('streaming'));
+    const internal = controller as any;
+    await internal.nativePageChain;
+    await internal.streamingBackend.drain();
+    internal.stopHeartbeat();
+    internal.textFlushCtrl.dispose();
+    internal.auxFlushCtrl.dispose();
+    let flush = async () => {};
+    internal.auxFlushCtrl.schedule = (
+      _length: number,
+      fn: () => Promise<void>,
+    ) => {
+      flush = fn;
+    };
+    return { ...mock, controller, internal, text, flush: () => flush() };
+  }
+
+  function addLargeDetails(controller: StreamingCardController) {
+    const escaped = '"\\';
+    controller.appendThinking(escaped.repeat(2000));
+    for (let i = 0; i < 12; i++) {
+      controller.startTool(`tool_${i}`, `test_${i}`);
+      controller.updateToolSummary(`tool_${i}`, escaped.repeat(1800));
+      controller.pushRecentEvent(escaped.repeat(1800));
+    }
+    controller.setTodos(
+      Array.from({ length: 12 }, () => ({
+        content: escaped.repeat(100),
+        status: 'in_progress',
+      })),
+    );
+    for (let i = 0; i < 10; i++)
+      controller.updateTask(`task_${i}`, {
+        title: escaped.repeat(100),
+        summary: escaped.repeat(200),
+        status: 'running',
+      });
+  }
+
+  test.each(['complete', 'abort'] as const)(
+    'growing escaped diagnostics preserve one near-capacity card through %s',
+    async (terminal) => {
+      const {
+        controller,
+        internal,
+        text,
+        cards,
+        rejections,
+        cardCreate,
+        flush,
+      } = await nearCapacityController();
+      try {
+        addLargeDetails(controller);
+        for (let i = 0; i < 3; i++) await flush();
+        await internal.backendTransition;
+        expect(internal.backendMode).toBe('streaming');
+        expect(rejections).toEqual([]);
+        expect(cardCreate).toHaveBeenCalledOnce();
+        if (terminal === 'complete') {
+          await controller.complete(text);
+          await controller.patchUsageNote({
+            inputTokens: 100,
+            outputTokens: 200,
+          });
+        } else await controller.abort('Stopped');
+        expect(cardCreate).toHaveBeenCalledOnce();
+        const final = cards.get('card_1');
+        const body = final.body.elements
+          .filter(
+            (entry: any) =>
+              entry.element_id === 'main_content' ||
+              /^body_/.test(entry.element_id ?? ''),
+          )
+          .map((entry: any) => entry.content)
+          .join('');
+        expect(body).toContain(text);
+        if (terminal === 'abort') expect(body).toContain('Stopped');
+        else
+          expect(
+            findElementContent(final, CARD_ELEMENT_IDS.FOOTER_NOTE),
+          ).toContain('200');
+        expect(Buffer.byteLength(JSON.stringify(final))).toBeLessThanOrEqual(
+          CARDKIT_JSON_MAX_BYTES,
+        );
+      } finally {
+        controller.dispose();
+      }
+    },
+  );
+
+  test('shrinks acknowledged details before growing the answer near capacity', async () => {
+    const { controller, internal, cards, rejections, cardCreate, flush } =
+      await nearCapacityController('Answer');
+    try {
+      addLargeDetails(controller);
+      await flush();
+      expect(internal.streamingBackend.hasRuntimeDetails()).toBe(true);
+      const text = 'Answer\n\n' + 'x'.repeat(295500);
+      controller.append(text);
+      await vi.waitFor(() => expect(internal.nativeCanonicalText).toBe(text), {
+        timeout: 5000,
+      });
+      expect(rejections).toEqual([]);
+      expect(cardCreate).toHaveBeenCalledOnce();
+      expect(internal.backendMode).toBe('streaming');
+      await controller.complete(text);
+      expect(cardCreate).toHaveBeenCalledOnce();
+      const body = cards
+        .get('card_1')
+        .body.elements.filter(
+          (entry: any) =>
+            entry.element_id === 'main_content' ||
+            /^body_/.test(entry.element_id ?? ''),
+        )
+        .map((entry: any) => entry.content)
+        .join('');
+      expect(body === text).toBe(true);
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  test('a hidden auxiliary capacity rejection removes optional details without per-slot fallback', async () => {
+    const {
+      controller,
+      internal,
+      batchUpdate,
+      elementContent,
+      cardCreate,
+      flush,
+    } = await nearCapacityController('Answer');
+    try {
+      addLargeDetails(controller);
+      await flush();
+      expect(internal.streamingBackend.hasRuntimeDetails()).toBe(true);
+      controller.updateToolSummary('tool_0', 'Changed tool summary');
+      batchUpdate.mockResolvedValueOnce({
+        code: 200860,
+        msg: 'rendered capacity exceeded',
+      });
+      elementContent.mockClear();
+      await flush();
+      await flush();
+      expect(elementContent).not.toHaveBeenCalled();
+      expect(internal.streamingBackend.hasRuntimeDetails()).toBe(false);
+      expect(internal.backendMode).toBe('streaming');
+      expect(internal.nativeCapacityScale).toBe(1);
+      await controller.complete('Answer');
+      expect(cardCreate).toHaveBeenCalledOnce();
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  test('repeated auxiliary capacity rejection repartitions unchanged prose through native pages', async () => {
+    const { controller, internal, text, batchUpdate, cardCreate, flush } =
+      await nearCapacityController();
+    try {
+      addLargeDetails(controller);
+      batchUpdate
+        .mockResolvedValueOnce({ code: 200860 })
+        .mockResolvedValueOnce({ code: 200860 });
+      await flush();
+      await flush();
+      await vi.waitFor(() => expect(cardCreate).toHaveBeenCalledTimes(2), {
+        timeout: 5000,
+      });
+      await internal.nativePageChain;
+      expect(internal.backendMode).toBe('streaming');
+      expect(internal.nativeCapacityScale).toBe(0.8);
+      expect(
+        internal.nativeCards.map((entry: any) => entry.text).join(''),
+      ).toBe(text);
+      await controller.complete(text);
+      expect(cardCreate).toHaveBeenCalledTimes(2);
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  test('unknown detail-shrink ACK fences subsequent body and terminal mutations', async () => {
+    const {
+      controller,
+      internal,
+      batchUpdate,
+      elementContent,
+      cardUpdate,
+      cardCreate,
+      flush,
+    } = await nearCapacityController('Answer');
+    try {
+      addLargeDetails(controller);
+      await flush();
+      batchUpdate
+        .mockRejectedValueOnce(new Error('shrink ACK lost'))
+        .mockRejectedValueOnce(new Error('shrink retry ACK lost'));
+      elementContent.mockClear();
+      cardUpdate.mockClear();
+      const text = 'Answer\n\n' + 'x'.repeat(295500);
+      controller.append(text);
+      await vi.waitFor(
+        () => expect(internal.terminalDeliveryError).toBeDefined(),
+        { timeout: 5000 },
+      );
+      await expect(controller.complete(text)).rejects.toBeDefined();
+      await expect(controller.abort('Stopped')).rejects.toBeDefined();
+      expect(elementContent).not.toHaveBeenCalled();
+      expect(cardUpdate).not.toHaveBeenCalled();
+      expect(cardCreate).toHaveBeenCalledOnce();
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  test('hidden detail-shrink capacity rejection drops details before repartitioning prose', async () => {
+    const { controller, internal, batchUpdate, cardCreate, flush } =
+      await nearCapacityController('Answer');
+    try {
+      addLargeDetails(controller);
+      await flush();
+      batchUpdate.mockResolvedValueOnce({ code: 200860 });
+      const text = 'Answer\n\n' + 'x'.repeat(286000);
+      controller.append(text);
+      await vi.waitFor(() => expect(internal.nativeCanonicalText).toBe(text), {
+        timeout: 5000,
+      });
+      expect(internal.nativeSuppressDetails).toBe(true);
+      expect(internal.nativeCapacityScale).toBe(1);
+      expect(internal.backendMode).toBe('streaming');
+      await controller.complete(text);
+      expect(cardCreate).toHaveBeenCalledOnce();
+    } finally {
+      controller.dispose();
+    }
+  });
+});
