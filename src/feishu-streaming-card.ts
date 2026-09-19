@@ -1366,6 +1366,8 @@ class StreamingModeBackend {
    * patchFailCount toward degradation even though nothing is wrong.
    */
   private chain: Promise<unknown> = Promise.resolve();
+  /** An unresolved auxiliary ACK also fences work already queued behind it. */
+  private uncertainAuxiliaryError: unknown;
 
   constructor(
     client: lark.Client,
@@ -1374,8 +1376,22 @@ class StreamingModeBackend {
     this.client = client;
   }
 
-  private enqueue<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.chain.then(fn, fn);
+  private enqueue<T>(
+    fn: () => Promise<T>,
+    fenceUncertainAuxiliary = false,
+  ): Promise<T> {
+    const execute = async (): Promise<T> => {
+      if (this.uncertainAuxiliaryError !== undefined)
+        throw this.uncertainAuxiliaryError;
+      try {
+        return await fn();
+      } catch (error) {
+        if (fenceUncertainAuxiliary && !canSwitchFeishuCardBackend(error))
+          this.uncertainAuxiliaryError ??= error;
+        throw error;
+      }
+    };
+    const run = this.chain.then(execute, execute);
     this.chain = run.then(
       () => undefined,
       () => undefined,
@@ -1781,7 +1797,11 @@ class StreamingModeBackend {
             // call reached CardKit but its acknowledgement was lost.
             await runBatch();
           } catch (retryError) {
-            batchFailure = retryError;
+            // A rejected retry cannot prove the first request was rejected.
+            // Only an ACK for the identical mutation resolves its uncertainty.
+            batchFailure = canSwitchFeishuCardBackend(firstError)
+              ? retryError
+              : firstError;
           }
         }
       }
@@ -1853,7 +1873,7 @@ class StreamingModeBackend {
         ],
         failed: [],
       };
-    });
+    }, true);
   }
 
   /**
@@ -3817,11 +3837,13 @@ export class StreamingCardController {
           details,
         );
       } catch (error) {
-        if (this.state !== 'streaming') return;
+        // complete()/abort() may already be draining this auxiliary mutation.
+        // Preserve unknown acceptance before applying the terminal-state guard.
         if (!canSwitchFeishuCardBackend(error)) {
           this.fenceVisibleCardMutation(error);
           return;
         }
+        if (this.state !== 'streaming') return;
         this.patchFailCount++;
         if (this.patchFailCount >= this.maxPatchFailures) this.degradeToV1();
         return;

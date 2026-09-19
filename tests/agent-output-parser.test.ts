@@ -10,6 +10,7 @@ import {
   attachStdoutHandler,
   handleNonZeroExit,
   handleSuccessClose,
+  type CloseHandlerContext,
 } from '../src/agent-output-parser.js';
 import type { ContainerOutput } from '../src/container-runner.js';
 
@@ -340,53 +341,126 @@ describe('close handlers — provider failure classification carryover', () => {
     return state;
   }
 
-  test('SIGTERM close after a streamed transient failure keeps its class', async () => {
-    const stdoutState = await stateAfterStreamedFailure({
-      status: 'error',
-      result: null,
-      providerFailure: true,
-      providerFailureClass: 'transient',
-      providerLivenessTimeout: true,
-      inputTurnId: 'task-run-1',
+  async function closeStreamedFrames(
+    frames: ContainerOutput[],
+    zeroExit = false,
+  ): Promise<ContainerOutput> {
+    const stream = new PassThrough();
+    const stdoutState = createStdoutParserState();
+    const onOutput = async (): Promise<void> => {};
+    attachStdoutHandler(stream, stdoutState, {
+      groupName: 'carryover-test',
+      label: 'Host agent',
+      resetTimeout: () => {},
+      onOutput,
     });
-    expect(stdoutState.hasProviderFailureOutput).toBe(true);
-    const resolved: ContainerOutput[] = [];
+    for (const frame of frames) {
+      stream.write(`${S}${JSON.stringify(frame)}${E}`);
+    }
+    stream.end();
+    // Closing before the queued callbacks settle exercises the production
+    // close-handler boundary, rather than manually constructing parser state.
+    return new Promise((resolve) => {
+      const context: CloseHandlerContext = {
+        groupName: 'carryover-test',
+        label: 'Host Agent',
+        filePrefix: 'host',
+        identifier: 'proc-carryover',
+        logsDir: '/tmp',
+        input: { prompt: 'prompt', isMain: false },
+        stdoutState,
+        stderrState: createStderrState(),
+        onOutput,
+        resolvePromise: resolve,
+        startTime: Date.now(),
+        timeoutMs: 1_000,
+      };
+      if (zeroExit) handleSuccessClose(context, 10);
+      else
+        expect(
+          handleNonZeroExit(
+            context,
+            null,
+            'SIGTERM',
+            10,
+            '/tmp/carryover-test.log',
+          ),
+        ).toBe(true);
+    });
+  }
 
-    expect(
-      handleNonZeroExit(
+  test.each(['interrupt', 'stream-terminal', 'error', 'zero-exit'] as const)(
+    '%s close retains transient classification without fabricating delivery evidence',
+    async (branch) => {
+      const frames: ContainerOutput[] = [];
+      if (branch === 'interrupt')
+        frames.push({
+          status: 'stream',
+          result: null,
+          streamEvent: { eventType: 'status', statusText: 'interrupted' },
+        });
+      if (branch === 'stream-terminal')
+        frames.push({ status: 'success', result: 'earlier turn' });
+      frames.push({
+        status: 'error',
+        result: null,
+        providerFailure: true,
+        providerFailureClass: 'transient',
+        providerLivenessTimeout: true,
+        inputTurnId: 'task-run-1',
+        ipcReceipts: [
+          {
+            deliveryId: 'delivery-1',
+            chatJid: 'web:carryover',
+            cursor: { id: 'message-1', timestamp: '2026-09-17T05:00:00.000Z' },
+          },
+        ],
+      });
+      const resolved = await closeStreamedFrames(
+        frames,
+        branch === 'zero-exit',
+      );
+      expect(resolved).toMatchObject({
+        status: branch === 'error' ? 'error' : 'success',
+        providerFailure: true,
+        providerFailureClass: 'transient',
+        providerLivenessTimeout: true,
+      });
+      expect(resolved.inputTurnId).toBeUndefined();
+      expect(resolved.ipcReceipts).toBeUndefined();
+    },
+  );
+
+  test('a later failure replaces old classification instead of inheriting its optional fields', async () => {
+    const resolved = await closeStreamedFrames(
+      [
         {
-          groupName: 'carryover-test',
-          label: 'Host Agent',
-          filePrefix: 'host',
-          identifier: 'proc-1',
-          logsDir: '/tmp',
-          input: { prompt: 'prompt', isMain: false },
-          stdoutState,
-          stderrState: createStderrState(),
-          onOutput: async () => {},
-          resolvePromise: (output) => resolved.push(output),
-          startTime: Date.now(),
-          timeoutMs: 1_000,
+          status: 'error',
+          result: null,
+          providerFailure: true,
+          providerFailureClass: 'transient',
+          providerLivenessTimeout: true,
+          providerRateLimitScope: 'model',
+          providerRateLimitModel: 'old-model',
+          providerRateLimitResetsAt: 1234,
+          providerFailureNotice: 'old notice',
         },
-        null,
-        'SIGTERM',
-        10,
-        '/tmp/carryover-test.log',
-      ),
-    ).toBe(true);
-
-    await stdoutState.outputChain;
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(resolved).toHaveLength(1);
-    expect(resolved[0]).toMatchObject({
-      providerFailure: true,
-      providerFailureClass: 'transient',
-      providerLivenessTimeout: true,
-    });
-    // Turn identity is delivery evidence and must never be re-attached to a
-    // synthesized close output.
-    expect(resolved[0].inputTurnId).toBeUndefined();
-    expect(resolved[0].ipcReceipts).toBeUndefined();
+        {
+          status: 'error',
+          result: null,
+          providerFailure: true,
+          providerFailureClass: 'config',
+          providerRateLimitResetsAt: 0,
+        },
+      ],
+      true,
+    );
+    expect(resolved.providerFailureClass).toBe('config');
+    expect(resolved.providerLivenessTimeout).toBeUndefined();
+    expect(resolved.providerRateLimitScope).toBeUndefined();
+    expect(resolved.providerRateLimitModel).toBeUndefined();
+    expect(resolved.providerFailureNotice).toBeUndefined();
+    expect(resolved.providerRateLimitResetsAt).toBe(0);
   });
 
   test('zero-exit close after a streamed model-scope failure keeps scope and reset stamp', async () => {
@@ -434,7 +508,7 @@ describe('close handlers — provider failure classification carryover', () => {
     });
   });
 
-  test('a later healthy frame does not resurrect provider-failure fields', async () => {
+  test('a healthy-only stream does not attach provider-failure fields', async () => {
     const stream = new PassThrough();
     const stdoutState = createStdoutParserState();
     attachStdoutHandler(stream, stdoutState, {

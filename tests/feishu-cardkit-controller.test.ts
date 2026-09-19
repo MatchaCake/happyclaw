@@ -1542,4 +1542,80 @@ describe('Feishu CardKit streaming controller', () => {
       controller.dispose();
     },
   );
+  test.each([
+    ['complete', 'unknown'],
+    ['abort', 'unknown'],
+    ['complete', 'rejected'],
+    ['abort', 'rejected'],
+  ] as const)(
+    '%s observes an uncertain auxiliary ACK followed by a %s retry and fences later mutations',
+    async (terminal, retryOutcome) => {
+      const mock = makeClient();
+      const controller = new StreamingCardController({
+        client: mock.client as any,
+        chatId: `oc_aux_ack_${terminal}`,
+      });
+      const body = 'a'.repeat(200000);
+      controller.append(body);
+      await vi.waitFor(() => expect(controller.currentState).toBe('streaming'));
+      await (controller as any).nativePageChain;
+      await (controller as any).streamingBackend.drain();
+      let rejectFirst!: (error: Error) => void;
+      let signal!: () => void;
+      const started = new Promise<void>((resolve) => {
+        signal = resolve;
+      });
+      const ackLost = new Error(
+        'provider accepted auxiliary batch but ACK was lost',
+      );
+      let attempts = 0;
+      mock.batchUpdate.mockImplementation(async () => {
+        if (++attempts === 1) {
+          signal();
+          return new Promise((_resolve, reject) => {
+            rejectFirst = reject;
+          });
+        }
+        if (retryOutcome === 'rejected')
+          return { code: 200600, msg: 'retry rejected by provider' };
+        throw ackLost;
+      });
+      controller.appendThinking('more thinking');
+      await started;
+      // Start a body flush while the auxiliary request owns the backend queue.
+      // It must not escape after the unknown ACK, even if its state guard ran.
+      const previousChain = (controller as any).nativePageChain;
+      controller.append(body + 'new text'.repeat(20));
+      await vi.waitFor(() =>
+        expect((controller as any).nativePageChain).not.toBe(previousChain),
+      );
+      const contents = mock.elementContent.mock.calls.length;
+      const updates = mock.cardUpdate.mock.calls.length;
+      const settings = mock.cardSettings.mock.calls.length;
+      const ending = (
+        terminal === 'complete'
+          ? controller.complete(body)
+          : controller.abort('stopped')
+      ).then(
+        () => ({ ok: true, error: undefined }),
+        (error) => ({ ok: false, error }),
+      );
+      rejectFirst(ackLost);
+      const result = await ending;
+      expect(result.ok).toBe(false);
+      expect(result.error).toMatchObject({ code: 'CHANNEL_DELIVERY_PARTIAL' });
+      expect(attempts).toBe(2);
+      const requests = mock.batchUpdate.mock.calls
+        .slice(-2)
+        .map(([request]) => request.data);
+      expect(requests[0]).toEqual(requests[1]);
+      expect(mock.cardCreate).toHaveBeenCalledOnce();
+      expect(mock.client.im.v1.message.create).toHaveBeenCalledOnce();
+      expect(mock.elementContent).toHaveBeenCalledTimes(contents);
+      expect(mock.cardUpdate).toHaveBeenCalledTimes(updates);
+      expect(mock.cardSettings).toHaveBeenCalledTimes(settings);
+      expect((controller as any).nativeCards[0].text).toBe(body);
+      controller.dispose();
+    },
+  );
 });
