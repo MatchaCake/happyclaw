@@ -4,12 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-// GHSA-vwc7-r8mq-g2x9 has no patched adm-zip release (cthackers/adm-zip#575
-// is still open). HappyClaw only extracts skill ZIPs into mkdtemp and rejects
-// archive symlink entries, so the advisory's "pre-existing destination
-// symlink + overwrite" precondition does not apply. Drop this once 0.6.1+
-// ships a real fix.
-const ALLOWED_ADVISORIES = new Set(['GHSA-vwc7-r8mq-g2x9']);
+const ALLOWED_ADVISORIES = new Set();
 
 const workspaces = [
   { label: 'root', cwd: root },
