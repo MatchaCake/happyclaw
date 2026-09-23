@@ -199,6 +199,8 @@ import {
   getSessionAgentIdentity,
   getAgentProfileForWorkspace,
   getWorkspaceInteractionMode,
+  getSessionInteractionMode,
+  setSessionInteractionMode,
   listAgentsByJid,
   getGroupsByOwner,
   getMessagesPage,
@@ -301,12 +303,15 @@ import {
   cleanupChannelReliability,
   getDeliveredChannelOutboxForTurn,
   getFailedChannelOutboxForTurn,
+  getChannelOutboxItem,
+  markFeishuCapacityReplacementDelivered,
   getChannelTurnRun,
   getUncertainChannelOutboxForTurn,
   CHANNEL_RELIABILITY_TERMINAL_STATUSES,
   type ChannelOutboxItem,
 } from './channel-reliability-store.js';
 import { prepareWeChatTextChunks } from './wechat-outbound.js';
+import { deliverFeishuScopedText } from './feishu-scoped-text-delivery.js';
 import { ChannelTurnRuntime } from './channel-turn-runtime.js';
 import {
   createChannelInboundRouter,
@@ -343,6 +348,12 @@ import {
   shouldSendProactiveTailInterruptionNotice,
   usesNativeMessagePresentation,
 } from './workspace-interaction-runtime.js';
+import {
+  resolveSourceInteractionMode,
+  selectSourceInteractionModePrefix,
+  sessionInteractionModeChanged,
+} from './channel-interaction-mode.js';
+
 import {
   channelConversationJid,
   parseChannelAddress,
@@ -501,7 +512,7 @@ import {
   hasAuthoritativeScheduledGroupTerminal,
   resolveScheduledGroupRunsForOutput,
   resolveScheduledGroupDeliveryRoute,
-  selectInteractionModeCompatibleMessagePrefix,
+  resolveScheduledGroupPromptInteractionMode,
   resolveTerminalScheduledGroupPromptRun,
   scheduledGroupPromptMessageId,
   resolveScheduledTaskIpcRunId,
@@ -529,6 +540,7 @@ import {
   MessageCursor,
   NewMessage,
   RegisteredGroup,
+  InteractionMode,
   StreamEvent,
   SubAgent,
   ChannelAccount,
@@ -594,7 +606,16 @@ import {
 import { installSkillForUser, deleteSkillForUser } from './routes/skills.js';
 import { verifyPairingCode } from './telegram-pairing.js';
 import { sdkQuery } from './sdk-query.js';
-import { executeSessionReset } from './commands.js';
+import {
+  executeSessionReset,
+  executeFreshWindowReset,
+  FRESH_WINDOW_FAILURE_REPLY,
+  FRESH_WINDOW_SUCCESS_REPLY,
+} from './commands.js';
+import {
+  captureWorkspaceSnapshot,
+  formatFreshWindowHandoff,
+} from './fresh-window.js';
 import {
   claimOwner,
   claimOwnerFromMention,
@@ -1513,60 +1534,82 @@ function injectPreparedFollowUp(
   const images = collectMessageImages(item.chat_jid, prepared.messages, {
     knownMessageIds: knownReferencedMessageIds,
   });
-  const result = queue.sendMessage(
-    item.chat_jid,
-    formatMessages(prepared.messages, {
-      knownMessageIds: knownReferencedMessageIds,
-    }),
-    images.length > 0 ? images : undefined,
-    (receipt) => {
-      if (runtime && receipt) {
-        activeAgentBuilderTurns.enqueueBatch(
-          agentBuilderTurnScope(runtime.effectiveGroup.folder, runtime.agentId),
-          (receipt.coveredCursors ?? [receipt.cursor]).map((cursor) => ({
-            chatJid: receipt.chatJid,
-            messageId: cursor.id,
-            runtimeTurnId: receipt.deliveryId,
-            scheduledTaskId: null,
-          })),
-        );
-        grantWorkspaceMemoryTurnToCurrentRunner(
-          {
-            groupFolder: runtime.effectiveGroup.folder,
-            agentId: runtime.agentId ?? null,
-            taskRunId: null,
-          },
-          receipt.deliveryId,
-        );
-      }
-      if (runtime?.agentId) {
-        activeHeldCardFinalizers.get(item.chat_jid)?.(
-          sourceJid,
-          receipt?.deliveryId,
-        );
-      } else if (runtime) {
-        invokeActiveRouteUpdater(
-          runtime.effectiveGroup.folder,
-          sourceJid,
-          receipt?.deliveryId,
-          receipt?.cursor,
-        );
-      }
-    },
-    sourceJid,
-    undefined,
-    deliveryTarget,
-    channelContext,
-    (receipt) =>
-      runtime
-        ? invokeActiveRouteAdmission(
-            runtime.effectiveGroup.folder,
-            sourceJid,
-            receipt,
-            runtime.agentId ?? undefined,
-          )
-        : false,
-  );
+  const interactionBatch = runtime
+    ? selectRuntimeInteractionBatch(
+        prepared.messages,
+        runtime.effectiveGroup,
+        item.chat_jid,
+        runtime.agentId
+          ? getAgent(runtime.agentId)?.kind === 'spawn'
+            ? 'spawn'
+            : 'conversation'
+          : 'main',
+      )
+    : undefined;
+  // A claimed mixed-mode batch is released intact to the durable cold reader,
+  // which selects a compatible prefix without consuming the remainder.
+  const result = interactionBatch?.hasDeferredMessages
+    ? 'no_active'
+    : queue.sendMessage(
+        item.chat_jid,
+        formatMessages(prepared.messages, {
+          knownMessageIds: knownReferencedMessageIds,
+        }),
+        images.length > 0 ? images : undefined,
+        (receipt) => {
+          if (runtime && receipt) {
+            activeAgentBuilderTurns.enqueueBatch(
+              agentBuilderTurnScope(
+                runtime.effectiveGroup.folder,
+                runtime.agentId,
+              ),
+              (receipt.coveredCursors ?? [receipt.cursor]).map((cursor) => ({
+                chatJid: receipt.chatJid,
+                messageId: cursor.id,
+                runtimeTurnId: receipt.deliveryId,
+                scheduledTaskId: null,
+              })),
+            );
+            grantWorkspaceMemoryTurnToCurrentRunner(
+              {
+                groupFolder: runtime.effectiveGroup.folder,
+                agentId: runtime.agentId ?? null,
+                taskRunId: null,
+              },
+              receipt.deliveryId,
+            );
+          }
+          if (runtime?.agentId) {
+            activeHeldCardFinalizers.get(item.chat_jid)?.(
+              sourceJid,
+              receipt?.deliveryId,
+            );
+          } else if (runtime) {
+            invokeActiveRouteUpdater(
+              runtime.effectiveGroup.folder,
+              sourceJid,
+              receipt?.deliveryId,
+              receipt?.cursor,
+            );
+          }
+        },
+        sourceJid,
+        undefined,
+        deliveryTarget,
+        channelContext,
+        (receipt) =>
+          runtime
+            ? invokeActiveRouteAdmission(
+                runtime.effectiveGroup.folder,
+                sourceJid,
+                receipt,
+                runtime.agentId ?? undefined,
+              )
+            : false,
+        interactionBatch
+          ? { interactionMode: interactionBatch.interactionMode }
+          : undefined,
+      );
 
   if (result === 'sent') {
     const deliveryUpdatedAt = new Date().toISOString();
@@ -2292,6 +2335,90 @@ function isHappyClawOwnerProfileRuntimeEligible(input: {
   });
 }
 
+/** Resolve only host-persisted routing metadata; message text and runner payloads cannot choose a mode. */
+function resolveTrustedInteractionMode(
+  group: RegisteredGroup,
+  sourceJid: string | null | undefined,
+  agentKind: 'main' | 'conversation' | 'spawn' = 'main',
+): InteractionMode {
+  return resolveSourceInteractionMode(
+    {
+      workspaceFolder: group.folder,
+      workspaceMode: getWorkspaceInteractionMode(group.folder),
+      sourceJid,
+      agentKind,
+    },
+    {
+      getMount: (source) =>
+        getChannelMount(source) ??
+        getChannelMount(channelConversationJid(source)),
+      getWorkspaceFolder: (jid) =>
+        (registeredGroups[jid] ?? getRegisteredGroup(jid))?.folder,
+    },
+  );
+}
+
+function selectRuntimeInteractionBatch(
+  messages: NewMessage[],
+  group: RegisteredGroup,
+  logicalJid: string,
+  agentKind: 'main' | 'conversation' | 'spawn' = 'main',
+) {
+  const workspaceMode = resolveRuntimeInteractionMode(
+    getWorkspaceInteractionMode(group.folder),
+    { agentKind },
+  );
+  return selectSourceInteractionModePrefix(
+    messages,
+    (message) => {
+      if (agentKind === 'spawn') return 'assistant';
+      // A durable scheduled group occurrence owns its original interaction
+      // contract, including replay after a later mount/workspace setting edit.
+      const frozen = resolveScheduledGroupPromptInteractionMode(
+        message,
+        getTaskRunById,
+      );
+      if (frozen) return frozen;
+      if (message.source_kind === 'scheduled_task_prompt') return workspaceMode;
+      return resolveTrustedInteractionMode(
+        group,
+        message.source_jid || message.chat_jid || logicalJid,
+        agentKind,
+      );
+    },
+    workspaceMode,
+  );
+}
+
+function resetSessionForInteractionModeMismatch(
+  group: RegisteredGroup,
+  requiredMode: InteractionMode,
+  agentId?: string,
+  agentKind: 'main' | 'conversation' | 'spawn' = 'main',
+): boolean {
+  if (
+    !sessionInteractionModeChanged({
+      sessionId: getSession(group.folder, agentId),
+      storedMode: getSessionInteractionMode(group.folder, agentId),
+      legacyMode: resolveRuntimeInteractionMode(
+        getWorkspaceInteractionMode(group.folder),
+        { agentKind },
+      ),
+      requiredMode,
+    })
+  )
+    return false;
+  // Only the SDK resume token is invalidated. Persisted messages, mounts and
+  // sibling sessions are retained and the normal fresh-history path runs.
+  deleteSession(group.folder, agentId);
+  if (!agentId) delete sessions[group.folder];
+  logger.info(
+    { groupFolder: group.folder, agentId, requiredMode },
+    'Reset SDK resume after source interaction contract changed',
+  );
+  return true;
+}
+
 function hasSessionAgentProfileMismatch(
   groupFolder: string,
   agentId: string | null | undefined,
@@ -2557,17 +2684,19 @@ function childChannelOutboxRef(
 
 class ScopedChannelDeliveryError extends Error {
   readonly deliveryPhase: 'rejected' | 'uncertain';
+  readonly outboxItemId?: string;
 
   constructor(
     readonly status: Exclude<ChannelOutboxDeliveryOutcome, 'delivered'>,
     message: string,
-    options: { cause?: unknown } = {},
+    options: { cause?: unknown; outboxItemId?: string } = {},
   ) {
     super(
       message,
       options.cause === undefined ? undefined : { cause: options.cause },
     );
     this.name = 'ScopedChannelDeliveryError';
+    this.outboxItemId = options.outboxItemId;
     this.deliveryPhase = status === 'failed' ? 'rejected' : 'uncertain';
   }
 }
@@ -2772,6 +2901,7 @@ async function deliverScopedChannelOutput(
       input.failure.error = new ScopedChannelDeliveryError(
         result.status,
         result.error ?? `Channel delivery ended as ${result.status}`,
+        { outboxItemId: result.itemId },
       );
     }
     logger.warn(
@@ -2822,6 +2952,25 @@ async function retryImOperation(
   return result.ok;
 }
 
+async function settleFeishuCapacityReplacement(
+  failure: unknown,
+  budget: number,
+): Promise<void> {
+  const id =
+    failure instanceof ScopedChannelDeliveryError
+      ? failure.outboxItemId
+      : undefined;
+  const item = id ? getChannelOutboxItem(id) : undefined;
+  if (
+    !item ||
+    !markFeishuCapacityReplacementDelivered(item.id, item.payloadHash, budget)
+  ) {
+    throw new Error(
+      'Feishu replacement pages were acknowledged but their rejected parent could not be durably retired',
+    );
+  }
+}
+
 /**
  * Send an IM message with retry.
  * On final failure, increments imSendFailCounts and may auto-unbind the IM group.
@@ -2845,12 +2994,16 @@ async function sendImWithRetry(
   if (durableScoped) {
     ok = true;
     const weChat = getChannelType(imJid) === 'wechat';
+    const feishuNative =
+      getChannelType(imJid) === 'feishu' &&
+      deliveryOptions?.presentation === 'native';
     const textChunks = text
       ? weChat
         ? prepareWeChatTextChunks(text)
         : [text]
       : [];
-    const totalPhysicalOutputs = textChunks.length + localImagePaths.length;
+    let textPhysicalOutputs = textChunks.length;
+    let totalPhysicalOutputs = textPhysicalOutputs + localImagePaths.length;
     let deliveredOutputs = 0;
 
     const recordTailFailure = (tail: unknown): void => {
@@ -2874,35 +3027,70 @@ async function sendImWithRetry(
           : scopedTail;
     };
 
-    for (let index = 0; index < textChunks.length; index++) {
-      const chunk = textChunks[index]!;
-      const chunkFailure: { error?: unknown } = {};
-      const delivered = await deliverScopedChannelOutput(
-        imJid,
-        childChannelOutboxRef(outbox!, weChat ? `text:${index}` : 'text'),
-        {
-          kind: 'text',
-          payload: buildInteractionTextOutboxPayload(
-            chunk,
-            deliveryOptions?.presentation,
-            outboxMetadata,
-          ),
-          send: (item) =>
-            imManager.sendMessage(imJid, chunk, [], {
-              ...deliveryOptions,
-              deliveryId: item.id,
-              chunkIndex: index,
-              physicalOutput: weChat,
-            }),
-          failure: chunkFailure,
+    if (feishuNative && text) {
+      const textResult = await deliverFeishuScopedText(text, {
+        onCapacityResolved: settleFeishuCapacityReplacement,
+        send: async (page) => {
+          const pageFailure: { error?: unknown } = {};
+          const delivered = await deliverScopedChannelOutput(
+            imJid,
+            childChannelOutboxRef(outbox!, page.slot),
+            {
+              kind: 'text',
+              payload: buildInteractionTextOutboxPayload(
+                page.text,
+                'native',
+                outboxMetadata,
+              ),
+              send: (item) =>
+                imManager.sendMessage(imJid, page.text, [], {
+                  ...deliveryOptions,
+                  deliveryId: item.id,
+                  chunkIndex: page.index,
+                  physicalOutput: true,
+                }),
+              failure: pageFailure,
+            },
+          );
+          return { delivered: delivered === true, error: pageFailure.error };
         },
-      );
-      if (delivered !== true) {
-        ok = false;
-        recordTailFailure(chunkFailure.error);
-        break;
+      });
+      deliveredOutputs = textResult.deliveredOutputs;
+      textPhysicalOutputs = textResult.totalOutputs;
+      totalPhysicalOutputs = textPhysicalOutputs + localImagePaths.length;
+      ok = textResult.delivered;
+      if (!ok) recordTailFailure(textResult.error);
+    } else {
+      for (let index = 0; index < textChunks.length; index++) {
+        const chunk = textChunks[index]!;
+        const chunkFailure: { error?: unknown } = {};
+        const delivered = await deliverScopedChannelOutput(
+          imJid,
+          childChannelOutboxRef(outbox!, weChat ? `text:${index}` : 'text'),
+          {
+            kind: 'text',
+            payload: buildInteractionTextOutboxPayload(
+              chunk,
+              deliveryOptions?.presentation,
+              outboxMetadata,
+            ),
+            send: (item) =>
+              imManager.sendMessage(imJid, chunk, [], {
+                ...deliveryOptions,
+                deliveryId: item.id,
+                chunkIndex: index,
+                physicalOutput: weChat,
+              }),
+            failure: chunkFailure,
+          },
+        );
+        if (delivered !== true) {
+          ok = false;
+          recordTailFailure(chunkFailure.error);
+          break;
+        }
+        deliveredOutputs += 1;
       }
-      deliveredOutputs += 1;
     }
 
     for (let index = 0; ok && index < localImagePaths.length; index++) {
@@ -2948,7 +3136,7 @@ async function sendImWithRetry(
               path.basename(imagePath),
               {
                 deliveryId: item.id,
-                chunkIndex: textChunks.length + index,
+                chunkIndex: textPhysicalOutputs + index,
                 physicalOutput: weChat,
               },
             ),
@@ -3383,6 +3571,65 @@ async function sendTaskImageWithRetry(
 ): Promise<boolean> {
   if (!imManager.isChannelAvailableForJid(targetJid)) return false;
   const channelType = getChannelType(targetJid);
+  if (channelType === 'feishu' && outbox && caption) {
+    // Feishu historically publishes the image before its caption. Keep that
+    // order while giving each caption page its own durable physical receipt.
+    const imageDelivered = await sendTaskImageWithRetry(
+      targetJid,
+      imageBuffer,
+      mimeType,
+      undefined,
+      fileName,
+      childChannelOutboxRef(outbox, 'image'),
+      failure,
+    );
+    if (!imageDelivered) return false;
+    const captions = await deliverFeishuScopedText(caption, {
+      slot: 'caption',
+      onCapacityResolved: settleFeishuCapacityReplacement,
+      send: async (page) => {
+        const pageFailure: { error?: unknown } = {};
+        const delivered = await deliverScopedChannelOutput(
+          targetJid,
+          childChannelOutboxRef(outbox, page.slot),
+          {
+            kind: 'text',
+            payload: {
+              text: page.text,
+              role: 'image_caption',
+              presentation: 'native',
+            },
+            send: (item) =>
+              imManager.sendMessage(targetJid, page.text, [], {
+                presentation: 'native',
+                deliveryId: item.id,
+                chunkIndex: page.index + 1,
+                physicalOutput: true,
+              }),
+            failure: pageFailure,
+          },
+        );
+        return { delivered: delivered === true, error: pageFailure.error };
+      },
+    });
+    if (!captions.delivered && failure) {
+      const tail =
+        captions.error instanceof ScopedChannelDeliveryError
+          ? captions.error
+          : new ScopedChannelDeliveryError(
+              'busy',
+              'Feishu caption was not acknowledged',
+              { cause: captions.error },
+            );
+      failure.error = new ScopedChannelPartialDeliveryError(
+        1 + captions.deliveredOutputs,
+        1 + captions.totalOutputs,
+        tail,
+      );
+    }
+    return captions.delivered;
+  }
+
   const separatesImageCaption =
     channelType === 'wechat' ||
     channelType === 'dingtalk' ||
@@ -3909,6 +4156,8 @@ async function handleCommand(
   switch (cmd) {
     case 'clear':
       return handleClearCommand(chatJid);
+    case 'fresh':
+      return handleFreshCommand(chatJid, rawArgs);
     case 'list':
     case 'ls':
       return handleListCommand(chatJid);
@@ -3984,6 +4233,64 @@ async function handleClearCommand(chatJid: string): Promise<string> {
       'handleCommand /clear failed',
     );
     return '清除上下文失败，请稍后重试';
+  }
+}
+
+async function handleFreshCommand(
+  chatJid: string,
+  rawNotes: string,
+): Promise<string> {
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return '未找到当前工作区';
+
+  const target = resolveBoundChatTarget(
+    chatJid,
+    group,
+    (jid) => registeredGroups[jid] ?? getRegisteredGroup(jid),
+    getAgent,
+    findGroupNameByFolder,
+    resolveWorkspaceJid,
+  );
+  if (!target) return '当前绑定目标不存在，请先重新绑定工作区或会话。';
+
+  try {
+    const targetGroup =
+      registeredGroups[target.baseChatJid] ??
+      getRegisteredGroup(target.baseChatJid);
+    const snapshotCwd =
+      targetGroup?.customCwd || path.join(GROUPS_DIR, target.folder);
+    const snapshot = await captureWorkspaceSnapshot(snapshotCwd);
+    const handoff = formatFreshWindowHandoff({
+      notes: rawNotes,
+      snapshot,
+    });
+    await executeFreshWindowReset(
+      target.baseChatJid,
+      target.folder,
+      {
+        queue,
+        sessions,
+        broadcast: broadcastNewMessage,
+        setLastAgentTimestamp: setCursors,
+      },
+      {
+        agentId: target.agentId ?? undefined,
+        handoff,
+      },
+    );
+    return FRESH_WINDOW_SUCCESS_REPLY;
+  } catch (err) {
+    logger.error(
+      {
+        chatJid,
+        targetChatJid: target.targetChatJid,
+        targetFolder: target.folder,
+        agentId: target.agentId,
+        err,
+      },
+      'handleCommand /fresh failed',
+    );
+    return FRESH_WINDOW_FAILURE_REPLY;
   }
 }
 
@@ -6053,14 +6360,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (missedMessages.length === 0) return true;
   }
 
-  const liveInteractionMode = resolveRuntimeInteractionMode(
-    getWorkspaceInteractionMode(effectiveGroup.folder),
-    { agentKind: 'main' },
-  );
-  const interactionBatch = selectInteractionModeCompatibleMessagePrefix(
+  const interactionBatch = selectRuntimeInteractionBatch(
     missedMessages,
-    liveInteractionMode,
-    getTaskRunById,
+    effectiveGroup,
+    chatJid,
   );
   missedMessages = selectChannelReplyBatch(interactionBatch.messages);
   const interactionMode = interactionBatch.interactionMode;
@@ -6201,6 +6504,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     effectiveGroup,
     agentProfile,
   );
+  const resetForInteractionMode = resetSessionForInteractionModeMismatch(
+    effectiveGroup,
+    interactionMode,
+  );
 
   // Recovery mode: session was cleared to prevent session ghost, so inject
   // recent conversation history to give the fresh session context.
@@ -6224,15 +6531,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         'Recovery: injected recent conversation history into prompt',
       );
     }
-  } else if (resetForAgentProfile) {
+  } else if (resetForAgentProfile || resetForInteractionMode) {
     historyContext = buildRecentConversationHistoryContext(
       chatJid,
       new Set(missedMessages.map((m) => m.id)),
       {
         limit: 30,
         maxMessageLength: 700,
-        intro:
-          '检测到当前 workspace 切换或更新了顶层 AgentProfile 身份提示词，底层模型 session 已重置。以下是 HappyClaw 保存的最近对话记录，供你在新身份下延续上下文。',
+        intro: resetForInteractionMode
+          ? '当前输入来源使用不同的回复模式，底层模型 session 已重置。以下是 HappyClaw 保存的最近对话记录，供你延续上下文。'
+          : '检测到当前 workspace 切换或更新了顶层 AgentProfile 身份提示词，底层模型 session 已重置。以下是 HappyClaw 保存的最近对话记录，供你在新身份下延续上下文。',
       },
     );
     if (historyContext) {
@@ -9127,6 +9435,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       currentChannelContext,
       agentProfile,
       missedMessages.map((message) => message.id),
+      interactionMode,
     );
   } finally {
     runEnded = true;
@@ -10067,6 +10376,7 @@ async function runAgent(
   channelContext?: ChannelTurnContext,
   agentProfile?: AgentProfile,
   currentBatchMessageIds?: readonly string[],
+  frozenInteractionMode?: InteractionMode,
 ): Promise<{ status: 'success' | 'error' | 'closed'; error?: string }> {
   const isHome = !!group.is_home;
   const owner = group.created_by ? getUserById(group.created_by) : undefined;
@@ -10074,10 +10384,10 @@ async function runAgent(
   const resolvedAgentProfile = resolveEffectiveAgentProfile(
     agentProfile ?? getAgentProfileForWorkspace(group.folder, group.created_by),
   );
-  const interactionMode = resolveRuntimeInteractionMode(
-    getWorkspaceInteractionMode(group.folder),
-    { agentKind: 'main' },
-  );
+  const interactionMode =
+    frozenInteractionMode ??
+    resolveTrustedInteractionMode(group, currentSourceJid || chatJid);
+  resetSessionForInteractionModeMismatch(group, interactionMode);
   if (resetMainSessionForAgentProfileMismatch(group, resolvedAgentProfile)) {
     logger.info(
       { groupFolder: group.folder, chatJid },
@@ -10175,6 +10485,7 @@ async function runAgent(
         agentProfileVersion: resolvedAgentProfile?.version,
         identityHash: resolvedAgentProfile?.identity_hash,
       });
+      setSessionInteractionMode(group.folder, undefined, interactionMode);
     }
     await onOutput?.(output);
     // A runner receipt proves model consumption, not successful Host
@@ -10335,6 +10646,7 @@ async function runAgent(
         agentProfileVersion: resolvedAgentProfile?.version,
         identityHash: resolvedAgentProfile?.identity_hash,
       });
+      setSessionInteractionMode(group.folder, undefined, interactionMode);
     }
 
     if (rotatingTurnCompleted) {
@@ -12459,6 +12771,10 @@ async function processTaskIpc(
     expectedAgentVersion?: number;
     definition?: unknown;
     assumptions?: string[];
+    // Zero-summary fresh window switch
+    notes?: string;
+    next_focus?: string;
+    handoff?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isAdminHome: boolean, // Whether source is admin home container
@@ -14756,6 +15072,84 @@ async function processTaskIpc(
       }
       break;
 
+    case 'fresh_window': {
+      const failFresh = (error: string): void => {
+        logger.warn({ sourceGroup, error }, 'fresh_window rejected');
+        writeTaskResult(tasksDir, 'fresh_window', data.requestId, {
+          success: false,
+          error,
+        });
+      };
+      try {
+        const handoff =
+          typeof data.handoff === 'string' ? data.handoff.trim() : '';
+        if (!handoff) {
+          failFresh('fresh_window requires a handoff payload');
+          break;
+        }
+
+        let baseChatJid = typeof data.chatJid === 'string' ? data.chatJid : '';
+        let agentId = ipcAgentId ?? undefined;
+        const agentSep = '#agent:';
+        const agentIdx = baseChatJid.indexOf(agentSep);
+        if (agentIdx >= 0) {
+          if (!agentId) {
+            agentId =
+              baseChatJid.slice(agentIdx + agentSep.length) || undefined;
+          }
+          baseChatJid = baseChatJid.slice(0, agentIdx);
+        }
+        if (!baseChatJid) {
+          const jids = getJidsByFolder(sourceGroup);
+          baseChatJid =
+            jids.find((jid) => jid.startsWith('web:')) ?? jids[0] ?? '';
+        }
+        if (!baseChatJid) {
+          failFresh('Unable to resolve workspace chat for fresh_window');
+          break;
+        }
+
+        const targetGroup =
+          registeredGroups[baseChatJid] ?? getRegisteredGroup(baseChatJid);
+        if (!targetGroup) {
+          failFresh('Unable to resolve workspace for fresh_window');
+          break;
+        }
+        if (targetGroup.folder !== sourceGroup) {
+          failFresh('fresh_window target is outside this workspace');
+          break;
+        }
+
+        // Acknowledge before stopGroup so the runner can finish the MCP tool.
+        // Validation already passed; do not write a second terminal result.
+        writeTaskResult(tasksDir, 'fresh_window', data.requestId, {
+          success: true,
+          accepted: true,
+        });
+        try {
+          await executeFreshWindowReset(
+            baseChatJid,
+            sourceGroup,
+            {
+              queue,
+              sessions,
+              broadcast: broadcastNewMessage,
+              setLastAgentTimestamp: setCursors,
+            },
+            { agentId, handoff },
+          );
+        } catch (resetErr) {
+          logger.error(
+            { sourceGroup, baseChatJid, agentId, err: resetErr },
+            'fresh_window accepted but reset failed',
+          );
+        }
+      } catch (err) {
+        failFresh(err instanceof Error ? err.message : String(err));
+      }
+      break;
+    }
+
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
   }
@@ -14951,8 +15345,18 @@ async function processAgentConversation(
     }
     return;
   }
-  const replyBatch = selectChannelReplyBatch(missedMessages);
-  if (replyBatch.length < missedMessages.length) {
+  const interactionBatch = selectRuntimeInteractionBatch(
+    missedMessages,
+    effectiveGroup,
+    chatJid,
+    agent.kind,
+  );
+  const interactionMode = interactionBatch.interactionMode;
+  const replyBatch = selectChannelReplyBatch(interactionBatch.messages);
+  if (
+    interactionBatch.hasDeferredMessages ||
+    replyBatch.length < interactionBatch.messages.length
+  ) {
     queue.enqueueTask(virtualChatJid, `agent-channel-next:${agentId}`, () =>
       processAgentConversation(chatJid, agentId),
     );
@@ -15076,9 +15480,11 @@ async function processAgentConversation(
       effectiveGroup.created_by,
     ),
   );
-  const interactionMode = resolveRuntimeInteractionMode(
-    getWorkspaceInteractionMode(effectiveGroup.folder),
-    { agentKind: agent.kind },
+  const resetForInteractionMode = resetSessionForInteractionModeMismatch(
+    effectiveGroup,
+    interactionMode,
+    agentId,
+    agent.kind,
   );
   const resetForAgentProfile = resetConversationSessionForAgentProfileMismatch(
     effectiveGroup,
@@ -15098,6 +15504,7 @@ async function processAgentConversation(
   const startsFreshSession =
     !sessionId ||
     resetForAgentProfile ||
+    resetForInteractionMode ||
     willClearSessionOnProviderSwitch(
       effectiveGroup.folder,
       agentId,
@@ -16254,6 +16661,11 @@ async function processAgentConversation(
         agentProfileVersion: agentProfile?.version,
         identityHash: agentProfile?.identity_hash,
       });
+      setSessionInteractionMode(
+        effectiveGroup.folder,
+        agentId,
+        interactionMode,
+      );
       currentAgentSessionId = output.newSessionId;
     }
 
@@ -17280,6 +17692,7 @@ async function processAgentConversation(
         agentId,
         selectedProviderId,
         feishuCliAccountId,
+        interactionMode,
         onDeferredInterruptFailure: () => {
           clearSteeringInterrupt(virtualJid);
           dispatchQueuedFollowUpFamily(virtualJid);
@@ -17423,6 +17836,11 @@ async function processAgentConversation(
         agentProfileVersion: agentProfile?.version,
         identityHash: agentProfile?.identity_hash,
       });
+      setSessionInteractionMode(
+        effectiveGroup.folder,
+        agentId,
+        interactionMode,
+      );
     }
 
     if (rotatingAgentTurnCompleted) {
@@ -18178,16 +18596,11 @@ async function startMessageLoop(): Promise<void> {
             allPending.length > 0 ? allPending : groupMessages;
           const { effectiveGroup: activeEffectiveGroup } =
             resolveEffectiveGroup(group);
-          const liveWarmInteractionMode = resolveRuntimeInteractionMode(
-            getWorkspaceInteractionMode(activeEffectiveGroup.folder),
-            { agentKind: 'main' },
+          const warmInteractionBatch = selectRuntimeInteractionBatch(
+            messagesToSend,
+            activeEffectiveGroup,
+            chatJid,
           );
-          const warmInteractionBatch =
-            selectInteractionModeCompatibleMessagePrefix(
-              messagesToSend,
-              liveWarmInteractionMode,
-              getTaskRunById,
-            );
           messagesToSend = selectChannelReplyBatch(
             warmInteractionBatch.messages,
           );
@@ -19542,7 +19955,15 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
     // Fetch pending messages
     const sinceCursor = lastAgentTimestamp[virtualChatJid] || EMPTY_CURSOR;
     const allPendingMessages = getMessagesSince(virtualChatJid, sinceCursor);
-    const missedMessages = selectChannelReplyBatch(allPendingMessages);
+    const { effectiveGroup } = resolveEffectiveGroup(group);
+    const interactionBatch = selectRuntimeInteractionBatch(
+      allPendingMessages,
+      effectiveGroup,
+      homeChatJid,
+      agent?.kind === 'spawn' ? 'spawn' : 'conversation',
+    );
+    const missedMessages = selectChannelReplyBatch(interactionBatch.messages);
+    const requiredInteractionMode = interactionBatch.interactionMode;
 
     // IM messages must force-restart the agent process so reply routing
     // (replySourceImJid) is recalculated from the latest batch.  This mirrors
@@ -19658,6 +20079,7 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
                 receipt,
                 agentId,
               ),
+            { interactionMode: requiredInteractionMode },
           )
         : 'no_active';
       if (sendResult === 'sent' && deliveryTarget) {
@@ -19902,7 +20324,9 @@ function handleCardInterrupt(
 
   const session = getStreamingSession(chatJid);
   if (session?.isActive()) {
-    session.abort('已停止').catch((err) => {
+    // Let the callback acknowledge immediately; the session preserves the
+    // generated answer and exclusively owns the asynchronous card finalization.
+    void session.abort('已停止').catch((err) => {
       logger.debug({ err, chatJid }, 'Failed to abort streaming card');
     });
   }
@@ -20026,6 +20450,58 @@ async function handleFeishuSessionClear(input: {
       'Feishu session clear failed',
     );
     return 'Failed to clear the session context. Please try again.';
+  }
+}
+
+async function handleFeishuSessionFresh(input: {
+  sourceJid: string;
+  targetJid?: string;
+  senderImId: string;
+  notes: string;
+}): Promise<string> {
+  const targetJid = input.targetJid;
+  const runtime = targetJid ? resolveFollowUpRuntime(targetJid) : null;
+  if (!targetJid || !runtime) {
+    return '当前绑定目标不存在，无法执行 /fresh。';
+  }
+  try {
+    const snapshotCwd =
+      runtime.effectiveGroup.customCwd ||
+      path.join(GROUPS_DIR, runtime.effectiveGroup.folder);
+    const snapshot = await captureWorkspaceSnapshot(snapshotCwd);
+    const handoff = formatFreshWindowHandoff({
+      notes: input.notes,
+      snapshot,
+    });
+    await executeFreshWindowReset(
+      runtime.baseChatJid,
+      runtime.effectiveGroup.folder,
+      {
+        queue,
+        sessions,
+        broadcast: broadcastNewMessage,
+        setLastAgentTimestamp: setCursors,
+      },
+      {
+        agentId: runtime.agentId ?? undefined,
+        handoff,
+      },
+    );
+    logger.info(
+      {
+        sourceJid: input.sourceJid,
+        targetJid,
+        senderImId: input.senderImId,
+      },
+      'Feishu session fresh window processed',
+    );
+    return FRESH_WINDOW_SUCCESS_REPLY;
+  } catch (err) {
+    logger.error(
+      { err, sourceJid: input.sourceJid, targetJid },
+      'Feishu session fresh window failed',
+    );
+    return FRESH_WINDOW_FAILURE_REPLY;
   }
 }
 
@@ -20171,6 +20647,7 @@ async function reloadChannelAccountById(accountId: string): Promise<boolean> {
           onFollowUpMessage: handleIncomingFollowUp,
           onSessionBreak: handleSessionBreak,
           onSessionClear: handleFeishuSessionClear,
+          onSessionFresh: handleFeishuSessionFresh,
           onFollowUpCardAction: handleFollowUpCardAction,
           onCardInterrupt: handleCardInterrupt,
           onP2pSender: (senderOpenId: string) => {
@@ -21104,6 +21581,7 @@ async function main(): Promise<void> {
             onFollowUpMessage: handleIncomingFollowUp,
             onSessionBreak: handleSessionBreak,
             onSessionClear: handleFeishuSessionClear,
+            onSessionFresh: handleFeishuSessionFresh,
             onFollowUpCardAction: handleFollowUpCardAction,
             onCardInterrupt: handleCardInterrupt,
             onP2pSender: onReloadP2pSender,

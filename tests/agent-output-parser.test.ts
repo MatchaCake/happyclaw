@@ -9,6 +9,8 @@ import {
   createStderrState,
   attachStdoutHandler,
   handleNonZeroExit,
+  handleSuccessClose,
+  type CloseHandlerContext,
 } from '../src/agent-output-parser.js';
 import type { ContainerOutput } from '../src/container-runner.js';
 
@@ -222,7 +224,8 @@ describe('handleNonZeroExit — provider failure lifecycle', () => {
       status: 'success',
     },
     { label: 'code 137', code: 137, signal: null, status: 'success' },
-    { label: 'code 143', code: 143, signal: null, status: 'error' },
+    { label: 'code 143', code: 143, signal: null, status: 'success' },
+    { label: 'code 2 after success', code: 2, signal: null, status: 'success' },
   ])(
     'preserves providerFailure when docker stop closes with $label',
     async ({ code, signal, status }) => {
@@ -270,6 +273,282 @@ describe('handleNonZeroExit — provider failure lifecycle', () => {
       }
     },
   );
+
+  test('code 2 after a closed stream keeps closed, not a hard error', async () => {
+    const stdoutState = createStdoutParserState();
+    stdoutState.hasClosedOutput = true;
+    const resolved: ContainerOutput[] = [];
+
+    expect(
+      handleNonZeroExit(
+        {
+          groupName: 'closed-then-code-2',
+          label: 'Container',
+          filePrefix: 'container',
+          identifier: 'container-id',
+          logsDir: '/tmp',
+          input: { prompt: 'prompt', isMain: true },
+          stdoutState,
+          stderrState: createStderrState(),
+          onOutput: async () => {},
+          resolvePromise: (output) => resolved.push(output),
+          startTime: Date.now(),
+          timeoutMs: 1_000,
+        },
+        2,
+        null,
+        10,
+        '/tmp/closed-then-code-2.log',
+      ),
+    ).toBe(true);
+
+    await stdoutState.outputChain;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(resolved).toEqual([
+      expect.objectContaining({ status: 'closed', result: null }),
+    ]);
+  });
+});
+
+describe('close handlers — provider failure classification carryover', () => {
+  // Regression (2026-09-17 scheduled-run incident): the host kills the runner
+  // right after a streamed provider-failure frame, so the final ContainerOutput
+  // is synthesized by a close handler. It used to carry only the boolean
+  // `providerFailure` flag; the class fields were lost, so a *transient*
+  // failure defaulted back to an 'account' verdict downstream. For a scheduled
+  // task that misclassification cancelled the same-provider replay the
+  // transient ledger had just granted ("no availability progress") and
+  // surfaced the quota notice for a failure that had nothing to do with quota.
+
+  const S = '---HAPPYCLAW_OUTPUT_START---';
+  const E = '---HAPPYCLAW_OUTPUT_END---';
+
+  async function stateAfterStreamedFailure(
+    failureFrame: Record<string, unknown>,
+  ) {
+    const stream = new PassThrough();
+    const state = createStdoutParserState();
+    attachStdoutHandler(stream, state, {
+      groupName: 'carryover-test',
+      label: 'Host agent',
+      resetTimeout: () => {},
+      onOutput: async () => {},
+    });
+    stream.write(`${S}${JSON.stringify(failureFrame)}${E}`);
+    stream.end();
+    await new Promise((r) => setTimeout(r, 10));
+    await state.outputChain;
+    return state;
+  }
+
+  async function closeStreamedFrames(
+    frames: ContainerOutput[],
+    zeroExit = false,
+  ): Promise<ContainerOutput> {
+    const stream = new PassThrough();
+    const stdoutState = createStdoutParserState();
+    const onOutput = async (): Promise<void> => {};
+    attachStdoutHandler(stream, stdoutState, {
+      groupName: 'carryover-test',
+      label: 'Host agent',
+      resetTimeout: () => {},
+      onOutput,
+    });
+    for (const frame of frames) {
+      stream.write(`${S}${JSON.stringify(frame)}${E}`);
+    }
+    stream.end();
+    // Closing before the queued callbacks settle exercises the production
+    // close-handler boundary, rather than manually constructing parser state.
+    return new Promise((resolve) => {
+      const context: CloseHandlerContext = {
+        groupName: 'carryover-test',
+        label: 'Host Agent',
+        filePrefix: 'host',
+        identifier: 'proc-carryover',
+        logsDir: '/tmp',
+        input: { prompt: 'prompt', isMain: false },
+        stdoutState,
+        stderrState: createStderrState(),
+        onOutput,
+        resolvePromise: resolve,
+        startTime: Date.now(),
+        timeoutMs: 1_000,
+      };
+      if (zeroExit) handleSuccessClose(context, 10);
+      else
+        expect(
+          handleNonZeroExit(
+            context,
+            null,
+            'SIGTERM',
+            10,
+            '/tmp/carryover-test.log',
+          ),
+        ).toBe(true);
+    });
+  }
+
+  test.each(['interrupt', 'stream-terminal', 'error', 'zero-exit'] as const)(
+    '%s close retains transient classification without fabricating delivery evidence',
+    async (branch) => {
+      const frames: ContainerOutput[] = [];
+      if (branch === 'interrupt')
+        frames.push({
+          status: 'stream',
+          result: null,
+          streamEvent: { eventType: 'status', statusText: 'interrupted' },
+        });
+      if (branch === 'stream-terminal')
+        frames.push({ status: 'success', result: 'earlier turn' });
+      frames.push({
+        status: 'error',
+        result: null,
+        providerFailure: true,
+        providerFailureClass: 'transient',
+        providerLivenessTimeout: true,
+        inputTurnId: 'task-run-1',
+        ipcReceipts: [
+          {
+            deliveryId: 'delivery-1',
+            chatJid: 'web:carryover',
+            cursor: { id: 'message-1', timestamp: '2026-09-17T05:00:00.000Z' },
+          },
+        ],
+      });
+      const resolved = await closeStreamedFrames(
+        frames,
+        branch === 'zero-exit',
+      );
+      expect(resolved).toMatchObject({
+        status: branch === 'error' ? 'error' : 'success',
+        providerFailure: true,
+        providerFailureClass: 'transient',
+        providerLivenessTimeout: true,
+      });
+      expect(resolved.inputTurnId).toBeUndefined();
+      expect(resolved.ipcReceipts).toBeUndefined();
+    },
+  );
+
+  test('a later failure replaces old classification instead of inheriting its optional fields', async () => {
+    const resolved = await closeStreamedFrames(
+      [
+        {
+          status: 'error',
+          result: null,
+          providerFailure: true,
+          providerFailureClass: 'transient',
+          providerLivenessTimeout: true,
+          providerRateLimitScope: 'model',
+          providerRateLimitModel: 'old-model',
+          providerRateLimitResetsAt: 1234,
+          providerFailureNotice: 'old notice',
+        },
+        {
+          status: 'error',
+          result: null,
+          providerFailure: true,
+          providerFailureClass: 'config',
+          providerRateLimitResetsAt: 0,
+        },
+      ],
+      true,
+    );
+    expect(resolved.providerFailureClass).toBe('config');
+    expect(resolved.providerLivenessTimeout).toBeUndefined();
+    expect(resolved.providerRateLimitScope).toBeUndefined();
+    expect(resolved.providerRateLimitModel).toBeUndefined();
+    expect(resolved.providerFailureNotice).toBeUndefined();
+    expect(resolved.providerRateLimitResetsAt).toBe(0);
+  });
+
+  test('zero-exit close after a streamed model-scope failure keeps scope and reset stamp', async () => {
+    const resetsAt = Date.now() + 60_000;
+    const stdoutState = await stateAfterStreamedFailure({
+      status: 'error',
+      result: null,
+      providerFailure: true,
+      providerFailureClass: 'account',
+      providerRateLimitScope: 'model',
+      providerRateLimitModel: 'claude-fable-5',
+      providerRateLimitResetsAt: resetsAt,
+      providerFailureNotice: 'model tier exhausted',
+    });
+    const resolved: ContainerOutput[] = [];
+
+    handleSuccessClose(
+      {
+        groupName: 'carryover-test',
+        label: 'Host Agent',
+        filePrefix: 'host',
+        identifier: 'proc-2',
+        logsDir: '/tmp',
+        input: { prompt: 'prompt', isMain: false },
+        stdoutState,
+        stderrState: createStderrState(),
+        onOutput: async () => {},
+        resolvePromise: (output) => resolved.push(output),
+        startTime: Date.now(),
+        timeoutMs: 1_000,
+      },
+      10,
+    );
+
+    await stdoutState.outputChain;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(resolved).toHaveLength(1);
+    expect(resolved[0]).toMatchObject({
+      providerFailure: true,
+      providerFailureClass: 'account',
+      providerRateLimitScope: 'model',
+      providerRateLimitModel: 'claude-fable-5',
+      providerRateLimitResetsAt: resetsAt,
+      providerFailureNotice: 'model tier exhausted',
+    });
+  });
+
+  test('a healthy-only stream does not attach provider-failure fields', async () => {
+    const stream = new PassThrough();
+    const stdoutState = createStdoutParserState();
+    attachStdoutHandler(stream, stdoutState, {
+      groupName: 'carryover-test',
+      label: 'Host agent',
+      resetTimeout: () => {},
+      onOutput: async () => {},
+    });
+    stream.write(
+      `${S}${JSON.stringify({ status: 'success', result: 'all good' })}${E}`,
+    );
+    stream.end();
+    await new Promise((r) => setTimeout(r, 10));
+    await stdoutState.outputChain;
+    const resolved: ContainerOutput[] = [];
+
+    handleSuccessClose(
+      {
+        groupName: 'carryover-test',
+        label: 'Host Agent',
+        filePrefix: 'host',
+        identifier: 'proc-3',
+        logsDir: '/tmp',
+        input: { prompt: 'prompt', isMain: false },
+        stdoutState,
+        stderrState: createStderrState(),
+        onOutput: async () => {},
+        resolvePromise: (output) => resolved.push(output),
+        startTime: Date.now(),
+        timeoutMs: 1_000,
+      },
+      10,
+    );
+
+    await stdoutState.outputChain;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(resolved).toHaveLength(1);
+    expect(resolved[0].providerFailure).toBe(false);
+    expect(resolved[0].providerFailureClass).toBeUndefined();
+  });
 });
 
 describe('attachStdoutHandler — framed output parsing (marker collision)', () => {

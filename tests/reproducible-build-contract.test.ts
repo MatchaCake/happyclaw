@@ -54,8 +54,14 @@ describe('reproducible build contract', () => {
     expect(ci).toContain('npm --prefix container/agent-runner ci');
     expect(ci).toContain('npm run audit:prod');
     expect(read('package.json')).toContain(
-      'npm --prefix container/agent-runner audit --omit=dev',
+      '"audit:prod": "node scripts/audit-prod.mjs"',
     );
+    const auditProd = read('scripts/audit-prod.mjs');
+    expect(auditProd).toContain("cwd: path.join(root, 'web')");
+    expect(auditProd).toContain(
+      "cwd: path.join(root, 'container/agent-runner')",
+    );
+    expect(auditProd).toContain("['audit', '--omit=dev', '--json']");
     expect(ci).not.toMatch(/^\s+npm(?: --prefix \S+)? install\s*$/m);
     expect(ci).toMatch(/uses: actions\/checkout@[a-f0-9]{40}/);
     expect(ci).toMatch(/uses: actions\/setup-node@[a-f0-9]{40}/);
