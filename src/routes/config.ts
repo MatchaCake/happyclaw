@@ -143,10 +143,13 @@ import {
   CODEX_OAUTH_FLOW_TTL_MS,
 } from '../codex-gateway/types.js';
 import {
-  CODEX_MODEL_CATALOG,
   CODEX_DEFAULT_MODEL,
   CODEX_DEFAULT_EFFORT,
 } from '../codex-gateway/model-catalog.js';
+import {
+  getResolvedCodexCatalog,
+  maybeRefreshCodexCatalog,
+} from '../codex-gateway/model-catalog-sync.js';
 import {
   hasOAuthUsageSignals,
   parseOAuthUsageResponse,
@@ -1855,17 +1858,22 @@ configRoutes.post(
 );
 
 // ─── GET /codex/model-catalog — Codex 模型目录（UI 下拉数据源）──────────
-// 目录唯一真相源在 src/codex-gateway/model-catalog.ts；前端不再硬编码，
-// 上游目录变化时只更新后端一处。
+// 目录真相源是上游 openai/codex 的 models.json，由 model-catalog-sync
+// 定期同步（baked-in 目录兜底）；前端不再硬编码。
 configRoutes.get(
   '/codex/model-catalog',
   authMiddleware,
   systemConfigMiddleware,
   async (c) => {
+    // TTL 过期时触发后台刷新：响应不等待网络，目录在流量中自愈。
+    maybeRefreshCodexCatalog();
+    const resolved = getResolvedCodexCatalog();
     return c.json({
-      models: CODEX_MODEL_CATALOG,
+      models: resolved.models,
       defaultModel: CODEX_DEFAULT_MODEL,
       defaultEffort: CODEX_DEFAULT_EFFORT,
+      source: resolved.source,
+      fetchedAt: resolved.fetchedAt,
     });
   },
 );

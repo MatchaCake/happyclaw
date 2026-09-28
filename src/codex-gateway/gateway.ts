@@ -15,7 +15,8 @@ import {
   resolveCodexModel,
   type AnthropicRequestSubset,
 } from './convert-request.js';
-import { clampCodexEffort } from './model-catalog.js';
+import { clampCodexEffortWithCatalog } from './model-catalog.js';
+import { getResolvedCodexCatalog } from './model-catalog-sync.js';
 import {
   ResponsesToAnthropicConverter,
   aggregateResponsesStream,
@@ -240,7 +241,9 @@ codexGatewayApp.post('/v1/messages', async (c) => {
     targetModel: resolveCodexModel(anthropicRequest.model, targetModel),
     // 目录钳制：存量配置里被上游移除的 effort 档（如 minimal）或模型不支持
     // 的档位在请求侧归位，避免上游 400；与前端切模型归位逻辑语义一致。
-    reasoningEffort: clampCodexEffort(
+    // 目录用解析后的实时目录（上游同步结果优先，baked-in 兜底）。
+    reasoningEffort: clampCodexEffortWithCatalog(
+      getResolvedCodexCatalog().models,
       resolveCodexModel(anthropicRequest.model, targetModel),
       configuredEffort,
     ),

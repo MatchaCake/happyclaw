@@ -1,10 +1,12 @@
 /**
- * Codex 模型目录 — 唯一真相源。
+ * Codex 模型目录 — baked-in 离线兜底。
  *
  * 目录对齐 codex CLI 随版本捆绑的 models.json（上游移除模型后请求会直接
  * 400，例如 gpt-5.1 系列）。UI 下拉、请求侧 effort 钳制、legacy 归一都以
- * 这里为准；前端通过 GET /api/config/codex/model-catalog 获取，目录随上游
- * 更新时只需改这一个文件，无需重新发前端。
+ * 这里为准；前端通过 GET /api/config/codex/model-catalog 获取。
+ *
+ * 实时目录由 model-catalog-sync.ts 从上游 openai/codex 仓库同步（本文件
+ * 是拉取失败/首次启动时的兜底）；目录随上游更新通常无需改这个文件。
  */
 
 export interface CodexModelCatalogEntry {
@@ -84,13 +86,22 @@ export function resolveCodexCatalogEntry(
  * 请求侧 effort 钳制（纵深防御，与前端"切模型归位默认档"语义一致）：
  * 模型在目录中且配置的 effort 不受支持时，回落到目录默认 medium。
  * 目录外模型（上游新模型尚未收录）不做钳制，保持透传。
+ * catalog 参数供上游同步层传入解析后的实时目录；缺省用 baked-in 目录。
  */
-export function clampCodexEffort(
+export function clampCodexEffortWithCatalog(
+  catalog: readonly CodexModelCatalogEntry[],
   model: string,
   effort: string | undefined,
 ): string | undefined {
   if (!effort) return effort;
-  const entry = resolveCodexCatalogEntry(model);
+  const entry = catalog.find((candidate) => candidate.value === model);
   if (!entry) return effort;
   return entry.efforts.includes(effort) ? effort : CODEX_DEFAULT_EFFORT;
+}
+
+export function clampCodexEffort(
+  model: string,
+  effort: string | undefined,
+): string | undefined {
+  return clampCodexEffortWithCatalog(CODEX_MODEL_CATALOG, model, effort);
 }

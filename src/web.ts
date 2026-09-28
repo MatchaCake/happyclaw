@@ -63,6 +63,7 @@ import { usage as usageRoutes } from './routes/usage.js';
 import billingRoutes from './routes/billing.js';
 import bugReportRoutes from './routes/bug-report.js';
 import { codexGatewayApp } from './codex-gateway/gateway.js';
+import { initCodexCatalogSync } from './codex-gateway/model-catalog-sync.js';
 import { CODEX_GATEWAY_ROUTE } from './codex-gateway/types.js';
 import channelAccountRoutes, {
   injectChannelAccountDeps,
@@ -3524,6 +3525,8 @@ export function startWebServer(webDeps: WebDeps): void {
     broadcastDockerPullLog,
     broadcastDockerPullComplete,
   });
+  // Codex 模型目录：读磁盘缓存后后台同步上游（永不阻塞启动）。
+  initCodexCatalogSync();
 
   httpServer = serve(
     {
