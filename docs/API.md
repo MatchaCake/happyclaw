@@ -298,6 +298,12 @@ Provider：
 - `POST /api/config/claude/apply`
 - `POST /api/config/claude/oauth/start`
 - `POST /api/config/claude/oauth/callback`
+- `POST /api/config/codex/oauth/start`，启动 ChatGPT/Codex 订阅 OAuth
+  PKCE 流程，返回 `authorizeUrl` 与 `state`；可选 `targetProviderId`
+  用于对已有 Provider 重新授权
+- `POST /api/config/codex/oauth/callback`，用 `{ state, code }`（`code`
+  接受回调页完整 URL 或裸授权码）换取 token，创建或更新 ChatGPT
+  订阅型 Provider；其 `anthropicBaseUrl` 落盘为内嵌网关占位值
 - `PUT /api/config/claude/custom-env`
 
 系统：

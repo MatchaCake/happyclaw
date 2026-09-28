@@ -30,7 +30,7 @@ import {
 import type { ProviderWithHealth, EnvRow } from './types';
 import { getErrorMessage } from './types';
 
-type ProviderType = 'official' | 'third_party';
+type ProviderType = 'official' | 'third_party' | 'codex';
 type OfficialAuthTab = 'oauth' | 'setup_token' | 'api_key';
 
 const RESERVED_ENV_KEYS = new Set([
@@ -172,7 +172,9 @@ export function ProviderEditor({
       setCustomEnvRows([]);
       setProviderEnvOverrides({});
     } else {
-      setProviderType(provider.type);
+      setProviderType(
+        provider.hasCodexOAuthCredentials ? 'codex' : provider.type,
+      );
       setName(provider.name);
       setBaseUrl(provider.anthropicBaseUrl || '');
       const modelSelection = parseProviderModel(provider.anthropicModel || '');
@@ -297,6 +299,57 @@ export function ProviderEditor({
     }
   }, [oauthState, oauthCode, setError, setNotice, onSave]);
 
+  // ─── Codex（ChatGPT 订阅）OAuth 流程 ────────────────────────
+  const handleCodexOAuthStart = useCallback(async () => {
+    setOauthLoading(true);
+    setError(null);
+    try {
+      const body: Record<string, unknown> = {};
+      // 编辑模式下传入目标提供商 ID（重新登录）
+      if (!isCreate && provider) {
+        body.targetProviderId = provider.id;
+      }
+      const data = await api.post<{
+        authorizeUrl: string;
+        state: string;
+        redirectHint: string;
+      }>(
+        '/api/config/codex/oauth/start',
+        Object.keys(body).length > 0 ? body : undefined,
+      );
+      setOauthState(data.state);
+      setOauthCode('');
+      window.open(data.authorizeUrl, '_blank', 'noopener,noreferrer');
+    } catch (err) {
+      setError(getErrorMessage(err, 'ChatGPT 授权启动失败'));
+    } finally {
+      setOauthLoading(false);
+    }
+  }, [isCreate, provider, setError]);
+
+  const handleCodexOAuthCallback = useCallback(async () => {
+    if (!oauthState || !oauthCode.trim()) {
+      setError('请粘贴回调地址');
+      return;
+    }
+    setOauthExchanging(true);
+    setError(null);
+    try {
+      await api.post('/api/config/codex/oauth/callback', {
+        state: oauthState,
+        code: oauthCode.trim(),
+      });
+      setOauthState(null);
+      setOauthCode('');
+      setNotice('ChatGPT 授权成功，凭据已保存。');
+      onSave();
+    } catch (err) {
+      setError(getErrorMessage(err, 'ChatGPT 授权码换取失败'));
+    } finally {
+      setOauthExchanging(false);
+    }
+  }, [oauthState, oauthCode, setError, setNotice, onSave]);
+
   // ─── 保存 ──────────────────────────────────────────────────
   const handleSave = async () => {
     const normalizedModel =
@@ -314,6 +367,28 @@ export function ProviderEditor({
         : '');
     if (!trimmedName) {
       setError('请填写模型配置名称');
+      return;
+    }
+
+    // ChatGPT 订阅型配置：端点、模型与凭据均由后端网关管理，仅允许改名。
+    if (providerType === 'codex') {
+      if (isCreate) {
+        setError('请先完成 ChatGPT 授权，配置会在授权后自动创建');
+        return;
+      }
+      setSaving(true);
+      setError(null);
+      try {
+        await api.patch(`/api/config/claude/providers/${provider!.id}`, {
+          name: trimmedName,
+        });
+        setNotice('模型配置已保存。');
+        onSave();
+      } catch (err) {
+        setError(getErrorMessage(err, '保存模型配置失败'));
+      } finally {
+        setSaving(false);
+      }
       return;
     }
 
@@ -521,7 +596,9 @@ export function ProviderEditor({
           <DialogDescription className="text-left text-xs leading-5">
             {providerType === 'third_party'
               ? '填写端点、密钥和模型即可；Claude Code 运行参数会自动预填，也可在高级设置中调整。'
-              : '配置 Claude 官方认证方式与默认模型。'}
+              : providerType === 'codex'
+                ? '使用 ChatGPT Plus / Pro 订阅授权；凭据保存在服务端，经内嵌网关驱动 Claude Code。'
+                : '配置 Claude 官方认证方式与默认模型。'}
           </DialogDescription>
         </DialogHeader>
 
@@ -557,27 +634,43 @@ export function ProviderEditor({
                 >
                   第三方
                 </button>
+                <button
+                  type="button"
+                  aria-pressed={providerType === 'codex'}
+                  onClick={() => setProviderType('codex')}
+                  className={`min-h-9 rounded-md px-3 py-1.5 text-sm transition-colors cursor-pointer ${
+                    providerType === 'codex'
+                      ? 'bg-background text-primary shadow-sm'
+                      : 'text-muted-foreground'
+                  }`}
+                >
+                  ChatGPT 订阅
+                </button>
               </div>
             </div>
           )}
 
-          {/* 名称 */}
-          <div>
-            <label className="block text-xs text-muted-foreground mb-1">
-              {providerType === 'third_party' ? '配置名称（可选）' : '名称'}
-            </label>
-            <Input
-              type="text"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              disabled={saving}
-              placeholder={
-                providerType === 'official'
-                  ? '如：Claude 官方'
-                  : '留空时使用模型名称'
-              }
-            />
-          </div>
+          {/* 名称（创建 ChatGPT 订阅配置时由 OAuth 回调自动命名，隐藏） */}
+          {!(isCreate && providerType === 'codex') && (
+            <div>
+              <label className="block text-xs text-muted-foreground mb-1">
+                {providerType === 'third_party' ? '配置名称（可选）' : '名称'}
+              </label>
+              <Input
+                type="text"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                disabled={saving}
+                placeholder={
+                  providerType === 'official'
+                    ? '如：Claude 官方'
+                    : providerType === 'codex'
+                      ? '如：ChatGPT 订阅'
+                      : '留空时使用模型名称'
+                }
+              />
+            </div>
+          )}
 
           {/* ─── 官方模式 ─── */}
           {providerType === 'official' && (
@@ -774,6 +867,106 @@ export function ProviderEditor({
             </div>
           )}
 
+          {/* ─── ChatGPT 订阅模式 ─── */}
+          {providerType === 'codex' && (
+            <div className="rounded-lg border border-green-200 bg-green-50/50 p-4 space-y-3 dark:border-green-800 dark:bg-green-950/30">
+              <div className="text-sm font-medium text-foreground">
+                使用 ChatGPT 订阅登录
+              </div>
+              <div className="text-xs leading-5 text-muted-foreground">
+                点击按钮打开 ChatGPT 登录页（需要 Plus / Pro / Team
+                订阅）。完成授权后浏览器会跳转到{' '}
+                <code className="rounded bg-muted px-1">localhost:1455</code>{' '}
+                ——该页面打不开是正常的，把浏览器地址栏的完整地址复制粘贴到下方即可。
+              </div>
+
+              {/* 编辑模式显示现有凭据 */}
+              {!isCreate && provider?.hasCodexOAuthCredentials && (
+                <div className="space-y-1 rounded-md border border-emerald-200 bg-emerald-50/50 p-3 text-xs dark:border-emerald-800 dark:bg-emerald-950/30">
+                  {provider.codexOAuthCredentialsEmail && (
+                    <div className="text-emerald-700 dark:text-emerald-300">
+                      账号：{provider.codexOAuthCredentialsEmail}
+                      {provider.codexOAuthCredentialsPlanType
+                        ? `（${provider.codexOAuthCredentialsPlanType}）`
+                        : ''}
+                    </div>
+                  )}
+                  {provider.codexOAuthCredentialsExpiresAt && (
+                    <div
+                      className={
+                        provider.codexOAuthCredentialsExpiresAt <= Date.now()
+                          ? 'font-medium text-red-700 dark:text-red-400'
+                          : 'text-emerald-700 dark:text-emerald-300'
+                      }
+                    >
+                      过期时间:{' '}
+                      {new Date(
+                        provider.codexOAuthCredentialsExpiresAt,
+                      ).toLocaleString('zh-CN')}
+                      {provider.codexOAuthCredentialsExpiresAt > Date.now()
+                        ? ` (${Math.round((provider.codexOAuthCredentialsExpiresAt - Date.now()) / 60000)} 分钟后)`
+                        : ' (已过期)'}
+                    </div>
+                  )}
+                  <div className="text-emerald-600">
+                    网关会在 token 过期时自动刷新。
+                  </div>
+                </div>
+              )}
+
+              {!oauthState ? (
+                <Button
+                  onClick={handleCodexOAuthStart}
+                  disabled={saving || oauthLoading}
+                >
+                  {oauthLoading ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <ExternalLink className="size-4" />
+                  )}
+                  {!isCreate && provider?.hasCodexOAuthCredentials
+                    ? '重新登录 ChatGPT'
+                    : '登录 ChatGPT'}
+                </Button>
+              ) : (
+                <div className="space-y-2">
+                  <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-300">
+                    授权窗口已打开，请在 ChatGPT
+                    完成登录授权后，将跳转页面的完整地址粘贴到下方。
+                  </div>
+                  <div className="flex gap-2">
+                    <Input
+                      type="text"
+                      value={oauthCode}
+                      onChange={(e) => setOauthCode(e.target.value)}
+                      disabled={oauthExchanging}
+                      placeholder="粘贴 localhost:1455 回调完整地址"
+                      className="flex-1"
+                    />
+                    <Button
+                      onClick={handleCodexOAuthCallback}
+                      disabled={oauthExchanging || !oauthCode.trim()}
+                    >
+                      {oauthExchanging && (
+                        <Loader2 className="size-4 animate-spin" />
+                      )}
+                      确认
+                    </Button>
+                    <Button
+                      variant="outline"
+                      onClick={() => {
+                        setOauthState(null);
+                        setOauthCode('');
+                      }}
+                    >
+                      取消
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
           {/* ─── 第三方模式 ─── */}
           {providerType === 'third_party' && (
             <div className="space-y-5">
@@ -935,212 +1128,216 @@ export function ProviderEditor({
           )}
 
           {/* ─── 环境变量 ─── */}
-          <details className="border-t border-border pt-4">
-            <summary className="cursor-pointer text-sm font-medium text-foreground">
-              {providerType === 'third_party'
-                ? '高级设置 · 环境变量'
-                : '高级设置 · 自定义环境变量'}
-              {providerType === 'third_party' && (
-                <span className="ml-2 text-xs font-normal text-muted-foreground">
-                  {defaultProviderEnv.length} 项默认配置
-                </span>
-              )}
-              {customEnvRows.length > 0 && (
-                <span className="ml-2 text-xs font-normal text-muted-foreground">
-                  {customEnvRows.length} 项自定义
-                </span>
-              )}
-            </summary>
+          {providerType !== 'codex' && (
+            <details className="border-t border-border pt-4">
+              <summary className="cursor-pointer text-sm font-medium text-foreground">
+                {providerType === 'third_party'
+                  ? '高级设置 · 环境变量'
+                  : '高级设置 · 自定义环境变量'}
+                {providerType === 'third_party' && (
+                  <span className="ml-2 text-xs font-normal text-muted-foreground">
+                    {defaultProviderEnv.length} 项默认配置
+                  </span>
+                )}
+                {customEnvRows.length > 0 && (
+                  <span className="ml-2 text-xs font-normal text-muted-foreground">
+                    {customEnvRows.length} 项自定义
+                  </span>
+                )}
+              </summary>
 
-            <div className="mt-4 space-y-5">
-              {providerType === 'third_party' && (
-                <section aria-labelledby="default-provider-env-heading">
-                  <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
+              <div className="mt-4 space-y-5">
+                {providerType === 'third_party' && (
+                  <section aria-labelledby="default-provider-env-heading">
+                    <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
+                      <div>
+                        <h3
+                          id="default-provider-env-heading"
+                          className="text-xs font-medium text-foreground"
+                        >
+                          系统预填环境变量
+                        </h3>
+                        <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                          默认值会随模型和上下文更新；修改后以你的自定义值为准。
+                        </p>
+                      </div>
+                      <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                        {defaultProviderEnv.length} 项
+                      </span>
+                    </div>
+
+                    <div className="overflow-hidden rounded-lg border border-border/80 bg-muted/20">
+                      {defaultProviderEnv.map((row, index) => {
+                        const hasOverride = Object.hasOwn(
+                          providerEnvOverrides,
+                          row.key,
+                        );
+                        const value = hasOverride
+                          ? providerEnvOverrides[row.key]
+                          : row.value;
+                        const inputId = `provider-env-default-${index}`;
+
+                        return (
+                          <div
+                            key={row.key}
+                            className={`grid min-w-0 gap-2 px-3 py-2.5 sm:grid-cols-[minmax(0,1fr)_minmax(12rem,0.8fr)] sm:items-center sm:gap-4 ${
+                              index > 0 ? 'border-t border-border/70' : ''
+                            }`}
+                          >
+                            <div className="flex min-w-0 items-center justify-between gap-2">
+                              <label
+                                htmlFor={inputId}
+                                className="min-w-0 break-all font-mono text-[11px] text-foreground"
+                              >
+                                {row.key}
+                              </label>
+                              <span
+                                className={`shrink-0 rounded-full border px-1.5 py-0.5 text-[10px] ${
+                                  hasOverride
+                                    ? 'border-primary/25 bg-primary/5 text-primary'
+                                    : 'border-border bg-background text-muted-foreground'
+                                }`}
+                              >
+                                {hasOverride
+                                  ? '已自定义'
+                                  : MANAGED_ENV_SOURCE_LABELS[row.source]}
+                              </span>
+                            </div>
+                            <div className="flex min-w-0 items-center gap-1.5">
+                              <Input
+                                id={inputId}
+                                type="text"
+                                value={value}
+                                onChange={(event) =>
+                                  updateProviderEnv(
+                                    row.key,
+                                    event.target.value,
+                                    row.value,
+                                  )
+                                }
+                                disabled={saving}
+                                placeholder="填写模型后生成"
+                                autoComplete="off"
+                                className="h-9 min-w-0 px-2.5 font-mono text-xs"
+                              />
+                              {hasOverride && (
+                                <button
+                                  type="button"
+                                  onClick={() => resetProviderEnv(row.key)}
+                                  disabled={saving}
+                                  className="flex size-11 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-50 sm:size-9"
+                                  aria-label={`恢复 ${row.key} 的默认值`}
+                                  title="恢复默认值"
+                                >
+                                  <RotateCcw className="size-3.5" />
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </section>
+                )}
+
+                <section
+                  aria-labelledby="custom-provider-env-heading"
+                  className={
+                    providerType === 'third_party'
+                      ? 'border-t border-border pt-4'
+                      : undefined
+                  }
+                >
+                  <div className="mb-2 flex items-start justify-between gap-3">
                     <div>
                       <h3
-                        id="default-provider-env-heading"
+                        id="custom-provider-env-heading"
                         className="text-xs font-medium text-foreground"
                       >
-                        系统预填环境变量
+                        自定义环境变量
                       </h3>
                       <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                        默认值会随模型和上下文更新；修改后以你的自定义值为准。
+                        仅用于 API 自定义 Header 等特殊需求。
                       </p>
                     </div>
-                    <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
-                      {defaultProviderEnv.length} 项
-                    </span>
-                  </div>
-
-                  <div className="overflow-hidden rounded-lg border border-border/80 bg-muted/20">
-                    {defaultProviderEnv.map((row, index) => {
-                      const hasOverride = Object.hasOwn(
-                        providerEnvOverrides,
-                        row.key,
-                      );
-                      const value = hasOverride
-                        ? providerEnvOverrides[row.key]
-                        : row.value;
-                      const inputId = `provider-env-default-${index}`;
-
-                      return (
-                        <div
-                          key={row.key}
-                          className={`grid min-w-0 gap-2 px-3 py-2.5 sm:grid-cols-[minmax(0,1fr)_minmax(12rem,0.8fr)] sm:items-center sm:gap-4 ${
-                            index > 0 ? 'border-t border-border/70' : ''
-                          }`}
-                        >
-                          <div className="flex min-w-0 items-center justify-between gap-2">
-                            <label
-                              htmlFor={inputId}
-                              className="min-w-0 break-all font-mono text-[11px] text-foreground"
-                            >
-                              {row.key}
-                            </label>
-                            <span
-                              className={`shrink-0 rounded-full border px-1.5 py-0.5 text-[10px] ${
-                                hasOverride
-                                  ? 'border-primary/25 bg-primary/5 text-primary'
-                                  : 'border-border bg-background text-muted-foreground'
-                              }`}
-                            >
-                              {hasOverride
-                                ? '已自定义'
-                                : MANAGED_ENV_SOURCE_LABELS[row.source]}
-                            </span>
-                          </div>
-                          <div className="flex min-w-0 items-center gap-1.5">
-                            <Input
-                              id={inputId}
-                              type="text"
-                              value={value}
-                              onChange={(event) =>
-                                updateProviderEnv(
-                                  row.key,
-                                  event.target.value,
-                                  row.value,
-                                )
-                              }
-                              disabled={saving}
-                              placeholder="填写模型后生成"
-                              autoComplete="off"
-                              className="h-9 min-w-0 px-2.5 font-mono text-xs"
-                            />
-                            {hasOverride && (
-                              <button
-                                type="button"
-                                onClick={() => resetProviderEnv(row.key)}
-                                disabled={saving}
-                                className="flex size-11 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-50 sm:size-9"
-                                aria-label={`恢复 ${row.key} 的默认值`}
-                                title="恢复默认值"
-                              >
-                                <RotateCcw className="size-3.5" />
-                              </button>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </section>
-              )}
-
-              <section
-                aria-labelledby="custom-provider-env-heading"
-                className={
-                  providerType === 'third_party'
-                    ? 'border-t border-border pt-4'
-                    : undefined
-                }
-              >
-                <div className="mb-2 flex items-start justify-between gap-3">
-                  <div>
-                    <h3
-                      id="custom-provider-env-heading"
-                      className="text-xs font-medium text-foreground"
+                    <button
+                      type="button"
+                      onClick={addRow}
+                      className="inline-flex min-h-11 shrink-0 cursor-pointer items-center gap-1 rounded-md px-2 text-xs text-primary hover:bg-muted"
                     >
-                      自定义环境变量
-                    </h3>
-                    <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                      仅用于 API 自定义 Header 等特殊需求。
-                    </p>
+                      <Plus className="size-3.5" />
+                      添加
+                    </button>
                   </div>
-                  <button
-                    type="button"
-                    onClick={addRow}
-                    className="inline-flex min-h-11 shrink-0 cursor-pointer items-center gap-1 rounded-md px-2 text-xs text-primary hover:bg-muted"
-                  >
-                    <Plus className="size-3.5" />
-                    添加
-                  </button>
-                </div>
 
-                {customEnvRows.length === 0 ? (
-                  <p className="text-xs text-muted-foreground">
-                    没有自定义环境变量，大多数配置无需添加。
-                  </p>
-                ) : (
-                  <div className="space-y-2">
-                    {customEnvRows.map((row, idx) => (
-                      <div
-                        key={idx}
-                        className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center"
-                      >
-                        <Input
-                          type="text"
-                          value={row.key}
-                          onChange={(e) =>
-                            updateRow(idx, 'key', e.target.value)
-                          }
-                          placeholder="KEY"
-                          className="h-auto w-full px-2.5 py-1.5 font-mono text-xs sm:w-[38%]"
-                        />
-                        <Input
-                          type={showCustomEnvValues[idx] ? 'text' : 'password'}
-                          value={row.value}
-                          onChange={(e) =>
-                            updateRow(idx, 'value', e.target.value)
-                          }
-                          placeholder="value"
-                          className="h-auto flex-1 px-2.5 py-1.5 font-mono text-xs"
-                        />
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setShowCustomEnvValues((current) => ({
-                              ...current,
-                              [idx]: !current[idx],
-                            }))
-                          }
-                          className="flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
-                          aria-label={
-                            showCustomEnvValues[idx]
-                              ? '隐藏环境变量值'
-                              : '显示环境变量值'
-                          }
+                  {customEnvRows.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">
+                      没有自定义环境变量，大多数配置无需添加。
+                    </p>
+                  ) : (
+                    <div className="space-y-2">
+                      {customEnvRows.map((row, idx) => (
+                        <div
+                          key={idx}
+                          className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center"
                         >
-                          {showCustomEnvValues[idx] ? (
-                            <EyeOff className="size-4" />
-                          ) : (
-                            <Eye className="size-4" />
-                          )}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => removeRow(idx)}
-                          className="flex size-8 cursor-pointer items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-red-500"
-                          aria-label="删除环境变量"
-                        >
-                          <X className="size-4" />
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </section>
-            </div>
-          </details>
+                          <Input
+                            type="text"
+                            value={row.key}
+                            onChange={(e) =>
+                              updateRow(idx, 'key', e.target.value)
+                            }
+                            placeholder="KEY"
+                            className="h-auto w-full px-2.5 py-1.5 font-mono text-xs sm:w-[38%]"
+                          />
+                          <Input
+                            type={
+                              showCustomEnvValues[idx] ? 'text' : 'password'
+                            }
+                            value={row.value}
+                            onChange={(e) =>
+                              updateRow(idx, 'value', e.target.value)
+                            }
+                            placeholder="value"
+                            className="h-auto flex-1 px-2.5 py-1.5 font-mono text-xs"
+                          />
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setShowCustomEnvValues((current) => ({
+                                ...current,
+                                [idx]: !current[idx],
+                              }))
+                            }
+                            className="flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+                            aria-label={
+                              showCustomEnvValues[idx]
+                                ? '隐藏环境变量值'
+                                : '显示环境变量值'
+                            }
+                          >
+                            {showCustomEnvValues[idx] ? (
+                              <EyeOff className="size-4" />
+                            ) : (
+                              <Eye className="size-4" />
+                            )}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => removeRow(idx)}
+                            className="flex size-8 cursor-pointer items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-red-500"
+                            aria-label="删除环境变量"
+                          >
+                            <X className="size-4" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </section>
+              </div>
+            </details>
+          )}
 
           {/* ─── 操作按钮 ─── */}
           <div className="sticky -bottom-4 z-10 -mx-4 flex justify-end gap-2 border-t border-border bg-background/95 px-4 pb-4 pt-3 backdrop-blur supports-[backdrop-filter]:bg-background/85">
@@ -1152,10 +1349,12 @@ export function ProviderEditor({
               取消
             </Button>
             {/* OAuth 模式下创建时不需要保存按钮（OAuth 回调会自动触发 onSave） */}
-            <Button onClick={handleSave} disabled={saving || oauthExchanging}>
-              {saving && <Loader2 className="size-4 animate-spin" />}
-              {isCreate ? '创建' : '保存'}
-            </Button>
+            {!(isCreate && providerType === 'codex') && (
+              <Button onClick={handleSave} disabled={saving || oauthExchanging}>
+                {saving && <Loader2 className="size-4 animate-spin" />}
+                {isCreate ? '创建' : '保存'}
+              </Button>
+            )}
           </div>
         </div>
       </DialogContent>
