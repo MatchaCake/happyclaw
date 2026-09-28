@@ -45,6 +45,17 @@ const DEFAULTED_THIRD_PARTY_ENV_KEYS = new Set(
   buildDefaultProviderEnv('', false).map((row) => row.key),
 );
 
+// ChatGPT 订阅型配置：目标 Codex 模型与推理力度（网关映射到上游请求）。
+const CODEX_MODEL_OPTIONS = [
+  'gpt-5.1-codex',
+  'gpt-5.1',
+  'gpt-5.1-codex-max',
+  'gpt-5.1-codex-mini',
+] as const;
+const CODEX_EFFORT_OPTIONS = ['minimal', 'low', 'medium', 'high'] as const;
+const CODEX_DEFAULT_MODEL = 'gpt-5.1-codex';
+const CODEX_DEFAULT_EFFORT = 'medium';
+
 const MANAGED_ENV_SOURCE_LABELS = {
   model: '跟随模型',
   context: '跟随上下文',
@@ -120,6 +131,10 @@ export function ProviderEditor({
   const [model, setModel] = useState('');
   const [oneMillionContext, setOneMillionContext] = useState(false);
 
+  // ChatGPT 订阅型配置：目标模型与推理力度
+  const [codexModel, setCodexModel] = useState<string>(CODEX_DEFAULT_MODEL);
+  const [codexEffort, setCodexEffort] = useState<string>(CODEX_DEFAULT_EFFORT);
+
   // 官方认证
   const [authTab, setAuthTab] = useState<OfficialAuthTab>('oauth');
   const [setupToken, setSetupToken] = useState('');
@@ -150,6 +165,18 @@ export function ProviderEditor({
 
   const defaultProviderEnv = buildDefaultProviderEnv(model, oneMillionContext);
 
+  // 当前值不在预设里（如后端已配置其他模型）时，追加为额外选项，避免 select 显示空白。
+  const codexModelChoices: readonly string[] = (
+    CODEX_MODEL_OPTIONS as readonly string[]
+  ).includes(codexModel)
+    ? CODEX_MODEL_OPTIONS
+    : [codexModel, ...CODEX_MODEL_OPTIONS];
+  const codexEffortChoices: readonly string[] = (
+    CODEX_EFFORT_OPTIONS as readonly string[]
+  ).includes(codexEffort)
+    ? CODEX_EFFORT_OPTIONS
+    : [codexEffort, ...CODEX_EFFORT_OPTIONS];
+
   // 初始化表单
   useEffect(() => {
     if (!open) return;
@@ -161,6 +188,8 @@ export function ProviderEditor({
       setBaseUrl('');
       setModel('');
       setOneMillionContext(false);
+      setCodexModel(CODEX_DEFAULT_MODEL);
+      setCodexEffort(CODEX_DEFAULT_EFFORT);
       setAuthTab('oauth');
       setSetupToken('');
       setApiKey('');
@@ -180,6 +209,10 @@ export function ProviderEditor({
       const modelSelection = parseProviderModel(provider.anthropicModel || '');
       setModel(modelSelection.model);
       setOneMillionContext(modelSelection.oneMillionContext);
+      setCodexModel(provider.anthropicModel || CODEX_DEFAULT_MODEL);
+      setCodexEffort(
+        provider.customEnv?.CODEX_REASONING_EFFORT || CODEX_DEFAULT_EFFORT,
+      );
       setAuthTab('oauth');
       setSetupToken('');
       setApiKey('');
@@ -370,7 +403,7 @@ export function ProviderEditor({
       return;
     }
 
-    // ChatGPT 订阅型配置：端点、模型与凭据均由后端网关管理，仅允许改名。
+    // ChatGPT 订阅型配置：端点与凭据由后端网关管理，允许改名、选模型和推理力度。
     if (providerType === 'codex') {
       if (isCreate) {
         setError('请先完成 ChatGPT 授权，配置会在授权后自动创建');
@@ -379,8 +412,15 @@ export function ProviderEditor({
       setSaving(true);
       setError(null);
       try {
+        // customEnv 为整体替换语义：保留其他既有变量，仅更新推理力度。
+        const nextCustomEnv: Record<string, string> = {
+          ...(provider?.customEnv ?? {}),
+          CODEX_REASONING_EFFORT: codexEffort,
+        };
         await api.patch(`/api/config/claude/providers/${provider!.id}`, {
           name: trimmedName,
+          anthropicModel: codexModel.trim() || CODEX_DEFAULT_MODEL,
+          customEnv: nextCustomEnv,
         });
         setNotice('模型配置已保存。');
         onSave();
@@ -910,6 +950,62 @@ export function ProviderEditor({
                   )}
                   <div className="text-emerald-600">
                     网关会在 token 过期时自动刷新。
+                  </div>
+                </div>
+              )}
+
+              {/* 编辑模式：目标模型与推理力度（由网关映射到上游请求） */}
+              {!isCreate && (
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div>
+                    <label
+                      htmlFor="codex-model-select"
+                      className="block text-xs text-muted-foreground mb-1"
+                    >
+                      模型
+                    </label>
+                    <select
+                      id="codex-model-select"
+                      value={codexModel}
+                      onChange={(e) => setCodexModel(e.target.value)}
+                      disabled={saving}
+                      className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/30"
+                    >
+                      {codexModelChoices.map((m) => (
+                        <option key={m} value={m}>
+                          {m === CODEX_DEFAULT_MODEL ? `${m}（默认）` : m}
+                        </option>
+                      ))}
+                    </select>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      SDK 请求的 Claude 模型名会由网关统一映射为此模型。
+                    </p>
+                  </div>
+                  <div>
+                    <label
+                      htmlFor="codex-effort-select"
+                      className="block text-xs text-muted-foreground mb-1"
+                    >
+                      推理力度
+                    </label>
+                    <select
+                      id="codex-effort-select"
+                      value={codexEffort}
+                      onChange={(e) => setCodexEffort(e.target.value)}
+                      disabled={saving}
+                      className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/30"
+                    >
+                      {codexEffortChoices.map((effort) => (
+                        <option key={effort} value={effort}>
+                          {effort === CODEX_DEFAULT_EFFORT
+                            ? `${effort}（默认）`
+                            : effort}
+                        </option>
+                      ))}
+                    </select>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      对应上游 reasoning.effort，越高越慢但推理越深。
+                    </p>
                   </div>
                 </div>
               )}
