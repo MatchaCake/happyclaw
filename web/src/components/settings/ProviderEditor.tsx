@@ -46,14 +46,63 @@ const DEFAULTED_THIRD_PARTY_ENV_KEYS = new Set(
 );
 
 // ChatGPT 订阅型配置：目标 Codex 模型与推理力度（网关映射到上游请求）。
-const CODEX_MODEL_OPTIONS = [
-  'gpt-5.1-codex',
-  'gpt-5.1',
-  'gpt-5.1-codex-max',
-  'gpt-5.1-codex-mini',
+// 目录对齐 openai/codex CLI models.json（2026-09）：GPT-6 家族为主力，
+// gpt-5.1 系列已从上游目录移除（实测 400）。
+const CODEX_FULL_EFFORTS = [
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+  'ultra',
 ] as const;
-const CODEX_EFFORT_OPTIONS = ['minimal', 'low', 'medium', 'high'] as const;
-const CODEX_DEFAULT_MODEL = 'gpt-5.1-codex';
+const CODEX_CAPPED_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+const CODEX_LEGACY_EFFORTS = ['low', 'medium', 'high', 'xhigh'] as const;
+
+// 每个模型支持的 reasoning.effort 档位不同（如 gpt-6-luna 无 ultra、gpt-5.5 无
+// max/ultra），选了模型目录不支持的档位会被上游 Responses API 拒绝（400）。
+const CODEX_MODEL_OPTIONS: ReadonlyArray<{
+  value: string;
+  label: string;
+  efforts: readonly string[];
+}> = [
+  {
+    value: 'gpt-6-sol',
+    label: 'gpt-6-sol（主力编码）',
+    efforts: CODEX_FULL_EFFORTS,
+  },
+  {
+    value: 'gpt-6-astra',
+    label: 'gpt-6-astra（旗舰·最强推理）',
+    efforts: CODEX_FULL_EFFORTS,
+  },
+  {
+    value: 'gpt-6-luna',
+    label: 'gpt-6-luna（快速轻量）',
+    efforts: CODEX_CAPPED_EFFORTS,
+  },
+  {
+    value: 'gpt-5.6-sol',
+    label: 'gpt-5.6-sol（上一代编码）',
+    efforts: CODEX_FULL_EFFORTS,
+  },
+  {
+    value: 'gpt-5.6-terra',
+    label: 'gpt-5.6-terra（上一代均衡）',
+    efforts: CODEX_FULL_EFFORTS,
+  },
+  {
+    value: 'gpt-5.6-luna',
+    label: 'gpt-5.6-luna（上一代快速）',
+    efforts: CODEX_CAPPED_EFFORTS,
+  },
+  {
+    value: 'gpt-5.5',
+    label: 'gpt-5.5（旧款）',
+    efforts: CODEX_LEGACY_EFFORTS,
+  },
+] as const;
+const CODEX_DEFAULT_MODEL = 'gpt-6-sol';
 const CODEX_DEFAULT_EFFORT = 'medium';
 
 const MANAGED_ENV_SOURCE_LABELS = {
@@ -165,17 +214,24 @@ export function ProviderEditor({
 
   const defaultProviderEnv = buildDefaultProviderEnv(model, oneMillionContext);
 
-  // 当前值不在预设里（如后端已配置其他模型）时，追加为额外选项，避免 select 显示空白。
-  const codexModelChoices: readonly string[] = (
-    CODEX_MODEL_OPTIONS as readonly string[]
-  ).includes(codexModel)
-    ? CODEX_MODEL_OPTIONS
-    : [codexModel, ...CODEX_MODEL_OPTIONS];
-  const codexEffortChoices: readonly string[] = (
-    CODEX_EFFORT_OPTIONS as readonly string[]
-  ).includes(codexEffort)
-    ? CODEX_EFFORT_OPTIONS
-    : [codexEffort, ...CODEX_EFFORT_OPTIONS];
+  // 当前值不在预设里（如后端已配置其他模型，例如旧目录的 gpt-5.1-*）时，
+  // 追加为额外选项，避免 select 显示空白。
+  const selectedCodexModel = CODEX_MODEL_OPTIONS.find(
+    (option) => option.value === codexModel,
+  );
+  const codexModelChoices: readonly { value: string; label: string }[] =
+    selectedCodexModel
+      ? CODEX_MODEL_OPTIONS
+      : [{ value: codexModel, label: codexModel }, ...CODEX_MODEL_OPTIONS];
+  // 推理力度档位按所选模型的目录过滤：不同模型支持的档位不同（见上方常量），
+  // 选了模型不支持的档位会被上游拒绝。未识别的模型退回全量档位，避免选不了。
+  const codexModelEfforts: readonly string[] =
+    selectedCodexModel?.efforts ?? CODEX_FULL_EFFORTS;
+  const codexEffortChoices: readonly string[] = codexModelEfforts.includes(
+    codexEffort,
+  )
+    ? codexModelEfforts
+    : [codexEffort, ...codexModelEfforts];
 
   // 初始化表单
   useEffect(() => {
@@ -967,13 +1023,29 @@ export function ProviderEditor({
                     <select
                       id="codex-model-select"
                       value={codexModel}
-                      onChange={(e) => setCodexModel(e.target.value)}
+                      onChange={(e) => {
+                        const nextModel = e.target.value;
+                        setCodexModel(nextModel);
+                        const nextEfforts =
+                          CODEX_MODEL_OPTIONS.find(
+                            (option) => option.value === nextModel,
+                          )?.efforts ?? CODEX_FULL_EFFORTS;
+                        if (!nextEfforts.includes(codexEffort)) {
+                          setCodexEffort(
+                            nextEfforts.includes(CODEX_DEFAULT_EFFORT)
+                              ? CODEX_DEFAULT_EFFORT
+                              : nextEfforts[0],
+                          );
+                        }
+                      }}
                       disabled={saving}
                       className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/30"
                     >
                       {codexModelChoices.map((m) => (
-                        <option key={m} value={m}>
-                          {m === CODEX_DEFAULT_MODEL ? `${m}（默认）` : m}
+                        <option key={m.value} value={m.value}>
+                          {m.value === CODEX_DEFAULT_MODEL
+                            ? `${m.label}·默认`
+                            : m.label}
                         </option>
                       ))}
                     </select>

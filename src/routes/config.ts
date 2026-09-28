@@ -1934,7 +1934,7 @@ configRoutes.post(
           type: 'third_party',
           anthropicBaseUrl: CODEX_GATEWAY_BASE_URL_PLACEHOLDER,
           anthropicAuthToken: gatewayToken,
-          anthropicModel: 'gpt-5.1-codex',
+          anthropicModel: 'gpt-6-sol',
           codexOAuthCredentials: codexCredentials,
           enabled: true,
         });

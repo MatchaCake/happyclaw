@@ -196,13 +196,22 @@ function convertToolChoice(
 }
 
 export interface AnthropicToResponsesOptions {
-  /** provider 配置的目标 Codex 模型（gpt-5.1-codex 等）。 */
+  /** provider 配置的目标 Codex 模型（gpt-6-sol 等）。 */
   targetModel: string;
   /** reasoning effort；provider customEnv 可覆盖。 */
   reasoningEffort?: string;
   /** 会话级缓存键（提高上游 prompt cache 命中率）。 */
   promptCacheKey?: string;
   requestTools?: boolean;
+}
+
+/**
+ * 归一 reasoning effort：GPT-6 模型目录已移除 minimal 档（实测上游 400），
+ * 历史配置里的 minimal 归到 low；未配置时用目录默认 medium。
+ */
+export function normalizeCodexEffort(effort: string | undefined): string {
+  if (!effort) return 'medium';
+  return effort === 'minimal' ? 'low' : effort;
 }
 
 export function anthropicToResponses(
@@ -224,7 +233,7 @@ export function anthropicToResponses(
     tools: tools && tools.length > 0 ? tools : undefined,
     tool_choice: tools && tools.length > 0 ? toolChoice : undefined,
     reasoning: {
-      effort: options.reasoningEffort ?? 'medium',
+      effort: normalizeCodexEffort(options.reasoningEffort),
       summary: 'auto',
     },
     include: ['reasoning.encrypted_content'],
@@ -242,16 +251,34 @@ export function anthropicToResponses(
 }
 
 /**
+ * 旧目录模型归一：gpt-5.1 系列已从上游目录移除（请求直接 400），
+ * 存量 provider 配置里的旧值在请求时映射到 GPT-6 对应档
+ * （映射语义对齐官方 gpt-5.4→sol / gpt-5.4-mini→luna 迁移）。
+ */
+const LEGACY_CODEX_MODELS: Readonly<Record<string, string>> = {
+  'gpt-5.1': 'gpt-6-sol',
+  'gpt-5.1-codex': 'gpt-6-sol',
+  'gpt-5.1-codex-max': 'gpt-6-sol',
+  'gpt-5.1-codex-mini': 'gpt-6-luna',
+};
+
+export function normalizeLegacyCodexModel(model: string): string {
+  return LEGACY_CODEX_MODELS[model] ?? model;
+}
+
+/**
  * 模型名重写：SDK 可能硬编码请求 claude-* 系列（haiku 后台任务等），
- * 一律映射到 provider 配置的 Codex 模型，避免上游 404。
+ * 一律映射到 provider 配置的 Codex 模型，避免上游 404；
+ * 旧目录模型（gpt-5.1-*）归一到现役 GPT-6 目录，存量配置无需手动迁移。
  */
 export function resolveCodexModel(
   requestModel: string | undefined,
   configuredModel: string,
 ): string {
-  if (!requestModel) return configuredModel || 'gpt-5.1-codex';
+  const configured = normalizeLegacyCodexModel(configuredModel || 'gpt-6-sol');
+  if (!requestModel) return configured;
   if (/^claude/i.test(requestModel)) {
-    return configuredModel || 'gpt-5.1-codex';
+    return configured;
   }
-  return requestModel;
+  return normalizeLegacyCodexModel(requestModel);
 }

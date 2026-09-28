@@ -2,6 +2,8 @@ import { describe, expect, test } from 'vitest';
 
 import {
   anthropicToResponses,
+  normalizeCodexEffort,
+  normalizeLegacyCodexModel,
   resolveCodexModel,
 } from '../src/codex-gateway/convert-request.js';
 import {
@@ -43,19 +45,63 @@ describe('reasoning-signature', () => {
 
 describe('resolveCodexModel', () => {
   test('rewrites claude-* model names to the configured Codex model', () => {
-    expect(resolveCodexModel('claude-haiku-4-5', 'gpt-5.1-codex')).toBe(
-      'gpt-5.1-codex',
+    expect(resolveCodexModel('claude-haiku-4-5', 'gpt-6-sol')).toBe(
+      'gpt-6-sol',
     );
   });
 
   test('passes through non-claude model names unchanged', () => {
-    expect(resolveCodexModel('gpt-5.1-codex-mini', 'gpt-5.1-codex')).toBe(
-      'gpt-5.1-codex-mini',
-    );
+    expect(resolveCodexModel('gpt-6-luna', 'gpt-6-sol')).toBe('gpt-6-luna');
   });
 
   test('falls back to a default when no request model or configured model exists', () => {
-    expect(resolveCodexModel(undefined, '')).toBe('gpt-5.1-codex');
+    expect(resolveCodexModel(undefined, '')).toBe('gpt-6-sol');
+  });
+
+  test('normalizes legacy gpt-5.1 configured models to the current catalog', () => {
+    expect(resolveCodexModel(undefined, 'gpt-5.1-codex')).toBe('gpt-6-sol');
+    expect(resolveCodexModel('claude-sonnet-4-6', 'gpt-5.1-codex-max')).toBe(
+      'gpt-6-sol',
+    );
+  });
+
+  test('normalizes legacy gpt-5.1 request models to the current catalog', () => {
+    expect(resolveCodexModel('gpt-5.1-codex', 'gpt-6-sol')).toBe('gpt-6-sol');
+    expect(resolveCodexModel('gpt-5.1-codex-mini', 'gpt-6-sol')).toBe(
+      'gpt-6-luna',
+    );
+  });
+});
+
+describe('normalizeLegacyCodexModel', () => {
+  test('maps the removed gpt-5.1 family to GPT-6 equivalents', () => {
+    expect(normalizeLegacyCodexModel('gpt-5.1')).toBe('gpt-6-sol');
+    expect(normalizeLegacyCodexModel('gpt-5.1-codex')).toBe('gpt-6-sol');
+    expect(normalizeLegacyCodexModel('gpt-5.1-codex-max')).toBe('gpt-6-sol');
+    expect(normalizeLegacyCodexModel('gpt-5.1-codex-mini')).toBe('gpt-6-luna');
+  });
+
+  test('leaves current-catalog models untouched', () => {
+    expect(normalizeLegacyCodexModel('gpt-6-sol')).toBe('gpt-6-sol');
+    expect(normalizeLegacyCodexModel('gpt-5.6-luna')).toBe('gpt-5.6-luna');
+    expect(normalizeLegacyCodexModel('some-future-model')).toBe(
+      'some-future-model',
+    );
+  });
+});
+
+describe('normalizeCodexEffort', () => {
+  test('defaults to medium when unset', () => {
+    expect(normalizeCodexEffort(undefined)).toBe('medium');
+  });
+
+  test('maps legacy minimal to low (removed from the GPT-6 catalog)', () => {
+    expect(normalizeCodexEffort('minimal')).toBe('low');
+  });
+
+  test('passes through other effort levels unchanged', () => {
+    expect(normalizeCodexEffort('xhigh')).toBe('xhigh');
+    expect(normalizeCodexEffort('ultra')).toBe('ultra');
   });
 });
 
