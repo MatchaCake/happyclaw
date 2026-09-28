@@ -11,7 +11,7 @@
 // - output_text.delta → text 块（惰性开启，节省 block 序号）
 // - function_call item → tool_use 块，arguments 经 input_json_delta 下发
 // - response.completed → usage 映射 + message_delta(stop_reason) + message_stop
-// - 上游断流未完成时 finish() 优雅收尾，SDK 不会挂死
+// - 上游断流/失败 → finish() 产出 error 事件（不伪装成成功的 end_turn）
 
 import { encodeReasoningSignature } from './reasoning-signature.js';
 
@@ -85,20 +85,19 @@ export class ResponsesToAnthropicConverter {
    */
   finish(): AnthropicStreamEvent[] {
     if (this.finished) return [];
-    if (!this.messageStarted) return [];
     this.finished = true;
-    const events: AnthropicStreamEvent[] = [];
-    events.push(...this.closeAllBlocks());
-    events.push({
-      event: 'message_delta',
-      data: {
-        type: 'message_delta',
-        delta: { stop_reason: 'end_turn', stop_sequence: null },
-        usage: { output_tokens: this.usage.output_tokens },
+    return [
+      {
+        event: 'error',
+        data: {
+          type: 'error',
+          error: {
+            type: 'api_error',
+            message: 'Upstream Codex stream ended before completion',
+          },
+        },
       },
-    });
-    events.push({ event: 'message_stop', data: { type: 'message_stop' } });
-    return events;
+    ];
   }
 
   private ensureMessageStarted(raw: Json): AnthropicStreamEvent[] {
@@ -403,7 +402,12 @@ export class ResponsesToAnthropicConverter {
     this.ensureMessageStarted(raw);
     if (this.finished) return [];
     this.finished = true;
+    // response.failed 的错误详情挂在 response.error.{code,message} 下
+    // （如订阅额度用尽的提示），裸 error 事件才用顶层 message/code。
+    const response = (raw.response ?? {}) as Json;
+    const responseError = (response.error ?? {}) as Json;
     const message =
+      asString(responseError.message) ??
       asString(raw.message) ??
       (typeof (raw as Json).code === 'string'
         ? `Upstream error: ${String((raw as Json).code)}`
@@ -446,7 +450,8 @@ export interface AggregatedAnthropicMessage {
 /**
  * 用与流式完全相同的翻译逻辑（converter → Anthropic SSE 事件）聚合出
  * 完整消息：逐块拼装 text/thinking/tool_use 内容与 stop_reason。
- * 上游中途断流时以已收到内容优雅收尾，与流式行为一致。
+ * 上游失败或断流未到 response.completed 时抛错（事件流含 error），
+ * 由网关转换为 502，绝不返回截断的部分内容冒充成功。
  */
 export function aggregateResponsesStream(
   events: Array<Json>,
@@ -458,6 +463,9 @@ export function aggregateResponsesStream(
     anthropicEvents.push(...converter.handleEvent(event));
   }
   anthropicEvents.push(...converter.finish());
+  if (anthropicEvents.some(({ event }) => event === 'error')) {
+    throw new Error('Upstream Codex stream failed or ended before completion');
+  }
 
   let id = `msg_${Date.now().toString(36)}`;
   let model = fallbackModel;

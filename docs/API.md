@@ -304,6 +304,10 @@ Provider：
 - `POST /api/config/codex/oauth/callback`，用 `{ state, code }`（`code`
   接受回调页完整 URL 或裸授权码）换取 token，创建或更新 ChatGPT
   订阅型 Provider；其 `anthropicBaseUrl` 落盘为内嵌网关占位值
+- `GET /api/config/codex/model-catalog`，返回 Codex 模型目录
+  `{ models: [{ value, label, efforts }], defaultModel, defaultEffort }`，
+  唯一真相源为 `src/codex-gateway/model-catalog.ts`，供设置页模型/
+  推理力度下拉使用
 - `PUT /api/config/claude/custom-env`
 
 系统：

@@ -26,12 +26,10 @@ export interface ResponsesRequest {
   input: Array<Json>;
   tools?: Array<Json>;
   tool_choice?: Json | 'auto' | 'none' | 'required';
-  parallel_tool_calls?: boolean;
   reasoning?: { effort: string; summary: 'auto' };
   include?: string[];
   store: false;
   stream: true;
-  prompt_cache_key?: string;
 }
 
 function contentBlocks(content: unknown): Array<Json> {
@@ -200,8 +198,6 @@ export interface AnthropicToResponsesOptions {
   targetModel: string;
   /** reasoning effort；provider customEnv 可覆盖。 */
   reasoningEffort?: string;
-  /** 会话级缓存键（提高上游 prompt cache 命中率）。 */
-  promptCacheKey?: string;
   requestTools?: boolean;
 }
 
@@ -239,7 +235,6 @@ export function anthropicToResponses(
     include: ['reasoning.encrypted_content'],
     store: false,
     stream: true,
-    prompt_cache_key: options.promptCacheKey,
   };
 
   if (!payload.tools) {

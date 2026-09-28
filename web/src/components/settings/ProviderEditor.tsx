@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   CheckCircle2,
   ExternalLink,
@@ -46,8 +46,9 @@ const DEFAULTED_THIRD_PARTY_ENV_KEYS = new Set(
 );
 
 // ChatGPT 订阅型配置：目标 Codex 模型与推理力度（网关映射到上游请求）。
-// 目录对齐 openai/codex CLI models.json（2026-09）：GPT-6 家族为主力，
-// gpt-5.1 系列已从上游目录移除（实测 400）。
+// 目录唯一真相源在后端 src/codex-gateway/model-catalog.ts（对齐上游 codex
+// CLI 的 models.json），通过 GET /api/config/codex/model-catalog 获取；
+// 下面这份只在目录接口不可用时兜底，保证编辑器离线也能渲染。
 const CODEX_FULL_EFFORTS = [
   'low',
   'medium',
@@ -61,7 +62,7 @@ const CODEX_LEGACY_EFFORTS = ['low', 'medium', 'high', 'xhigh'] as const;
 
 // 每个模型支持的 reasoning.effort 档位不同（如 gpt-6-luna 无 ultra、gpt-5.5 无
 // max/ultra），选了模型目录不支持的档位会被上游 Responses API 拒绝（400）。
-const CODEX_MODEL_OPTIONS: ReadonlyArray<{
+const CODEX_FALLBACK_MODEL_OPTIONS: ReadonlyArray<{
   value: string;
   label: string;
   efforts: readonly string[];
@@ -102,8 +103,24 @@ const CODEX_MODEL_OPTIONS: ReadonlyArray<{
     efforts: CODEX_LEGACY_EFFORTS,
   },
 ] as const;
-const CODEX_DEFAULT_MODEL = 'gpt-6-sol';
-const CODEX_DEFAULT_EFFORT = 'medium';
+const CODEX_FALLBACK_DEFAULT_MODEL = 'gpt-6-sol';
+const CODEX_FALLBACK_DEFAULT_EFFORT = 'medium';
+
+interface CodexCatalog {
+  models: ReadonlyArray<{
+    value: string;
+    label: string;
+    efforts: readonly string[];
+  }>;
+  defaultModel: string;
+  defaultEffort: string;
+}
+
+const CODEX_FALLBACK_CATALOG: CodexCatalog = {
+  models: CODEX_FALLBACK_MODEL_OPTIONS,
+  defaultModel: CODEX_FALLBACK_DEFAULT_MODEL,
+  defaultEffort: CODEX_FALLBACK_DEFAULT_EFFORT,
+};
 
 const MANAGED_ENV_SOURCE_LABELS = {
   model: '跟随模型',
@@ -181,8 +198,49 @@ export function ProviderEditor({
   const [oneMillionContext, setOneMillionContext] = useState(false);
 
   // ChatGPT 订阅型配置：目标模型与推理力度
-  const [codexModel, setCodexModel] = useState<string>(CODEX_DEFAULT_MODEL);
-  const [codexEffort, setCodexEffort] = useState<string>(CODEX_DEFAULT_EFFORT);
+  const [codexModel, setCodexModel] = useState<string>(
+    CODEX_FALLBACK_DEFAULT_MODEL,
+  );
+  const [codexEffort, setCodexEffort] = useState<string>(
+    CODEX_FALLBACK_DEFAULT_EFFORT,
+  );
+  // Codex 模型目录：唯一真相源在后端，打开编辑器时拉取；接口不可用时
+  // 保留内置兜底目录（与后端当前版本一致）。
+  const [codexCatalog, setCodexCatalog] = useState<CodexCatalog>(
+    CODEX_FALLBACK_CATALOG,
+  );
+  const codexCatalogRef = useRef<CodexCatalog>(CODEX_FALLBACK_CATALOG);
+  useEffect(() => {
+    codexCatalogRef.current = codexCatalog;
+  }, [codexCatalog]);
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .get<CodexCatalog>('/api/config/codex/model-catalog')
+      .then((catalog) => {
+        if (
+          cancelled ||
+          !catalog ||
+          !Array.isArray(catalog.models) ||
+          catalog.models.length === 0
+        ) {
+          return;
+        }
+        const normalized: CodexCatalog = {
+          models: catalog.models,
+          defaultModel: catalog.defaultModel || CODEX_FALLBACK_DEFAULT_MODEL,
+          defaultEffort: catalog.defaultEffort || CODEX_FALLBACK_DEFAULT_EFFORT,
+        };
+        setCodexCatalog(normalized);
+        codexCatalogRef.current = normalized;
+      })
+      .catch(() => {
+        // 目录接口不可用：静默保留兜底目录
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // 官方认证
   const [authTab, setAuthTab] = useState<OfficialAuthTab>('oauth');
@@ -216,13 +274,13 @@ export function ProviderEditor({
 
   // 当前值不在预设里（如后端已配置其他模型，例如旧目录的 gpt-5.1-*）时，
   // 追加为额外选项，避免 select 显示空白。
-  const selectedCodexModel = CODEX_MODEL_OPTIONS.find(
+  const selectedCodexModel = codexCatalog.models.find(
     (option) => option.value === codexModel,
   );
   const codexModelChoices: readonly { value: string; label: string }[] =
     selectedCodexModel
-      ? CODEX_MODEL_OPTIONS
-      : [{ value: codexModel, label: codexModel }, ...CODEX_MODEL_OPTIONS];
+      ? codexCatalog.models
+      : [{ value: codexModel, label: codexModel }, ...codexCatalog.models];
   // 推理力度档位按所选模型的目录过滤：不同模型支持的档位不同（见上方常量），
   // 选了模型不支持的档位会被上游拒绝。未识别的模型退回全量档位，避免选不了。
   const codexModelEfforts: readonly string[] =
@@ -244,8 +302,8 @@ export function ProviderEditor({
       setBaseUrl('');
       setModel('');
       setOneMillionContext(false);
-      setCodexModel(CODEX_DEFAULT_MODEL);
-      setCodexEffort(CODEX_DEFAULT_EFFORT);
+      setCodexModel(codexCatalogRef.current.defaultModel);
+      setCodexEffort(codexCatalogRef.current.defaultEffort);
       setAuthTab('oauth');
       setSetupToken('');
       setApiKey('');
@@ -265,9 +323,12 @@ export function ProviderEditor({
       const modelSelection = parseProviderModel(provider.anthropicModel || '');
       setModel(modelSelection.model);
       setOneMillionContext(modelSelection.oneMillionContext);
-      setCodexModel(provider.anthropicModel || CODEX_DEFAULT_MODEL);
+      setCodexModel(
+        provider.anthropicModel || codexCatalogRef.current.defaultModel,
+      );
       setCodexEffort(
-        provider.customEnv?.CODEX_REASONING_EFFORT || CODEX_DEFAULT_EFFORT,
+        provider.customEnv?.CODEX_REASONING_EFFORT ||
+          codexCatalogRef.current.defaultEffort,
       );
       setAuthTab('oauth');
       setSetupToken('');
@@ -475,7 +536,7 @@ export function ProviderEditor({
         };
         await api.patch(`/api/config/claude/providers/${provider!.id}`, {
           name: trimmedName,
-          anthropicModel: codexModel.trim() || CODEX_DEFAULT_MODEL,
+          anthropicModel: codexModel.trim() || codexCatalog.defaultModel,
           customEnv: nextCustomEnv,
         });
         setNotice('模型配置已保存。');
@@ -1027,13 +1088,13 @@ export function ProviderEditor({
                         const nextModel = e.target.value;
                         setCodexModel(nextModel);
                         const nextEfforts =
-                          CODEX_MODEL_OPTIONS.find(
+                          codexCatalog.models.find(
                             (option) => option.value === nextModel,
                           )?.efforts ?? CODEX_FULL_EFFORTS;
                         if (!nextEfforts.includes(codexEffort)) {
                           setCodexEffort(
-                            nextEfforts.includes(CODEX_DEFAULT_EFFORT)
-                              ? CODEX_DEFAULT_EFFORT
+                            nextEfforts.includes(codexCatalog.defaultEffort)
+                              ? codexCatalog.defaultEffort
                               : nextEfforts[0],
                           );
                         }
@@ -1043,7 +1104,7 @@ export function ProviderEditor({
                     >
                       {codexModelChoices.map((m) => (
                         <option key={m.value} value={m.value}>
-                          {m.value === CODEX_DEFAULT_MODEL
+                          {m.value === codexCatalog.defaultModel
                             ? `${m.label}·默认`
                             : m.label}
                         </option>
@@ -1069,7 +1130,7 @@ export function ProviderEditor({
                     >
                       {codexEffortChoices.map((effort) => (
                         <option key={effort} value={effort}>
-                          {effort === CODEX_DEFAULT_EFFORT
+                          {effort === codexCatalog.defaultEffort
                             ? `${effort}（默认）`
                             : effort}
                         </option>

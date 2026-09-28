@@ -299,7 +299,7 @@ describe('ResponsesToAnthropicConverter', () => {
     expect(sigPos).toBeLessThan(stopPos);
   });
 
-  test('finish() closes an unterminated stream exactly once', () => {
+  test('finish() reports premature EOF as an error exactly once', () => {
     const converter = new ResponsesToAnthropicConverter('gpt-5.1-codex');
     converter.handleEvent({ type: 'response.created', response: {} });
     converter.handleEvent({
@@ -308,11 +308,13 @@ describe('ResponsesToAnthropicConverter', () => {
     });
     const first = converter.finish();
     const second = converter.finish();
-    expect(first.map((e) => e.event)).toEqual([
-      'content_block_stop',
-      'message_delta',
-      'message_stop',
-    ]);
+    // 上游断流未到 response.completed 属于失败，必须让调用方看到 error，
+    // 而不是伪装成成功的 end_turn（会静默截断回复且不计失败重试）。
+    expect(first.map((e) => e.event)).toEqual(['error']);
+    expect(first[0].data).toMatchObject({
+      type: 'error',
+      error: { type: 'api_error' },
+    });
     expect(second).toEqual([]);
   });
 });

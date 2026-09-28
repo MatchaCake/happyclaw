@@ -143,6 +143,11 @@ import {
   CODEX_OAUTH_FLOW_TTL_MS,
 } from '../codex-gateway/types.js';
 import {
+  CODEX_MODEL_CATALOG,
+  CODEX_DEFAULT_MODEL,
+  CODEX_DEFAULT_EFFORT,
+} from '../codex-gateway/model-catalog.js';
+import {
   hasOAuthUsageSignals,
   parseOAuthUsageResponse,
 } from '../runtime-config.js';
@@ -784,6 +789,7 @@ interface CodexOAuthFlow {
   codeVerifier: string;
   expiresAt: number;
   targetProviderId?: string; // 空 = 创建新供应商
+  userId: string; // 发起者绑定：防止同权限的其他管理员消费他人挂起的流程
 }
 const codexOauthFlows = new Map<string, CodexOAuthFlow>();
 
@@ -802,6 +808,10 @@ function extractCodexCallbackParams(
   if (!trimmed) return null;
   try {
     const url = new URL(trimmed);
+    // 只接受官方回调地址（localhost:1455）；其他来源的 code 一律拒绝，
+    // 防止把任意第三方 URL 里的参数误当授权码（纵深防御：伪造 code 本身
+    // 也会因 PKCE 校验失败）。
+    if (url.origin !== 'http://localhost:1455') return null;
     const code = url.searchParams.get('code');
     if (code) return { code, state: url.searchParams.get('state') };
   } catch {
@@ -1844,6 +1854,22 @@ configRoutes.post(
   },
 );
 
+// ─── GET /codex/model-catalog — Codex 模型目录（UI 下拉数据源）──────────
+// 目录唯一真相源在 src/codex-gateway/model-catalog.ts；前端不再硬编码，
+// 上游目录变化时只更新后端一处。
+configRoutes.get(
+  '/codex/model-catalog',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    return c.json({
+      models: CODEX_MODEL_CATALOG,
+      defaultModel: CODEX_DEFAULT_MODEL,
+      defaultEffort: CODEX_DEFAULT_EFFORT,
+    });
+  },
+);
+
 // ─── POST /codex/oauth/start — 启动 ChatGPT/Codex 订阅 OAuth PKCE 流程 ─────
 configRoutes.post(
   '/codex/oauth/start',
@@ -1863,6 +1889,7 @@ configRoutes.post(
       codeVerifier,
       expiresAt: Date.now() + CODEX_OAUTH_FLOW_TTL_MS,
       targetProviderId,
+      userId: (c.get('user') as AuthUser).id,
     });
 
     return c.json({
@@ -1890,6 +1917,10 @@ configRoutes.post(
     const flow = codexOauthFlows.get(state);
     if (!flow) {
       return c.json({ error: 'Invalid or expired OAuth state' }, 400);
+    }
+    if (flow.userId !== (c.get('user') as AuthUser).id) {
+      codexOauthFlows.delete(state);
+      return c.json({ error: 'OAuth flow was started by another user' }, 403);
     }
     if (flow.expiresAt < Date.now()) {
       codexOauthFlows.delete(state);

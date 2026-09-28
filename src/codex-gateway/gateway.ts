@@ -9,11 +9,13 @@ import { Hono } from 'hono';
 
 import { logger } from '../logger.js';
 import { getProviderById } from '../runtime-config.js';
+import type { ReadableStreamReadResult } from 'node:stream/web';
 import {
   anthropicToResponses,
   resolveCodexModel,
   type AnthropicRequestSubset,
 } from './convert-request.js';
+import { clampCodexEffort } from './model-catalog.js';
 import {
   ResponsesToAnthropicConverter,
   aggregateResponsesStream,
@@ -26,6 +28,56 @@ export const codexGatewayApp = new Hono();
 
 function sseEncode(event: AnthropicStreamEvent): string {
   return `event: ${event.event}\ndata: ${JSON.stringify(event.data)}\n\n`;
+}
+
+// ─── 网关 token 维度的固定窗口限流 ─────────────────────────────────
+// 网关 token 存在于每个 Runner 环境里（ANTHROPIC_AUTH_TOKEN），被提示注入
+// 或攻陷的 Agent 可以拿它直接消耗订阅。限流 + 成功请求日志给管理员留出
+// 发现与轮换的信号窗口。
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX_REQUESTS = 120;
+const rateLimitCounters = new Map<
+  string,
+  { windowStart: number; count: number }
+>();
+
+function isRateLimited(gatewayToken: string): boolean {
+  const now = Date.now();
+  const counter = rateLimitCounters.get(gatewayToken);
+  if (!counter || now - counter.windowStart >= RATE_LIMIT_WINDOW_MS) {
+    rateLimitCounters.set(gatewayToken, { windowStart: now, count: 1 });
+    if (rateLimitCounters.size > 1024) {
+      // token 数量有界（= provider 数），这里只清理过期窗口防极端堆积。
+      for (const [key, entry] of rateLimitCounters) {
+        if (now - entry.windowStart >= RATE_LIMIT_WINDOW_MS) {
+          rateLimitCounters.delete(key);
+        }
+      }
+    }
+    return false;
+  }
+  counter.count += 1;
+  return counter.count > RATE_LIMIT_MAX_REQUESTS;
+}
+
+/** 成功代理请求的轻量审计日志：只记模型与 token 用量，不记消息内容。 */
+function logGatewaySuccess(
+  model: string,
+  usage: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_read_input_tokens: number;
+  },
+): void {
+  logger.info(
+    {
+      model,
+      inputTokens: usage.input_tokens,
+      outputTokens: usage.output_tokens,
+      cacheReadInputTokens: usage.cache_read_input_tokens,
+    },
+    'Codex gateway: request proxied',
+  );
 }
 
 function extractGatewayToken(headers: Headers): string | null {
@@ -68,7 +120,20 @@ async function* iterateUpstreamEvents(
 
   try {
     for (;;) {
-      const { value, done } = await reader.read();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          void reader.cancel().catch(() => {});
+          reject(new Error('Upstream Codex stream stalled'));
+        }, 60_000);
+      });
+      let result: ReadableStreamReadResult<Uint8Array>;
+      try {
+        result = await Promise.race([reader.read(), timeout]);
+      } finally {
+        clearTimeout(timer);
+      }
+      const { value, done } = result;
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
@@ -88,6 +153,17 @@ async function* iterateUpstreamEvents(
         }
       }
     }
+    // SSE 规范：EOF 时未被空行终止的最后一行也要分发。上游可能不发结尾
+    // 空行——丢掉它会把成功的 response.completed 误判成断流失败。
+    const trailing = buffer.replace(/\r$/, '');
+    if (trailing.startsWith('data:')) {
+      const chunk = trailing.slice('data:'.length).trim();
+      current.data =
+        current.data === undefined ? chunk : `${current.data}\n${chunk}`;
+    } else if (trailing.startsWith('event:')) {
+      current.event = trailing.slice('event:'.length).trim();
+    }
+    buffer = '';
     yield* flush();
   } finally {
     reader.releaseLock();
@@ -103,6 +179,20 @@ codexGatewayApp.post('/v1/messages', async (c) => {
         error: { type: 'authentication_error', message: 'Missing API key' },
       },
       401,
+    );
+  }
+
+  if (isRateLimited(gatewayToken)) {
+    logger.warn('Codex gateway: rate limit exceeded for gateway token');
+    return c.json(
+      {
+        type: 'error',
+        error: {
+          type: 'rate_limit_error',
+          message: 'Codex gateway rate limit exceeded, retry later',
+        },
+      },
+      429,
     );
   }
 
@@ -126,7 +216,7 @@ codexGatewayApp.post('/v1/messages', async (c) => {
     undefined,
     provider?.anthropicModel || '',
   );
-  const reasoningEffort = provider?.customEnv?.CODEX_REASONING_EFFORT;
+  const configuredEffort = provider?.customEnv?.CODEX_REASONING_EFFORT;
 
   let anthropicRequest: AnthropicRequestSubset;
   let wantsStream = true;
@@ -148,12 +238,21 @@ codexGatewayApp.post('/v1/messages', async (c) => {
 
   const responsesRequest = anthropicToResponses(anthropicRequest, {
     targetModel: resolveCodexModel(anthropicRequest.model, targetModel),
-    reasoningEffort,
+    // 目录钳制：存量配置里被上游移除的 effort 档（如 minimal）或模型不支持
+    // 的档位在请求侧归位，避免上游 400；与前端切模型归位逻辑语义一致。
+    reasoningEffort: clampCodexEffort(
+      resolveCodexModel(anthropicRequest.model, targetModel),
+      configuredEffort,
+    ),
     requestTools: !!anthropicRequest.tools?.length,
   });
 
   const controller = new AbortController();
-  c.req.raw.signal?.addEventListener('abort', () => controller.abort());
+  const FETCH_TIMEOUT_MS = 30_000;
+  const fetchTimeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  c.req.raw.signal?.addEventListener('abort', () => controller.abort(), {
+    once: true,
+  });
 
   let upstream: Response;
   try {
@@ -169,7 +268,9 @@ codexGatewayApp.post('/v1/messages', async (c) => {
       body: JSON.stringify(responsesRequest),
       signal: controller.signal,
     });
+    clearTimeout(fetchTimeout);
   } catch (err) {
+    clearTimeout(fetchTimeout);
     logger.warn({ err }, 'Codex gateway: upstream request failed');
     return c.json(
       {
@@ -181,7 +282,8 @@ codexGatewayApp.post('/v1/messages', async (c) => {
   }
 
   if (!upstream.ok || !upstream.body) {
-    const detail = await upstream.text().catch(() => '');
+    // 上游错误体可能回显请求片段（会话内容），截断后再进日志。
+    const detail = (await upstream.text().catch(() => '')).slice(0, 512);
     logger.warn(
       { status: upstream.status, detail },
       'Codex gateway: upstream rejected request',
@@ -204,20 +306,51 @@ codexGatewayApp.post('/v1/messages', async (c) => {
 
   if (!wantsStream) {
     const events: Record<string, unknown>[] = [];
-    for await (const event of iterateUpstreamEvents(upstream.body)) {
-      events.push(event);
+    // 非流式聚合需要一个整体上限：60s 只是块间超时，慢滴上游可以无限
+    // 拖住请求和 events 数组。上限对齐 Anthropic SDK 客户端默认 10 分钟。
+    const AGGREGATE_DEADLINE_MS = 600_000;
+    const deadline = setTimeout(
+      () => controller.abort(),
+      AGGREGATE_DEADLINE_MS,
+    );
+    try {
+      for await (const event of iterateUpstreamEvents(upstream.body)) {
+        events.push(event);
+      }
+      const aggregated = aggregateResponsesStream(
+        events,
+        responsesRequest.model,
+      );
+      logGatewaySuccess(responsesRequest.model, aggregated.usage);
+      return c.json({
+        id: aggregated.id,
+        type: 'message',
+        role: 'assistant',
+        model: aggregated.model,
+        content: aggregated.content,
+        stop_reason: aggregated.stopReason,
+        stop_sequence: null,
+        usage: aggregated.usage,
+      });
+    } catch (err) {
+      controller.abort();
+      const timedOut = err instanceof Error && err.name === 'AbortError';
+      logger.warn({ err }, 'Codex gateway: upstream stream failed');
+      return c.json(
+        {
+          type: 'error',
+          error: {
+            type: 'api_error',
+            message: timedOut
+              ? 'Upstream Codex stream timed out'
+              : 'Upstream Codex stream failed',
+          },
+        },
+        timedOut ? 504 : 502,
+      );
+    } finally {
+      clearTimeout(deadline);
     }
-    const aggregated = aggregateResponsesStream(events, responsesRequest.model);
-    return c.json({
-      id: aggregated.id,
-      type: 'message',
-      role: 'assistant',
-      model: aggregated.model,
-      content: aggregated.content,
-      stop_reason: aggregated.stopReason,
-      stop_sequence: null,
-      usage: aggregated.usage,
-    });
   }
 
   const stream = new ReadableStream<Uint8Array>({
@@ -234,6 +367,7 @@ codexGatewayApp.post('/v1/messages', async (c) => {
         for (const outEvent of converter.finish()) {
           controllerStream.enqueue(encoder.encode(sseEncode(outEvent)));
         }
+        logGatewaySuccess(responsesRequest.model, converter.getUsage());
       } catch (err) {
         logger.warn({ err }, 'Codex gateway: stream translation failed');
         controllerStream.enqueue(
