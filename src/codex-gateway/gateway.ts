@@ -237,14 +237,15 @@ codexGatewayApp.post('/v1/messages', async (c) => {
     );
   }
 
+  const requestModel = resolveCodexModel(anthropicRequest.model, targetModel);
   const responsesRequest = anthropicToResponses(anthropicRequest, {
-    targetModel: resolveCodexModel(anthropicRequest.model, targetModel),
+    targetModel: requestModel,
     // 目录钳制：存量配置里被上游移除的 effort 档（如 minimal）或模型不支持
     // 的档位在请求侧归位，避免上游 400；与前端切模型归位逻辑语义一致。
     // 目录用解析后的实时目录（上游同步结果优先，baked-in 兜底）。
     reasoningEffort: clampCodexEffortWithCatalog(
       getResolvedCodexCatalog().models,
-      resolveCodexModel(anthropicRequest.model, targetModel),
+      requestModel,
       configuredEffort,
     ),
     requestTools: !!anthropicRequest.tools?.length,

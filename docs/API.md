@@ -313,8 +313,10 @@ Provider：
   接受回调页完整 URL 或裸授权码）换取 token，创建或更新 ChatGPT
   订阅型 Provider；其 `anthropicBaseUrl` 落盘为内嵌网关占位值
 - `GET /api/config/codex/model-catalog`，返回 Codex 模型目录
-  `{ models: [{ value, label, efforts }], defaultModel, defaultEffort,
-  source, fetchedAt }`；目录由 `src/codex-gateway/model-catalog-sync.ts`
+  `{ models: [{ value, label, efforts, defaultEffort? }], defaultModel,
+defaultEffort, source, fetchedAt }`（条目内 `defaultEffort` 是上游
+  per-model 默认推理档，可能缺省）；目录由
+  `src/codex-gateway/model-catalog-sync.ts`
   从上游 openai/codex 仓库 `codex-rs/models-manager/models.json` 同步
   （`source` 为 `upstream`/`disk-cache`/`builtin`），baked-in 目录
   （`src/codex-gateway/model-catalog.ts`）作离线兜底，供设置页模型/

@@ -111,6 +111,7 @@ interface CodexCatalog {
     value: string;
     label: string;
     efforts: readonly string[];
+    defaultEffort?: string;
   }>;
   defaultModel: string;
   defaultEffort: string;
@@ -1087,14 +1088,19 @@ export function ProviderEditor({
                       onChange={(e) => {
                         const nextModel = e.target.value;
                         setCodexModel(nextModel);
+                        const nextModelEntry = codexCatalog.models.find(
+                          (option) => option.value === nextModel,
+                        );
                         const nextEfforts =
-                          codexCatalog.models.find(
-                            (option) => option.value === nextModel,
-                          )?.efforts ?? CODEX_FULL_EFFORTS;
+                          nextModelEntry?.efforts ?? CODEX_FULL_EFFORTS;
                         if (!nextEfforts.includes(codexEffort)) {
+                          // 归位优先该模型自己的上游默认档，缺省用全局默认。
+                          const nextDefault =
+                            nextModelEntry?.defaultEffort ??
+                            codexCatalog.defaultEffort;
                           setCodexEffort(
-                            nextEfforts.includes(codexCatalog.defaultEffort)
-                              ? codexCatalog.defaultEffort
+                            nextEfforts.includes(nextDefault)
+                              ? nextDefault
                               : nextEfforts[0],
                           );
                         }
@@ -1130,7 +1136,9 @@ export function ProviderEditor({
                     >
                       {codexEffortChoices.map((effort) => (
                         <option key={effort} value={effort}>
-                          {effort === codexCatalog.defaultEffort
+                          {effort ===
+                          (selectedCodexModel?.defaultEffort ??
+                            codexCatalog.defaultEffort)
                             ? `${effort}（默认）`
                             : effort}
                         </option>
