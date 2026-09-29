@@ -26,6 +26,80 @@ function asString(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
 }
 
+export type AnthropicErrorType =
+  | 'invalid_request_error'
+  | 'rate_limit_error'
+  | 'api_error';
+
+export interface CodexUpstreamFailure {
+  type: AnthropicErrorType;
+  code: string | null;
+  message: string;
+}
+
+const RATE_LIMIT_CODES = new Set([
+  'rate_limit_exceeded',
+  'usage_limit_reached',
+  'insufficient_quota',
+]);
+
+const HTTP_STATUS_BY_ERROR_TYPE: Readonly<Record<AnthropicErrorType, number>> =
+  {
+    invalid_request_error: 400,
+    rate_limit_error: 429,
+    api_error: 502,
+  };
+
+/**
+ * 把上游失败翻译成 Anthropic 错误类型。类型决定客户端是否重试：SDK 对
+ * api_error 会反复重试，而 invalid_prompt（上游安全策略拒绝）重试同一请求
+ * 并不会改变判定，必须以 invalid_request_error 暴露真实原因。
+ */
+export function describeUpstreamFailure(raw: Json): CodexUpstreamFailure {
+  // response.failed 的详情在 response.error 下；裸 error 事件在 error 下，
+  // 少数旧形态直接放在顶层 code/message。
+  const response = (raw.response ?? {}) as Json;
+  const nested = (response.error ?? raw.error ?? {}) as Json;
+  const code = asString(nested.code) ?? asString(raw.code);
+  const upstreamType = asString(nested.type) ?? '';
+  const detail =
+    asString(nested.message) ??
+    asString(raw.message) ??
+    'Upstream Codex request failed';
+
+  let type: AnthropicErrorType = 'api_error';
+  if (
+    (code && RATE_LIMIT_CODES.has(code)) ||
+    upstreamType.includes('rate_limit')
+  ) {
+    type = 'rate_limit_error';
+  } else if (upstreamType === 'invalid_request_error') {
+    type = 'invalid_request_error';
+  }
+
+  const message =
+    code === 'invalid_prompt'
+      ? `Codex 上游安全策略拒绝了本次请求（invalid_prompt）：${detail}`
+      : code
+        ? `Codex upstream error (${code}): ${detail}`
+        : detail;
+  return { type, code, message };
+}
+
+export class CodexUpstreamError extends Error {
+  readonly errorType: AnthropicErrorType;
+  readonly code: string | null;
+  readonly status: number;
+
+  constructor(failure: CodexUpstreamFailure) {
+    super(failure.message);
+    this.name = 'CodexUpstreamError';
+    this.errorType = failure.type;
+    this.code = failure.code;
+    this.status = HTTP_STATUS_BY_ERROR_TYPE[failure.type];
+  }
+}
+
 export class ResponsesToAnthropicConverter {
   private model: string;
   private blockIndex = 0;
@@ -45,6 +119,7 @@ export class ResponsesToAnthropicConverter {
   private messageStarted = false;
   private finished = false;
   private messageId = '';
+  private failure: CodexUpstreamFailure | null = null;
 
   constructor(model: string) {
     this.model = model;
@@ -402,25 +477,21 @@ export class ResponsesToAnthropicConverter {
     this.ensureMessageStarted(raw);
     if (this.finished) return [];
     this.finished = true;
-    // response.failed 的错误详情挂在 response.error.{code,message} 下
-    // （如订阅额度用尽的提示），裸 error 事件才用顶层 message/code。
-    const response = (raw.response ?? {}) as Json;
-    const responseError = (response.error ?? {}) as Json;
-    const message =
-      asString(responseError.message) ??
-      asString(raw.message) ??
-      (typeof (raw as Json).code === 'string'
-        ? `Upstream error: ${String((raw as Json).code)}`
-        : 'Upstream Codex request failed');
+    this.failure = describeUpstreamFailure(raw);
     return [
       {
         event: 'error',
         data: {
           type: 'error',
-          error: { type: 'api_error', message },
+          error: { type: this.failure.type, message: this.failure.message },
         },
       },
     ];
+  }
+
+  /** 上游明确报告的失败（response.failed / error 事件）；断流不算。 */
+  getFailure(): CodexUpstreamFailure | null {
+    return this.failure ? { ...this.failure } : null;
   }
 
   getUsage(): {
@@ -464,7 +535,13 @@ export function aggregateResponsesStream(
   }
   anthropicEvents.push(...converter.finish());
   if (anthropicEvents.some(({ event }) => event === 'error')) {
-    throw new Error('Upstream Codex stream failed or ended before completion');
+    throw new CodexUpstreamError(
+      converter.getFailure() ?? {
+        type: 'api_error',
+        code: null,
+        message: 'Upstream Codex stream ended before completion',
+      },
+    );
   }
 
   let id = `msg_${Date.now().toString(36)}`;

@@ -20,6 +20,7 @@ import { getResolvedCodexCatalog } from './model-catalog-sync.js';
 import {
   ResponsesToAnthropicConverter,
   aggregateResponsesStream,
+  CodexUpstreamError,
   type AnthropicStreamEvent,
 } from './convert-response.js';
 import { CodexGatewayAuthError, resolveCodexAccess } from './token-manager.js';
@@ -338,6 +339,19 @@ codexGatewayApp.post('/v1/messages', async (c) => {
       });
     } catch (err) {
       controller.abort();
+      if (err instanceof CodexUpstreamError) {
+        logger.warn(
+          { code: err.code, errorType: err.errorType },
+          'Codex gateway: upstream reported failure',
+        );
+        return c.json(
+          {
+            type: 'error',
+            error: { type: err.errorType, message: err.message },
+          },
+          err.status as 400 | 429 | 502,
+        );
+      }
       const timedOut = err instanceof Error && err.name === 'AbortError';
       logger.warn({ err }, 'Codex gateway: upstream stream failed');
       return c.json(
@@ -371,7 +385,15 @@ codexGatewayApp.post('/v1/messages', async (c) => {
         for (const outEvent of converter.finish()) {
           controllerStream.enqueue(encoder.encode(sseEncode(outEvent)));
         }
-        logGatewaySuccess(responsesRequest.model, converter.getUsage());
+        const failure = converter.getFailure();
+        if (failure) {
+          logger.warn(
+            { code: failure.code, errorType: failure.type },
+            'Codex gateway: upstream reported failure',
+          );
+        } else {
+          logGatewaySuccess(responsesRequest.model, converter.getUsage());
+        }
       } catch (err) {
         logger.warn({ err }, 'Codex gateway: stream translation failed');
         controllerStream.enqueue(
