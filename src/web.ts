@@ -93,6 +93,7 @@ import {
   resolveBoundWorkspaceJid,
 } from './workspace-attribution.js';
 import { markdownToPlainText } from './im-utils.js';
+import { stripVirtualJidSuffix } from './utils.js';
 import { isSessionExpired } from './auth.js';
 import type {
   AgentStatus,
@@ -1463,6 +1464,18 @@ app.use(
 // （前端只看到 onclose、后端默认静默 destroy socket），没有这行日志运维成本极高。
 const warnedRejectedOrigins = new Set<string>();
 
+export function evaluateWsSpawnCommandAccess(
+  user: { id: string; role: UserRole },
+  chatJid: string,
+): { dispatched: true } | { dispatched: false; reason: 'access' } {
+  const baseJid = stripVirtualJidSuffix(chatJid);
+  const row = getRegisteredGroup(baseJid);
+  if (!row || !canModifyGroup(user, { ...row, jid: baseJid })) {
+    return { dispatched: false, reason: 'access' };
+  }
+  return { dispatched: true };
+}
+
 function setupWebSocket(server: any): WebSocketServer {
   // 8 MiB 上限：覆盖单条消息含 10 张 5MB base64 image 的合法上限（~70MB 是
   // attachments 上限里的极端情形——通过 schema 上的 attachments.max(10) 控制
@@ -1831,6 +1844,15 @@ function setupWebSocket(server: any): WebSocketServer {
           // ── /sw or /spawn command: spawn parallel task (checked before agent routing) ──
           const swMatch = content.trim().match(/^\/(sw|spawn)\s+([\s\S]+)$/i);
           if (swMatch && deps?.handleSpawnCommand) {
+            const spawnAccess = evaluateWsSpawnCommandAccess(
+              { id: session.user_id, role: session.role },
+              chatJid,
+            );
+            if (!spawnAccess.dispatched) {
+              sendWsError('Only the workspace owner can run /sw', chatJid);
+              return;
+            }
+
             const spawnMessage = swMatch[2].trim();
             if (spawnMessage) {
               try {
