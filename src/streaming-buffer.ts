@@ -110,6 +110,40 @@ export class StreamingBuffer {
     }
   }
 
+  unlinkJid(jid: string): void {
+    try {
+      fs.unlinkSync(path.join(this.directory, `${this.encodeJid(jid)}.txt`));
+    } catch {
+      // Missing or already replaced. A kept file is retried by recover().
+    }
+  }
+
+  saveInterrupted(
+    activeTexts: ReadonlyMap<string, string>,
+    persist: (jid: string, text: string) => void,
+    onWhitespace?: (jid: string) => void,
+  ): void {
+    let failed = false;
+    for (const [jid, text] of activeTexts) {
+      try {
+        if (!text.trim()) {
+          onWhitespace?.(jid);
+          this.unlinkJid(jid);
+          continue;
+        }
+        persist(jid, text);
+        this.unlinkJid(jid);
+      } catch (error) {
+        failed = true;
+        logger.warn(
+          { error, jid },
+          'Error saving interrupted streaming messages',
+        );
+      }
+    }
+    if (!failed) this.clean();
+  }
+
   start(): void {
     if (this.interval) return;
     this.interval = setInterval(() => this.flush(), this.flushIntervalMs);

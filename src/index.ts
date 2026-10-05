@@ -10953,21 +10953,18 @@ function buildOverflowPartialReply(partialText: string): string {
  * Without this, partial bot responses are lost when the service restarts.
  */
 function saveInterruptedStreamingMessages(): void {
-  try {
-    const activeTexts = getActiveStreamingTexts();
-    if (activeTexts.size === 0) return;
+  const activeTexts = getActiveStreamingTexts();
+  if (activeTexts.size === 0) return;
 
-    logger.info(
-      { count: activeTexts.size },
-      'Saving interrupted streaming messages to DB',
-    );
+  logger.info(
+    { count: activeTexts.size },
+    'Saving interrupted streaming messages to DB',
+  );
 
-    for (const [jid, partialText] of activeTexts) {
-      if (!partialText.trim()) {
-        shutdownSavedJids.add(jid);
-        continue;
-      }
-      const interruptedText = buildInterruptedReply(partialText);
+  streamingBuffer.saveInterrupted(
+    activeTexts,
+    (jid, text) => {
+      const interruptedText = buildInterruptedReply(text);
       const msgId = crypto.randomUUID();
       const timestamp = new Date().toISOString();
       ensureChatExists(jid);
@@ -10986,15 +10983,12 @@ function saveInterruptedStreamingMessages(): void {
           },
         },
       );
-      // Mark as saved so the per-group finally blocks don't duplicate
       shutdownSavedJids.add(jid);
-    }
-  } catch (err) {
-    logger.warn({ err }, 'Error saving interrupted streaming messages');
-  }
-
-  // Clean up buffer files since we saved to DB (avoids duplicates on next startup)
-  streamingBuffer.clean();
+    },
+    (jid) => {
+      shutdownSavedJids.add(jid);
+    },
+  );
 }
 
 const streamingBuffer = new StreamingBuffer(
