@@ -24,6 +24,27 @@ export function readMcpServersFile(filePath: string): McpServerMap {
 }
 
 /**
+ * Read a project-level MCP file from the agent-writable workspace tree. The
+ * container can plant symlinks there, so resolve the real path and refuse
+ * anything that leaves the real workspace root before reading it.
+ */
+export function readWorkspaceMcpServersFile(
+  workspaceDir: string,
+  relativePath: string,
+): McpServerMap {
+  let realRoot: string;
+  let realFile: string;
+  try {
+    realRoot = fs.realpathSync(workspaceDir);
+    realFile = fs.realpathSync(path.join(workspaceDir, relativePath));
+  } catch {
+    return {}; // missing or dangling link
+  }
+  if (!realFile.startsWith(realRoot + path.sep)) return {};
+  return readMcpServersFile(realFile);
+}
+
+/**
  * Resolve every native user-level MCP source from the configured Claude
  * directory. Never consult process HOME: externalClaudeDir is the single
  * authority for both the .claude directory and its sibling .claude.json.
@@ -63,14 +84,17 @@ export function loadClaudeContextMcpServers(options: {
     options.includeHostClaudeContext && options.externalClaudeDir
       ? loadHostClaudeMcpServers(options.externalClaudeDir)
       : {};
-  const projectFile = readMcpServersFile(
-    path.join(options.workspaceDir, '.mcp.json'),
+  const projectFile = readWorkspaceMcpServersFile(
+    options.workspaceDir,
+    '.mcp.json',
   );
-  const projectSettings = readMcpServersFile(
-    path.join(options.workspaceDir, '.claude', 'settings.json'),
+  const projectSettings = readWorkspaceMcpServersFile(
+    options.workspaceDir,
+    path.join('.claude', 'settings.json'),
   );
-  const projectLocalSettings = readMcpServersFile(
-    path.join(options.workspaceDir, '.claude', 'settings.local.json'),
+  const projectLocalSettings = readWorkspaceMcpServersFile(
+    options.workspaceDir,
+    path.join('.claude', 'settings.local.json'),
   );
   return {
     ...hostServers,
