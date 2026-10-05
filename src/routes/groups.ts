@@ -1304,26 +1304,18 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     execution_mode !== undefined ||
     interaction_mode !== undefined
   ) {
-    // Spread `...existing` instead of rebuilding from an explicit field list.
-    // setRegisteredGroup is INSERT OR REPLACE (full-row overwrite), so every
-    // field omitted from the object gets silently nulled. The old explicit list
-    // dropped owner_im_id / sender_allowlist / conversation_source /
-    // conversation_nav_mode / binding_mode / feishu_chat_mode /
-    // feishu_group_message_type on EVERY rename — wiping the IM owner-gate's
-    // security anchor and corrupting feishu_thread workspaces. Only override
-    // what this PATCH actually changes.
-    const updated: RegisteredGroup = {
-      ...existing,
-      name: name || existing.name,
-      executionMode:
-        execution_mode !== undefined
-          ? (execution_mode as ExecutionMode)
-          : existing.executionMode,
-      activation_mode:
-        activation_mode !== undefined
-          ? activation_mode
-          : existing.activation_mode,
-    };
+    // setRegisteredGroup is a full-column UPSERT, so every field on the object
+    // it receives is written. The old explicit field list dropped owner_im_id /
+    // sender_allowlist / conversation_source / conversation_nav_mode /
+    // binding_mode / feishu_chat_mode / feishu_group_message_type on EVERY
+    // rename. Spreading the pre-await `existing` snapshot has the same shape
+    // of bug under concurrency: this handler reads the row before
+    // `await c.req.json()`, and execution/interaction changes yield again
+    // inside quiesceWorkspaceRunnersAroundCommit before commitUpdate runs.
+    // A name-only PATCH can therefore put back activation_mode / owner_im_id
+    // after a concurrent writer committed. Re-read inside the commit and
+    // overlay only the keys this request actually changes. Do not change
+    // setRegisteredGroup itself — other callers depend on the full upsert.
 
     const commitUpdate = () => {
       if (
@@ -1339,6 +1331,18 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
         activation_mode !== undefined ||
         execution_mode !== undefined
       ) {
+        const fresh = getRegisteredGroup(jid);
+        if (!fresh) {
+          throw new Error(`Group ${jid} not found during update commit`);
+        }
+        const updated: RegisteredGroup = {
+          ...fresh,
+          ...(name ? { name } : {}),
+          ...(execution_mode !== undefined
+            ? { executionMode: execution_mode as ExecutionMode }
+            : {}),
+          ...(activation_mode !== undefined ? { activation_mode } : {}),
+        };
         setRegisteredGroup(jid, updated);
         if (name) updateChatName(jid, name);
         deps.getRegisteredGroups()[jid] = updated;
