@@ -247,3 +247,257 @@ describe('Claude Code Workflow session projection', () => {
     });
   });
 });
+
+// Host-side parse caches are module-level and keyed per session. These tests
+// observe them only through attachSessionWorkflowRuns: a cached session keeps
+// answering from its stored state after an in-place same-size rewrite (same
+// inode, same size, same mtime for workflow files), while an evicted session
+// is reparsed and reports the rewritten values.
+describe('session workflow host caches', () => {
+  const CACHE_CAP = 64;
+  const FIXED_MTIME = new Date('2026-07-21T06:40:00.000Z');
+
+  function projectDir(group: string): string {
+    return path.join(
+      DATA_DIR,
+      'sessions',
+      group,
+      '.claude',
+      'projects',
+      `-${os.platform()}-fixture`,
+    );
+  }
+
+  function transcriptPath(group: string, sessionId: string): string {
+    return path.join(projectDir(group), `${sessionId}.jsonl`);
+  }
+
+  function workflowPath(group: string, sessionId: string): string {
+    return path.join(projectDir(group), sessionId, 'workflows', 'wf_cap.json');
+  }
+
+  function userTurn(label: string): string {
+    return JSON.stringify({
+      type: 'user',
+      message: { content: `<messages><message>${label}</message></messages>` },
+    });
+  }
+
+  function assistantLine(sdkUuid: string, inputTokens: number): string {
+    return JSON.stringify({
+      type: 'assistant',
+      uuid: sdkUuid,
+      message: {
+        id: `api-${sdkUuid}`,
+        model: 'glm-5.2',
+        usage: { input_tokens: inputTokens, output_tokens: 1 },
+      },
+    });
+  }
+
+  /** One turn; `inputTokens` keeps a fixed width so rewrites keep the size. */
+  function writeSession(
+    group: string,
+    sessionId: string,
+    inputTokens: number,
+    summary: string,
+  ): void {
+    const transcript = transcriptPath(group, sessionId);
+    fs.mkdirSync(path.dirname(transcript), { recursive: true });
+    fs.writeFileSync(
+      transcript,
+      `${userTurn(sessionId)}\n${assistantLine(`${sessionId}-final`, inputTokens)}\n`,
+    );
+    const workflow = workflowPath(group, sessionId);
+    fs.mkdirSync(path.dirname(workflow), { recursive: true });
+    fs.writeFileSync(
+      workflow,
+      JSON.stringify({
+        taskId: `task-${sessionId}`,
+        summary,
+        status: 'completed',
+      }),
+    );
+    fs.utimesSync(workflow, FIXED_MTIME, FIXED_MTIME);
+  }
+
+  function view(
+    group: string,
+    sessionId: string,
+    sdkUuid = `${sessionId}-final`,
+  ): { inputTokens: number; summary: string | undefined } {
+    const [message] = attachSessionWorkflowRuns(
+      [
+        {
+          id: `m-${sessionId}`,
+          timestamp: '2026-07-21T06:41:00.000Z',
+          session_id: sessionId,
+          sdk_message_uuid: sdkUuid,
+          is_from_me: true,
+          token_usage: JSON.stringify({ inputTokens: 0, outputTokens: 0 }),
+        },
+      ],
+      { groupFolder: group, agentId: null },
+    );
+    return {
+      inputTokens: JSON.parse(message.token_usage ?? '{}').inputTokens ?? 0,
+      summary: message.workflow_runs?.[0]?.summary,
+    };
+  }
+
+  function newGroup(label: string): string {
+    const group = `workflow-cache-${label}-${process.pid}-${Date.now()}`;
+    createdGroups.push(group);
+    return group;
+  }
+
+  test('bounds both caches to the most recently viewed sessions', () => {
+    const group = newGroup('lru');
+    const sessions = Array.from(
+      { length: CACHE_CAP + 16 },
+      (_, index) => `s${String(index).padStart(3, '0')}`,
+    );
+    for (const sessionId of sessions) {
+      writeSession(group, sessionId, 100, 'AAAA');
+      expect(view(group, sessionId)).toEqual({
+        inputTokens: 100,
+        summary: 'AAAA',
+      });
+    }
+    for (const sessionId of sessions) {
+      writeSession(group, sessionId, 200, 'BBBB');
+    }
+
+    // The newest CACHE_CAP sessions are still cached (stale answers prove it).
+    for (const sessionId of sessions.slice(-CACHE_CAP)) {
+      expect(view(group, sessionId)).toEqual({
+        inputTokens: 100,
+        summary: 'AAAA',
+      });
+    }
+    // The one just past the cap and the very first were evicted and reparse.
+    expect(view(group, sessions.at(-CACHE_CAP - 1)!)).toEqual({
+      inputTokens: 200,
+      summary: 'BBBB',
+    });
+    expect(view(group, sessions[0])).toEqual({
+      inputTokens: 200,
+      summary: 'BBBB',
+    });
+  });
+
+  test('a transcript replaced by rename and grown past the old offset is reparsed', () => {
+    const group = newGroup('rename');
+    const sessionId = 'renamed';
+    const transcript = transcriptPath(group, sessionId);
+    fs.mkdirSync(path.dirname(transcript), { recursive: true });
+    fs.writeFileSync(
+      transcript,
+      [
+        userTurn('old-1'),
+        assistantLine('old-1', 300),
+        userTurn('old-2'),
+        assistantLine('old-2', 301),
+        '',
+      ].join('\n'),
+    );
+    expect(view(group, sessionId, 'old-1').inputTokens).toBe(300);
+
+    // session-trim / history-image-prune: write tmp then rename (new inode),
+    // and the agent keeps appending so the file outgrows the old offset.
+    const tmp = `${transcript}.tmp`;
+    fs.writeFileSync(
+      tmp,
+      [
+        userTurn('new-1'),
+        assistantLine('new-1', 100),
+        userTurn('new-2'),
+        assistantLine('new-2', 101),
+        userTurn('new-3'),
+        assistantLine('new-3', 102),
+        userTurn('new-4'),
+        assistantLine('new-4', 103),
+        '',
+      ].join('\n'),
+    );
+    fs.renameSync(tmp, transcript);
+
+    expect(view(group, sessionId, 'new-1').inputTokens).toBe(100);
+    expect(view(group, sessionId, 'new-4').inputTokens).toBe(103);
+  });
+
+  test('an append-only transcript is read incrementally from the stored offset', () => {
+    const group = newGroup('append');
+    const sessionId = 'appending';
+    const transcript = transcriptPath(group, sessionId);
+    fs.mkdirSync(path.dirname(transcript), { recursive: true });
+    fs.writeFileSync(
+      transcript,
+      `${userTurn('turn-1')}\n${assistantLine('turn-1', 100)}\n`,
+    );
+    expect(view(group, sessionId, 'turn-1').inputTokens).toBe(100);
+
+    // Overwrite already-consumed bytes in place (same inode, same length).
+    // If the next pass re-read them it would report 900 for turn 1.
+    const original = fs.readFileSync(transcript, 'utf8');
+    const fd = fs.openSync(transcript, 'r+');
+    try {
+      fs.writeSync(
+        fd,
+        original.replace('"input_tokens":100', '"input_tokens":900'),
+        0,
+      );
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.appendFileSync(
+      transcript,
+      `${userTurn('turn-2')}\n${assistantLine('turn-2', 7)}\n`,
+    );
+
+    expect(view(group, sessionId, 'turn-1').inputTokens).toBe(100);
+    expect(view(group, sessionId, 'turn-2').inputTokens).toBe(7);
+  });
+
+  test('a session whose transcript and workflows are gone is dropped from the caches', () => {
+    const group = newGroup('missing');
+    const sessions = Array.from(
+      { length: CACHE_CAP + 1 },
+      (_, index) => `m${String(index).padStart(3, '0')}`,
+    );
+    const filled = sessions.slice(0, CACHE_CAP);
+    for (const sessionId of filled) {
+      writeSession(group, sessionId, 100, 'AAAA');
+      view(group, sessionId);
+    }
+
+    // The last filled session loses its files; viewing it must free its slot.
+    const gone = filled.at(-1)!;
+    fs.rmSync(transcriptPath(group, gone));
+    fs.rmSync(path.join(projectDir(group), gone), {
+      recursive: true,
+      force: true,
+    });
+    expect(view(group, gone)).toEqual({ inputTokens: 0, summary: undefined });
+
+    // A recreated transcript of the same size is parsed afresh, not answered
+    // from the forgotten state.
+    writeSession(group, gone, 200, 'BBBB');
+    expect(view(group, gone)).toEqual({ inputTokens: 200, summary: 'BBBB' });
+    fs.rmSync(transcriptPath(group, gone));
+    fs.rmSync(path.join(projectDir(group), gone), {
+      recursive: true,
+      force: true,
+    });
+    view(group, gone);
+
+    // With the freed slot, one more session fits without evicting the oldest.
+    writeSession(group, sessions.at(-1)!, 100, 'AAAA');
+    view(group, sessions.at(-1)!);
+    writeSession(group, filled[0], 200, 'BBBB');
+    expect(view(group, filled[0])).toEqual({
+      inputTokens: 100,
+      summary: 'AAAA',
+    });
+  });
+});
