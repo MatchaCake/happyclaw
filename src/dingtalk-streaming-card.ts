@@ -337,10 +337,10 @@ function buildDeliverBody(
 
 // ─── Markdown helpers ────────────────────────────────────────
 
-function ensureTableBlankLines(text: string): string {
+export function ensureTableBlankLines(text: string): string {
   const lines = text.split('\n');
   const result: string[] = [];
-  const tableDividerRegex = /^\s*\|?\s*:?-+:?\s*(\|?\s*:?-+:?\s*)+\|?\s*$/;
+  const tableDividerRegex = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
   const tableRowRegex = /^\s*\|?.*\|.*\|?\s*$/;
 
   for (let i = 0; i < lines.length; i++) {
