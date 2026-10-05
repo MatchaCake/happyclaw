@@ -157,6 +157,16 @@ export async function startPinnedHttpsProxy(
     socket.once('close', () => sockets.delete(socket));
   });
   server.on('connect', async (request, clientSocket, head) => {
+    // The http server detaches its own error handler from CONNECT sockets, so
+    // a peer reset (ECONNRESET) with no listener reaches uncaughtException.
+    // Attach durable handlers that tear down both ends of the tunnel instead.
+    let upstream: net.Socket | undefined;
+    const tearDown = () => {
+      clientSocket.destroy();
+      upstream?.destroy();
+    };
+    clientSocket.on('error', tearDown);
+
     const target = parseConnectAuthority(request.url);
     if (
       !target ||
@@ -182,7 +192,7 @@ export async function startPinnedHttpsProxy(
           'init_git_url hostname resolves to a private or link-local address',
         );
       }
-      const upstream = await connectFirstAvailable(
+      upstream = await connectFirstAvailable(
         addresses,
         target.port,
         (address, port) => {
@@ -192,6 +202,7 @@ export async function startPinnedHttpsProxy(
           return socket;
         },
       );
+      upstream.on('error', tearDown);
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
       if (head.length > 0) upstream.write(head);
       clientSocket.pipe(upstream);
