@@ -25,6 +25,7 @@ import {
 } from '../file-manager.js';
 import { checkStorageLimit, isBillingEnabled } from '../billing.js';
 import { MAX_FILE_SIZE_MB } from '../config.js';
+import { createUploadBodyLimit } from '../http-upload-policy.js';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -313,8 +314,12 @@ fileRoutes.get('/:jid/files', authMiddleware, (c) => {
   }
 });
 
+// The web client uploads one file per request, so cap the multipart body at
+// MAX_FILE_SIZE plus overhead before parseBody() buffers it in memory.
+const uploadBodyLimit = createUploadBodyLimit(MAX_FILE_SIZE);
+
 // POST /api/groups/:jid/files - 上传文件
-fileRoutes.post('/:jid/files', authMiddleware, async (c) => {
+fileRoutes.post('/:jid/files', authMiddleware, uploadBodyLimit, async (c) => {
   const jid = c.req.param('jid');
 
   const group = getRegisteredGroup(jid);

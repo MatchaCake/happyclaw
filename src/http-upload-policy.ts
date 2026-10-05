@@ -9,7 +9,10 @@ export const BRAND_ASSET_MAX_FILE_BYTES = 3 * 1024 * 1024;
 // stopped before Hono buffers an untrusted request body in memory.
 const MULTIPART_OVERHEAD_BYTES = 256 * 1024;
 
-function createUploadBodyLimit(maxFileBytes: number) {
+// Caps a multipart upload route at one file of `maxFileBytes` plus overhead.
+// Routes whose per-file limit is runtime config (e.g. MAX_FILE_SIZE for the
+// workspace file panel) build their limiter with this at module load.
+export function createUploadBodyLimit(maxFileBytes: number) {
   return bodyLimit({
     maxSize: maxFileBytes + MULTIPART_OVERHEAD_BYTES,
     onError: (c) => c.json({ error: 'Payload too large' }, 413),
