@@ -1836,14 +1836,53 @@ function prepareVolumeMounts(
   // Every selected Skill gets an explicit read-only mount. entrypoint rebuilds
   // /home/node/.claude/skills exclusively from this directory, so a real
   // directory persisted by an earlier container can never survive a restart.
+  // Workspace skills dir sits inside the RW /workspace/group bind and
+  // scanSkillDirectory accepts symlinks intentionally for host/user layers, so
+  // confine workspace skills to the group's real .claude/skills root (not
+  // realpath(skillsDir), which would follow a planted symlink).
+  let groupReal: string | null = null;
+  try {
+    groupReal = fs.realpathSync(path.join(GROUPS_DIR, group.folder));
+  } catch {
+    groupReal = null;
+  }
+  const workspaceSkillsRoot = groupReal
+    ? path.join(groupReal, '.claude', 'skills')
+    : null;
   for (const skill of claudeContextPlan.effectiveSkills.selected) {
     if (skill.source === 'plugin') continue;
     let hostPath = skill.path;
+    let realpathOk = true;
     try {
       hostPath = fs.realpathSync(hostPath);
     } catch {
       // The resolver already validated SKILL.md. Keep the original path so
       // Docker reports a deterministic mount error if it vanished afterward.
+      realpathOk = false;
+    }
+    if (skill.source === 'workspace') {
+      const rel = workspaceSkillsRoot
+        ? path.relative(workspaceSkillsRoot, hostPath)
+        : '';
+      if (
+        !realpathOk ||
+        !workspaceSkillsRoot ||
+        rel === '' ||
+        rel === '..' ||
+        rel.startsWith('..' + path.sep) ||
+        path.isAbsolute(rel)
+      ) {
+        logger.warn(
+          {
+            group: group.folder,
+            skillId: skill.id,
+            skillPath: skill.path,
+            resolvedPath: hostPath,
+          },
+          'Skipping workspace skill outside workspace skills root',
+        );
+        continue;
+      }
     }
     mounts.push({
       hostPath,
