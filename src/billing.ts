@@ -701,6 +701,8 @@ export function redeemCode(
     if (!getBillingPlan(rc.plan_id))
       return { success: false, message: '兑换码关联的套餐不存在' };
   }
+  if (rc.type === 'trial' && !getUserEffectivePlan(userId))
+    return { success: false, message: '无法激活试用（未找到可用套餐）' };
 
   // Optimistic lock: try to increment usage count atomically
   if (!tryIncrementRedeemCodeUsage(code, userId)) {
