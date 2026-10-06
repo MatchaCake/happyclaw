@@ -267,6 +267,7 @@ export function clearSessionClaudeOAuthFiles(
 ): void {
   const sessionClaudeJson = path.join(sessionDir, '.claude.json');
   let sourceExists = false;
+  let hasSyntaxError = false;
   let claudeJson: Record<string, unknown> = {};
   try {
     const sourcePath = claudeJsonTemplatePath ?? sessionClaudeJson;
@@ -278,26 +279,44 @@ export function clearSessionClaudeOAuthFiles(
       }
       claudeJson = parsed as Record<string, unknown>;
     }
-  } catch {
-    // Invalid session metadata must not survive as an opaque OAuth signal.
-    sourceExists = true;
-    claudeJson = {};
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      hasSyntaxError = true;
+    } else if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      sourceExists = false;
+      claudeJson = {};
+    } else {
+      // Invalid session metadata must not survive as an opaque OAuth signal.
+      sourceExists = true;
+      claudeJson = {};
+    }
   }
 
-  try {
-    const stat = fs.lstatSync(sessionClaudeJson);
-    if (stat.isSymbolicLink()) fs.unlinkSync(sessionClaudeJson);
-  } catch {
-    /* not found, ok */
-  }
-  const hadOauthAccount = 'oauthAccount' in claudeJson;
-  delete claudeJson.oauthAccount;
-  if (claudeJsonTemplatePath || sourceExists || hadOauthAccount) {
-    fs.writeFileSync(
-      sessionClaudeJson,
-      JSON.stringify(claudeJson, null, 2) + '\n',
-      { mode: 0o600 },
-    );
+  if (!hasSyntaxError) {
+    try {
+      const stat = fs.lstatSync(sessionClaudeJson);
+      if (stat.isSymbolicLink()) fs.unlinkSync(sessionClaudeJson);
+    } catch {
+      /* not found, ok */
+    }
+    const hadOauthAccount = 'oauthAccount' in claudeJson;
+    delete claudeJson.oauthAccount;
+    if (claudeJsonTemplatePath || sourceExists || hadOauthAccount) {
+      const tmpPath = `${sessionClaudeJson}.${process.pid}.${randomUUID()}.tmp`;
+      try {
+        fs.writeFileSync(tmpPath, JSON.stringify(claudeJson, null, 2) + '\n', {
+          flag: 'wx',
+          mode: 0o600,
+        });
+        fs.renameSync(tmpPath, sessionClaudeJson);
+      } finally {
+        try {
+          fs.unlinkSync(tmpPath);
+        } catch {
+          /* already renamed or never created */
+        }
+      }
+    }
   }
 
   const credentialsPath = path.join(sessionDir, '.credentials.json');
