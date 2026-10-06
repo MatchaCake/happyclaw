@@ -294,6 +294,8 @@ export interface StreamEvent {
   queryRunId?: string;
   /** Correlates all stream events for a single user turn. */
   turnId?: string;
+  /** Immutable input identity for usage-to-answer correlation; IPC uses deliveryId. */
+  inputTurnId?: string;
   /** SDK session identifier if known. */
   sessionId?: string;
   /** SDK message uuid if known. */
