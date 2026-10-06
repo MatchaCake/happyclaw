@@ -524,7 +524,6 @@ try {
   clearTimeout(timer);
   abortController?.abort();
   querySession?.close();
-  globalThis.fetch = originalFetch;
   process.chdir(originalCwd);
   if (originalLogLevel === undefined) delete process.env.LOG_LEVEL;
   else process.env.LOG_LEVEL = originalLogLevel;
@@ -538,6 +537,9 @@ try {
     ),
   );
   await rm(scratch, { recursive: true, force: true });
+  // Keep the fail-closed fetch boundary throughout cancellation/server teardown
+  // so a late request cannot reach the official upstream during cleanup.
+  globalThis.fetch = originalFetch;
 }
 
 const passed = phase === 'complete' && Object.values(checks).every(Boolean);
