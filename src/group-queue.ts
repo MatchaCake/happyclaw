@@ -203,6 +203,8 @@ interface GroupState {
   /** IPC deliveries written to this runner but not yet acknowledged by a
    * healthy agent query result. Keyed by deliveryId for out-of-order acks. */
   pendingIpcDeliveries: Map<string, IpcDeliveryReceipt>;
+  /** Immutable query identity stamped when each durable input was published. */
+  pendingIpcQueryIds?: Map<string, string>;
   /** Receipts observed from stdout but blocked behind an earlier unacknowledged
    * delivery for the same chat. They remain replayable until the contiguous
    * prefix is durably committed. */
@@ -977,7 +979,7 @@ export class GroupQueue {
   }
 
   /**
-   * Write a single _drain sentinel to the actual active main-agent runner that
+   * Write _drain to the exact conversation runner, or the main runner that
    * owns this serialization key. This must target the runner state rather than
    * the caller's group state because sibling JIDs can share one process.
    */
@@ -985,14 +987,21 @@ export class GroupQueue {
     groupJid: string,
     reason: string,
   ): boolean {
-    const activeRunner = this.findActiveRunnerFor(groupJid);
+    const directState = this.groups.get(groupJid);
+    const exactConversationRunner =
+      directState?.active &&
+      directState.agentId !== null &&
+      groupJid.endsWith(`#agent:${directState.agentId}`);
+    const activeRunner = exactConversationRunner
+      ? groupJid
+      : this.findActiveRunnerFor(groupJid);
     if (!activeRunner) return false;
 
     const runnerState = this.getGroup(activeRunner);
     if (
       !runnerState.active ||
       !runnerState.groupFolder ||
-      runnerState.agentId !== null
+      (runnerState.agentId !== null && !exactConversationRunner)
     ) {
       return false;
     }
@@ -1160,6 +1169,7 @@ export class GroupQueue {
         }
         commit([first]);
         state.pendingIpcDeliveries.delete(first.deliveryId);
+        state.pendingIpcQueryIds?.delete(first.deliveryId);
         state.acknowledgedIpcDeliveryIds.delete(first.deliveryId);
         committed.push(first);
       }
@@ -1215,6 +1225,13 @@ export class GroupQueue {
         ? ownState
         : this.resolveActiveState(groupJid);
     return state?.active && state.queryInFlight ? state.queryId : null;
+  }
+
+  getPublishedIpcQueryId(groupJid: string, deliveryId: string): string | null {
+    const state = this.groups.get(groupJid);
+    if (!state?.active || !state.pendingIpcDeliveries.has(deliveryId))
+      return null;
+    return state.pendingIpcQueryIds?.get(deliveryId) ?? null;
   }
 
   /** True only when the immutable DB batch owned by the active query includes
@@ -1901,6 +1918,8 @@ export class GroupQueue {
       if (receipt) {
         state.pendingIpcDeliveries ??= new Map();
         state.pendingIpcDeliveries.set(receipt.deliveryId, receipt);
+        state.pendingIpcQueryIds ??= new Map();
+        state.pendingIpcQueryIds.set(receipt.deliveryId, queryRunId);
         // Claim eligibility is observed synchronously in the same stack as
         // rename+registration. A blocked claim remains in both the file/ledger
         // until a later durable cursor advance makes it provably contiguous.
@@ -2092,6 +2111,7 @@ export class GroupQueue {
       }
       this.onUnacknowledgedIpcDeliveriesFn(groupJid, receipts);
       state.pendingIpcDeliveries.clear();
+      state.pendingIpcQueryIds?.clear();
       state.acknowledgedIpcDeliveryIds.clear();
     } catch (err) {
       logger.error(
@@ -2167,6 +2187,7 @@ export class GroupQueue {
     // the exit path falls back to replay rather than silently dropping work.
     this.onAbandonedIpcDeliveriesFn(groupJid, receipts);
     state.pendingIpcDeliveries.clear();
+    state.pendingIpcQueryIds?.clear();
     state.acknowledgedIpcDeliveryIds.clear();
   }
 
