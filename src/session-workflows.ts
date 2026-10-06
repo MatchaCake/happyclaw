@@ -23,6 +23,25 @@ const cache = new Map<
   { signature: string; runs: WorkflowRunSnapshot[] }
 >();
 
+/**
+ * Both caches are keyed by `<folder>:<agent>:<sessionId>`. Session ids are
+ * unbounded over the host lifetime (every /clear, task run and agent gets a
+ * new one) and the message-list poll touches every session it renders, so
+ * the caches are LRU-bounded and forget a session whose files are gone.
+ */
+const MAX_CACHED_SESSIONS = 64;
+
+/** Insert or refresh `key` as most recently used, evicting the oldest. */
+function touchBounded<V>(map: Map<string, V>, key: string, value: V): void {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > MAX_CACHED_SESSIONS) {
+    const oldest = map.keys().next();
+    if (oldest.done) break;
+    map.delete(oldest.value);
+  }
+}
+
 interface SessionAssistantUsage {
   inputTokens: number;
   outputTokens: number;
@@ -45,6 +64,9 @@ interface SessionAssistantUsage {
 /** Incremental transcript parse state; see loadSessionAssistantUsage. */
 interface TranscriptParseState {
   path: string;
+  /** Identity of the file the offsets refer to; tmp+rename yields a new one. */
+  dev: number;
+  ino: number;
   /** Bytes already parsed into complete lines. */
   consumed: number;
   /** Raw bytes of a trailing partial line (mid-write or split UTF-8). */
@@ -245,9 +267,10 @@ function usageTotal(usage: SessionAssistantUsage): number {
  * the whole-file signature cache missed on every request of an active session
  * (measured 2.4MB reparsed per message-list request, on a 2s poll). The parse
  * state is therefore kept per session and only bytes appended since the last
- * pass are read; a shrunk file (rotation) resets the state. A partial trailing
- * line is buffered as raw bytes so mid-write reads and multi-byte UTF-8 at the
- * chunk boundary stay intact.
+ * pass are read; a shrunk file (rotation) or a replaced file (session-trim and
+ * history-image-prune rewrite via tmp+rename, so dev/ino change) resets the
+ * state. A partial trailing line is buffered as raw bytes so mid-write reads
+ * and multi-byte UTF-8 at the chunk boundary stay intact.
  */
 function loadSessionAssistantUsage(input: {
   groupFolder: string;
@@ -257,18 +280,28 @@ function loadSessionAssistantUsage(input: {
   const transcript = sessionProjectRoots(input.groupFolder, input.agentId)
     .map((root) => path.join(root, `${input.sessionId}.jsonl`))
     .find((candidate) => fs.existsSync(candidate));
-  if (!transcript) return new Map();
-  const stat = fs.statSync(transcript);
-  if (!stat.isFile() || stat.size > 64 * 1024 * 1024) return new Map();
   const cacheKey = `${input.groupFolder}:${input.agentId ?? 'main'}:${input.sessionId}`;
+  if (!transcript) {
+    assistantUsageCache.delete(cacheKey);
+    return new Map();
+  }
+  const stat = fs.statSync(transcript);
+  if (!stat.isFile() || stat.size > 64 * 1024 * 1024) {
+    assistantUsageCache.delete(cacheKey);
+    return new Map();
+  }
   let state = assistantUsageCache.get(cacheKey);
   if (
     !state ||
     state.path !== transcript ||
+    state.dev !== stat.dev ||
+    state.ino !== stat.ino ||
     stat.size < state.consumed + state.leftover.length
   ) {
     state = {
       path: transcript,
+      dev: stat.dev,
+      ino: stat.ino,
       consumed: 0,
       leftover: Buffer.alloc(0),
       turn: 0,
@@ -276,8 +309,8 @@ function loadSessionAssistantUsage(input: {
       entriesByTurn: new Map(),
       bySdkUuid: new Map(),
     };
-    assistantUsageCache.set(cacheKey, state);
   }
+  touchBounded(assistantUsageCache, cacheKey, state);
   const alreadyExamined = state.consumed + state.leftover.length;
   if (stat.size === alreadyExamined) return state.bySdkUuid;
 
@@ -501,8 +534,15 @@ export function loadSessionWorkflowRuns(input: {
     })
     .join('|');
   const cacheKey = `${input.groupFolder}:${input.agentId ?? 'main'}:${input.sessionId}`;
+  if (files.length === 0) {
+    cache.delete(cacheKey);
+    return [];
+  }
   const cached = cache.get(cacheKey);
-  if (cached?.signature === signature) return cached.runs;
+  if (cached?.signature === signature) {
+    touchBounded(cache, cacheKey, cached);
+    return cached.runs;
+  }
 
   const runs = files
     .map((file) => {
@@ -522,7 +562,7 @@ export function loadSessionWorkflowRuns(input: {
         (a.startTime ?? a.completedAt ?? 0) -
         (b.startTime ?? b.completedAt ?? 0),
     );
-  cache.set(cacheKey, { signature, runs });
+  touchBounded(cache, cacheKey, { signature, runs });
   return runs;
 }
 
