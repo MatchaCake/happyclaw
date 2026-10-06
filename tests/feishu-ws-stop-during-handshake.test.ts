@@ -1,4 +1,12 @@
-import { afterAll, beforeAll, expect, test, vi } from 'vitest';
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  expect,
+  test,
+  vi,
+} from 'vitest';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -12,7 +20,14 @@ fs.mkdirSync(path.join(tmpDir, 'groups'), { recursive: true });
 // Fake Feishu long-connection provider: the endpoint-discovery POST answers
 // after PULL_DELAY_MS (a slow/flaky network), then hands out a local WS URL.
 const PULL_DELAY_MS = 400;
-const provider = vi.hoisted(() => ({ domain: '', live: 0, opened: 0 }));
+const provider = vi.hoisted(() => ({
+  domain: '',
+  live: 0,
+  opened: 0,
+  pulls: 0,
+  handshakes: 0,
+  handshakeDelay: 0,
+}));
 
 vi.mock('../src/config.js', async (importOriginal) => ({
   ...((await importOriginal()) as Record<string, unknown>),
@@ -63,7 +78,13 @@ let server: http.Server;
 
 beforeAll(async () => {
   db.initDatabase();
-  wss = new WebSocketServer({ port: 0 });
+  wss = new WebSocketServer({
+    port: 0,
+    verifyClient: (_info, done) => {
+      provider.handshakes += 1;
+      setTimeout(() => done(true), provider.handshakeDelay);
+    },
+  });
   await new Promise((r) => wss.on('listening', r));
   wss.on('connection', (s) => {
     provider.live += 1;
@@ -72,6 +93,7 @@ beforeAll(async () => {
   });
   const wsPort = (wss.address() as { port: number }).port;
   server = http.createServer((_req, res) => {
+    provider.pulls += 1;
     setTimeout(() => {
       res.setHeader('content-type', 'application/json');
       res.end(
@@ -103,8 +125,35 @@ afterAll(async () => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-test('stop() during the WS handshake leaves no live Feishu long connection', async () => {
-  const connection = createFeishuConnection({
+let connection: ReturnType<typeof createFeishuConnection> | undefined;
+beforeEach(() => {
+  provider.opened = 0;
+  provider.pulls = 0;
+  provider.handshakes = 0;
+  provider.handshakeDelay = 0;
+});
+afterEach(async () => {
+  await connection?.stop();
+  await vi.waitFor(() => expect(provider.live).toBe(0));
+});
+
+async function startConnection() {
+  connection = createFeishuConnection({
+    appId: 'app_handshake',
+    appSecret: 'secret',
+    channelAccountId: `acct-${Date.now()}`,
+  });
+  expect(
+    await connection.connect({
+      onReady: vi.fn(),
+      ignoreMessagesBefore: Date.now(),
+    }),
+  ).toBe(true);
+  return connection;
+}
+
+test('stop() during endpoint discovery leaves no live Feishu long connection', async () => {
+  connection = createFeishuConnection({
     appId: 'app_handshake',
     appSecret: 'secret',
     channelAccountId: `acct-${Date.now()}`,
@@ -127,4 +176,32 @@ test('stop() during the WS handshake leaves no live Feishu long connection', asy
   // long connections are cluster-mode: each event goes to ONE random client,
   // so an orphan steals events from the live replacement connector.
   expect(provider.live).toBe(0);
+}, 15_000);
+
+test('stop() during the SDK automatic reconnect endpoint pull fences the retired client', async () => {
+  const connected = await startConnection();
+  await vi.waitFor(() => expect(provider.live).toBe(1), { timeout: 3000 });
+  for (const socket of wss.clients) socket.close();
+  await vi.waitFor(() => expect(provider.pulls).toBe(2), { timeout: 3000 });
+  await connected.stop();
+  await new Promise((resolve) => setTimeout(resolve, PULL_DELAY_MS + 600));
+  expect(provider.live).toBe(0);
+  // The stale endpoint response must not create another provider socket.
+  expect(provider.opened).toBe(1);
+}, 15_000);
+
+test('stop() during an actual socket handshake closes its late socket before event dispatch', async () => {
+  provider.handshakeDelay = 400;
+  const connected = await startConnection();
+  await vi.waitFor(() => expect(provider.handshakes).toBe(1), {
+    timeout: 3000,
+  });
+  expect(provider.live).toBe(0);
+  await connected.stop();
+  await new Promise((resolve) =>
+    setTimeout(resolve, provider.handshakeDelay + 600),
+  );
+  expect(provider.opened).toBe(1);
+  expect(provider.live).toBe(0);
+  expect(connected.isConnected()).toBe(false);
 }, 15_000);

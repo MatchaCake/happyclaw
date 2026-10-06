@@ -1,3 +1,4 @@
+import { mp4Fixture } from './helpers/mp4-fixture.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -72,6 +73,12 @@ function touch(name: string): string {
   return filePath;
 }
 
+function videoFile(width: number, height: number, rotation = 0): string {
+  const filePath = path.join(root, 'clip.mp4');
+  fs.writeFileSync(filePath, mp4Fixture(width, height, rotation));
+  return filePath;
+}
+
 describe('Telegram sendFile media routing (live connection)', () => {
   let connection: ReturnType<typeof createTelegramConnection> | null = null;
 
@@ -97,13 +104,59 @@ describe('Telegram sendFile media routing (live connection)', () => {
     return connection;
   }
 
-  test('sendFile(clip.mp4) uses sendDocument to keep the aspect ratio', async () => {
+  test.each([
+    [1920, 1080, 0, 1920, 1080],
+    [1080, 1920, 0, 1080, 1920],
+    [1920, 1080, 90, 1080, 1920],
+    [1920, 1080, 270, 1080, 1920],
+  ])(
+    'sends MP4 %ix%i rotated %i as native video in the requested topic',
+    async (width, height, rotation, outputWidth, outputHeight) => {
+      const conn = await connect();
+      await conn.sendFile(
+        '424242#thread:17',
+        videoFile(width, height, rotation),
+        'clip.mp4',
+      );
+      expect(api.sendVideo).toHaveBeenCalledOnce();
+      expect(api.sendVideo).toHaveBeenCalledWith(424242, expect.anything(), {
+        width: outputWidth,
+        height: outputHeight,
+        message_thread_id: 17,
+      });
+      expect(api.sendDocument).not.toHaveBeenCalled();
+    },
+  );
+
+  test('chooses document before sending when MP4 metadata is unavailable', async () => {
     const conn = await connect();
-    await conn.sendFile('424242', touch('clip.mp4'), 'clip.mp4');
+    await conn.sendFile('424242#thread:17', touch('clip.mp4'), 'clip.mp4');
     expect(api.sendDocument).toHaveBeenCalledOnce();
-    expect(api.sendDocument.mock.calls[0][0]).toBe(424242);
+    expect(api.sendDocument).toHaveBeenCalledWith(424242, expect.anything(), {
+      message_thread_id: 17,
+    });
     expect(api.sendVideo).not.toHaveBeenCalled();
-    expect(api.sendAudio).not.toHaveBeenCalled();
+  });
+
+  test('can explicitly send the original MP4 as a document', async () => {
+    const conn = await connect();
+    await conn.sendFile('424242', videoFile(1920, 1080), 'clip.mp4', {
+      asDocument: true,
+    });
+    expect(api.sendDocument).toHaveBeenCalledOnce();
+    expect(api.sendVideo).not.toHaveBeenCalled();
+  });
+
+  test('never falls back to a duplicate document when the video send fails', async () => {
+    const conn = await connect();
+    api.sendVideo.mockRejectedValueOnce(
+      new Error('connection reset after acceptance'),
+    );
+    await expect(
+      conn.sendFile('424242', videoFile(1920, 1080), 'clip.mp4'),
+    ).rejects.toThrow();
+    expect(api.sendVideo).toHaveBeenCalledOnce();
+    expect(api.sendDocument).not.toHaveBeenCalled();
   });
 
   test('sendFile(voice.ogg) uses sendVoice, not sendAudio', async () => {

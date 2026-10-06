@@ -53,6 +53,37 @@ describe('ensureTableBlankLines table divider regex', () => {
     expect(result.out).toBe(ATTACK_TEXT);
   }, 30_000);
 
+  test('long whitespace and dash attacks remain bounded in a child process', () => {
+    const script = `
+      const { ensureTableBlankLines } = await import(${JSON.stringify(moduleUrl)});
+      const lines = [
+        '---' + ' '.repeat(128000) + 'x',
+        ' '.repeat(128000) + 'x',
+        '-'.repeat(128000) + ' end',
+        '|' + ' '.repeat(128000) + 'x',
+      ];
+      const start = process.hrtime.bigint();
+      const unchanged = lines.every(line => {
+        const text = 'intro\\na | b\\n' + line;
+        return ensureTableBlankLines(text) === text;
+      });
+      const ms = Number(process.hrtime.bigint() - start) / 1e6;
+      process.stdout.write(JSON.stringify({ ms, unchanged }) + '\\n', () =>
+        process.kill(process.pid, 'SIGKILL'),
+      );
+    `;
+    const child = spawnSync(
+      process.execPath,
+      ['--import', 'tsx', '--input-type=module', '-e', script],
+      { cwd: repoRoot, encoding: 'utf8', timeout: 15_000 },
+    );
+    expect(child.error?.message ?? null).toBeNull();
+    expect(child.stderr).toBe('');
+    const result = JSON.parse(child.stdout.trim().split('\n').pop()!);
+    expect(result.unchanged).toBe(true);
+    expect(result.ms).toBeLessThan(200);
+  }, 30_000);
+
   const header = 'para\nh1 | h2';
   const inserted = (divider: string) =>
     ensureTableBlankLines(`${header}\n${divider}`) ===
@@ -65,7 +96,7 @@ describe('ensureTableBlankLines table divider regex', () => {
     },
   );
 
-  test.each(['a|b', '|-a-|', '---- end'])(
+  test.each(['a|b', '|-a-|', '---- end', '--- ---', '---:-', '|||', ''])(
     'non-divider %j is not treated as a divider',
     (line) => {
       expect(inserted(line)).toBe(false);
