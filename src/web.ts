@@ -1517,7 +1517,14 @@ function setupWebSocket(server: any): WebSocketServer {
   });
 
   server.on('upgrade', (request: any, socket: any, head: any) => {
-    const { pathname } = new URL(request.url, `http://${request.headers.host}`);
+    let pathname: string;
+    try {
+      ({ pathname } = new URL(request.url, `http://${request.headers.host}`));
+    } catch {
+      socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
 
     if (pathname !== '/ws') {
       socket.destroy();
