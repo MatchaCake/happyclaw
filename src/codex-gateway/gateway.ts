@@ -7,13 +7,16 @@
 
 import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
+import type { ContentfulStatusCode } from 'hono/utils/http-status';
 
 import { logger } from '../logger.js';
 import { getProviderById } from '../runtime-config.js';
 import type { ReadableStreamReadResult } from 'node:stream/web';
 import {
   anthropicToResponses,
+  normalizeCodexEffort,
   resolveCodexModel,
+  resolveCodexRequestEffort,
   type AnthropicRequestSubset,
 } from './convert-request.js';
 import { clampCodexEffortWithCatalog } from './model-catalog.js';
@@ -32,6 +35,7 @@ import {
 import { CodexProviderRateLimiter } from './provider-rate-limit.js';
 import { CodexMessagesRequestSchema } from './request-validation.js';
 import { CODEX_BACKEND_RESPONSES_URL } from './types.js';
+import { codexRequestContext } from './request-context.js';
 
 export const codexGatewayApp = new Hono<{
   Variables: { codexGatewayToken: string };
@@ -87,20 +91,63 @@ function extractGatewayToken(headers: Headers): string | null {
   return null;
 }
 
-interface UpstreamSseLine {
-  event?: string;
-  data?: string;
+function upstreamHttpErrorType(status: number): string {
+  switch (status) {
+    case 400:
+    case 413:
+    case 422:
+      return 'invalid_request_error';
+    case 401:
+      return 'authentication_error';
+    case 403:
+      return 'permission_error';
+    case 404:
+      return 'not_found_error';
+    case 429:
+      return 'rate_limit_error';
+    case 529:
+      return 'overloaded_error';
+    default:
+      return 'api_error';
+  }
 }
 
-/** 逐行解析上游 SSE 文本为 (event, data) 对；data 以 JSON.parse 消费。 */
+function upstreamRetryHeaders(headers: Headers): Record<string, string> {
+  const retryAfter = headers.get('retry-after')?.trim();
+  if (
+    retryAfter &&
+    retryAfter.length <= 128 &&
+    (/^\d+(?:\.\d+)?$/.test(retryAfter) ||
+      (/GMT$/.test(retryAfter) && Number.isFinite(Date.parse(retryAfter))))
+  ) {
+    return { 'Retry-After': retryAfter };
+  }
+  return {};
+}
+
+const UPSTREAM_EVENT_LIMIT = 8 * 1024 * 1024;
+const TERMINAL_EVENT_TYPES = new Set([
+  'response.completed',
+  'response.done',
+  'response.incomplete',
+  'response.failed',
+  'error',
+]);
+
+/** Parse bounded SSE frames across arbitrary UTF-8 chunks and line endings. */
 async function* iterateUpstreamEvents(
   body: ReadableStream<Uint8Array>,
   signal: AbortSignal,
 ): AsyncGenerator<Record<string, unknown>> {
   const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let current: UpstreamSseLine = {};
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  let lineParts: string[] = [];
+  let lineBytes = 0;
+  let skipLf = false;
+  let eventName = '';
+  let dataParts: string[] = [];
+  let eventBytes = 0;
+  let terminalSeen = false;
   let reachedEof = false;
   const onAbort = () => {
     void reader.cancel(signal.reason).catch(() => {});
@@ -109,16 +156,97 @@ async function* iterateUpstreamEvents(
   if (signal.aborted) onAbort();
 
   const flush = function* (): Generator<Record<string, unknown>> {
-    if (current.data === undefined) return;
-    try {
-      yield JSON.parse(current.data) as Record<string, unknown>;
-    } catch (err) {
-      logger.warn(
-        { err },
-        'Codex gateway: failed to parse upstream SSE data line',
-      );
+    const data = dataParts.join('\n');
+    const name = eventName;
+    const hasData = dataParts.length > 0;
+    // Even a comment-only/event-only frame resets its event name.
+    eventName = '';
+    dataParts = [];
+    eventBytes = 0;
+    // Empty data frames are valid keepalives, not malformed JSON events.
+    if (!hasData || !data.trim()) return;
+    if (data.trim() === '[DONE]') {
+      // The sentinel ends framing, but never replaces a Responses terminal.
+      terminalSeen = true;
+      return;
     }
-    current = {};
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      // SyntaxError messages can quote private upstream data. Keep the error
+      // generic and fail the request instead of silently dropping output.
+      throw new Error('Upstream Codex SSE contains invalid JSON');
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('Upstream Codex SSE event is not an object');
+    }
+    const event = parsed as Record<string, unknown>;
+    if (event.type === undefined && name) event.type = name;
+    if (event.type !== undefined && typeof event.type !== 'string') {
+      throw new Error('Upstream Codex SSE event has an invalid type');
+    }
+    terminalSeen = TERMINAL_EVENT_TYPES.has(String(event.type));
+    yield event;
+  };
+
+  const consumeLine = function* (
+    line: string,
+  ): Generator<Record<string, unknown>> {
+    if (line === '') {
+      yield* flush();
+      return;
+    }
+    const separator = line.indexOf(':');
+    const field = separator === -1 ? line : line.slice(0, separator);
+    let value = separator === -1 ? '' : line.slice(separator + 1);
+    if (value.startsWith(' ')) value = value.slice(1);
+    if (field === 'event') {
+      eventName = value;
+    } else if (field === 'data') {
+      eventBytes += Buffer.byteLength(value) + (dataParts.length ? 1 : 0);
+      if (eventBytes > UPSTREAM_EVENT_LIMIT) {
+        throw new Error('Upstream Codex SSE event exceeds size limit');
+      }
+      dataParts.push(value);
+    }
+  };
+
+  const consumeText = function* (
+    text: string,
+  ): Generator<Record<string, unknown>> {
+    let start = 0;
+    const endings = /[\r\n]/g;
+    for (let match; (match = endings.exec(text)); ) {
+      if (skipLf && match.index === start && match[0] === '\n') {
+        skipLf = false;
+        start = match.index + 1;
+        continue;
+      }
+      skipLf = false;
+      const part = text.slice(start, match.index);
+      lineBytes += Buffer.byteLength(part);
+      if (lineBytes > UPSTREAM_EVENT_LIMIT) {
+        throw new Error('Upstream Codex SSE line exceeds size limit');
+      }
+      lineParts.push(part);
+      const line = lineParts.join('');
+      lineParts = [];
+      lineBytes = 0;
+      start = match.index + 1;
+      skipLf = match[0] === '\r';
+      yield* consumeLine(line);
+      if (terminalSeen) return;
+    }
+    if (start < text.length) {
+      skipLf = false;
+      const part = text.slice(start);
+      lineBytes += Buffer.byteLength(part);
+      if (lineBytes > UPSTREAM_EVENT_LIMIT) {
+        throw new Error('Upstream Codex SSE line exceeds size limit');
+      }
+      lineParts.push(part);
+    }
   };
 
   try {
@@ -143,41 +271,15 @@ async function* iterateUpstreamEvents(
         reachedEof = true;
         break;
       }
-      buffer += decoder.decode(value, { stream: true });
-      if (buffer.length > 8 * 1024 * 1024) {
-        throw new Error('Upstream Codex SSE event exceeds size limit');
-      }
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-      for (const line of lines) {
-        const trimmed = line.replace(/\r$/, '');
-        if (trimmed === '') {
-          yield* flush();
-          continue;
-        }
-        if (trimmed.startsWith('event:')) {
-          current.event = trimmed.slice('event:'.length).trim();
-        } else if (trimmed.startsWith('data:')) {
-          const chunk = trimmed.slice('data:'.length).trim();
-          current.data =
-            current.data === undefined ? chunk : `${current.data}\n${chunk}`;
-          if (current.data.length > 8 * 1024 * 1024) {
-            throw new Error('Upstream Codex SSE event exceeds size limit');
-          }
-        }
-      }
+      yield* consumeText(decoder.decode(value, { stream: true }));
+      // A semantic terminal is authoritative even if the peer keeps the HTTP
+      // body open. Do not wait for EOF or append a timeout after message_stop.
+      if (terminalSeen) return;
     }
-    // SSE 规范：EOF 时未被空行终止的最后一行也要分发。上游可能不发结尾
+    // 上游兼容性：EOF 时保留未被空行终止的最后一行。上游可能不发结尾
     // 空行——丢掉它会把成功的 response.completed 误判成断流失败。
-    const trailing = buffer.replace(/\r$/, '');
-    if (trailing.startsWith('data:')) {
-      const chunk = trailing.slice('data:'.length).trim();
-      current.data =
-        current.data === undefined ? chunk : `${current.data}\n${chunk}`;
-    } else if (trailing.startsWith('event:')) {
-      current.event = trailing.slice('event:'.length).trim();
-    }
-    buffer = '';
+    yield* consumeText(decoder.decode());
+    if (lineParts.length) yield* consumeLine(lineParts.join(''));
     yield* flush();
   } finally {
     signal.removeEventListener('abort', onAbort);
@@ -303,10 +405,28 @@ codexGatewayApp.post(
       reasoningEffort: clampCodexEffortWithCatalog(
         getResolvedCodexCatalog().models,
         requestModel,
-        configuredEffort,
+        normalizeCodexEffort(
+          resolveCodexRequestEffort(anthropicRequest, configuredEffort),
+        ),
       ),
       requestTools: !!anthropicRequest.tools?.length,
     });
+    const requestContext = codexRequestContext(
+      c.req.raw.headers,
+      validation.data,
+      {
+        providerId: access.providerId,
+        accountId: access.accountId,
+        model: responsesRequest.model,
+        serviceTier: responsesRequest.service_tier,
+      },
+    );
+    const upstreamRequest = {
+      ...responsesRequest,
+      ...(requestContext.promptCacheKey
+        ? { prompt_cache_key: requestContext.promptCacheKey }
+        : {}),
+    };
 
     const controller = new AbortController();
     const FETCH_TIMEOUT_MS = 30_000;
@@ -332,9 +452,9 @@ codexGatewayApp.post(
           ...(access.accountId
             ? { 'chatgpt-account-id': access.accountId }
             : {}),
-          originator: 'codex_cli_rs',
+          ...requestContext.headers,
         },
-        body: JSON.stringify(responsesRequest),
+        body: JSON.stringify(upstreamRequest),
         signal: controller.signal,
       });
       clearTimeout(fetchTimeout);
@@ -368,17 +488,22 @@ codexGatewayApp.post(
         {
           type: 'error',
           error: {
-            type: 'api_error',
+            type: upstreamHttpErrorType(upstream.status),
             message: `Upstream Codex backend returned ${upstream.status}`,
           },
         },
         upstream.status >= 400 && upstream.status < 600
-          ? (upstream.status as any)
+          ? (upstream.status as ContentfulStatusCode)
           : 502,
+        upstreamRetryHeaders(upstream.headers),
       );
     }
 
-    const converter = new ResponsesToAnthropicConverter(responsesRequest.model);
+    const conversionOptions = { tools: anthropicRequest.tools };
+    const converter = new ResponsesToAnthropicConverter(
+      responsesRequest.model,
+      conversionOptions,
+    );
 
     if (!wantsStream) {
       const events: Record<string, unknown>[] = [];
@@ -406,6 +531,7 @@ codexGatewayApp.post(
         const aggregated = aggregateResponsesStream(
           events,
           responsesRequest.model,
+          conversionOptions,
         );
         logGatewaySuccess(responsesRequest.model, aggregated.usage);
         return c.json({
@@ -415,7 +541,7 @@ codexGatewayApp.post(
           model: aggregated.model,
           content: aggregated.content,
           stop_reason: aggregated.stopReason,
-          stop_sequence: null,
+          stop_sequence: aggregated.stopSequence ?? null,
           usage: aggregated.usage,
         });
       } catch (err) {
@@ -430,7 +556,8 @@ codexGatewayApp.post(
               type: 'error',
               error: { type: err.errorType, message: err.message },
             },
-            err.status as 400 | 429 | 502,
+            err.status as ContentfulStatusCode,
+            upstreamRetryHeaders(upstream.headers),
           );
         }
         const timedOut = err instanceof Error && err.name === 'AbortError';
@@ -498,6 +625,8 @@ codexGatewayApp.post(
             controllerStream.close();
           }
         } catch (err) {
+          controller.abort();
+          await upstreamEvents.return(undefined).catch(() => {});
           if (!streamCancelled) {
             if (!clientCancelled) {
               logger.warn({ err }, 'Codex gateway: stream translation failed');

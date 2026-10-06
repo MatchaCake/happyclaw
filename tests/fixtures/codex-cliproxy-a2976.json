@@ -1,0 +1,3219 @@
+{
+  "repository": "https://github.com/router-for-me/CLIProxyAPI",
+  "commit": "a2976eb8a303f11b4ea5177bce9f9ff752634dfc",
+  "fixtures": [
+    {
+      "name": "text",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ]
+      },
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"]
+      }
+    },
+    {
+      "name": "top-level-system",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ],
+        "system": [
+          {
+            "type": "text",
+            "text": "x-anthropic-billing-header: fixture"
+          },
+          {
+            "type": "text",
+            "text": "Rules"
+          },
+          {
+            "type": "text",
+            "text": "More rules"
+          }
+        ]
+      },
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "developer",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "Rules"
+              },
+              {
+                "type": "input_text",
+                "text": "More rules"
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"]
+      }
+    },
+    {
+      "name": "system-reminders",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "first"
+          },
+          {
+            "role": "system",
+            "content": "latest repository"
+          },
+          {
+            "role": "assistant",
+            "content": "ok"
+          }
+        ],
+        "system": "Rules"
+      },
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "developer",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "Rules"
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "first"
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "\u003csystem-reminder\u003e\nlatest repository\n\u003c/system-reminder\u003e"
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "assistant",
+            "content": [
+              {
+                "type": "output_text",
+                "text": "ok"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"]
+      }
+    },
+    {
+      "name": "mixed-text-images",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "before"
+              },
+              {
+                "type": "image",
+                "source": {
+                  "type": "base64",
+                  "media_type": "image/png",
+                  "data": "aGVsbG8="
+                }
+              },
+              {
+                "type": "text",
+                "text": "after"
+              },
+              {
+                "type": "image",
+                "source": {
+                  "type": "base64",
+                  "media_type": "image/png",
+                  "data": "aGVsbG8="
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "before"
+              },
+              {
+                "type": "input_image",
+                "image_url": "data:image/png;base64,aGVsbG8="
+              },
+              {
+                "type": "input_text",
+                "text": "after"
+              },
+              {
+                "type": "input_image",
+                "image_url": "data:image/png;base64,aGVsbG8="
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"]
+      }
+    },
+    {
+      "name": "url-image",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "image",
+                "source": {
+                  "type": "url",
+                  "url": "https://example.invalid/image.png"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"]
+      }
+    },
+    {
+      "name": "pdf",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "document",
+                "source": {
+                  "type": "base64",
+                  "media_type": "application/pdf",
+                  "data": "cGRm"
+                },
+                "title": "example.pdf"
+              }
+            ]
+          }
+        ]
+      },
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_file",
+                "file_data": "data:application/pdf;base64,cGRm",
+                "filename": "document.pdf"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"]
+      }
+    },
+    {
+      "name": "tools",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ],
+        "tools": [
+          {
+            "name": "search",
+            "description": "Test tool",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "q": {
+                  "type": "string"
+                }
+              },
+              "required": ["q"]
+            }
+          }
+        ],
+        "tool_choice": {
+          "type": "any",
+          "disable_parallel_tool_use": true
+        }
+      },
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "tool_choice": "required",
+        "parallel_tool_calls": false,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
+        "tools": [
+          {
+            "name": "search",
+            "description": "Test tool",
+            "type": "function",
+            "parameters": {
+              "properties": {
+                "q": {
+                  "type": "string"
+                }
+              },
+              "required": ["q"],
+              "type": "object"
+            },
+            "strict": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "empty-tools",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ],
+        "tools": []
+      },
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
+        "tools": []
+      }
+    },
+    {
+      "name": "long-mcp-names",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ],
+        "tools": [
+          {
+            "name": "mcp__serverserverserverserverserverserverserverserverserverserverserverserver__search",
+            "description": "Test tool",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "q": {
+                  "type": "string"
+                }
+              },
+              "required": ["q"]
+            }
+          },
+          {
+            "name": "mcp__otherotherotherotherotherotherotherotherotherotherotherotherotherotherother__search",
+            "description": "Test tool",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "q": {
+                  "type": "string"
+                }
+              },
+              "required": ["q"]
+            }
+          }
+        ],
+        "tool_choice": {
+          "type": "tool",
+          "name": "mcp__serverserverserverserverserverserverserverserverserverserverserverserver__search"
+        }
+      },
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "tool_choice": {
+          "type": "function",
+          "name": "mcp__search"
+        },
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
+        "tools": [
+          {
+            "name": "mcp__search",
+            "description": "Test tool",
+            "type": "function",
+            "parameters": {
+              "properties": {
+                "q": {
+                  "type": "string"
+                }
+              },
+              "required": ["q"],
+              "type": "object"
+            },
+            "strict": false
+          },
+          {
+            "name": "mcp__search_1",
+            "description": "Test tool",
+            "type": "function",
+            "parameters": {
+              "properties": {
+                "q": {
+                  "type": "string"
+                }
+              },
+              "required": ["q"],
+              "type": "object"
+            },
+            "strict": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "schema-meta",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ],
+        "tools": [
+          {
+            "name": "schema",
+            "input_schema": {
+              "$schema": "draft",
+              "type": "object",
+              "properties": {
+                "$id": {
+                  "type": "string"
+                },
+                "value": {
+                  "$id": "annotation",
+                  "type": "string",
+                  "pattern": "\\p{L}+",
+                  "default": {
+                    "$id": "literal"
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
+        "tools": [
+          {
+            "name": "schema",
+            "type": "function",
+            "parameters": {
+              "properties": {
+                "$id": {
+                  "type": "string"
+                },
+                "value": {
+                  "default": {
+                    "$id": "literal"
+                  },
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            },
+            "strict": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "thinking-budget",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ],
+        "thinking": {
+          "type": "enabled",
+          "budget_tokens": 8192
+        }
+      },
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"]
+      }
+    },
+    {
+      "name": "adaptive-effort",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ],
+        "thinking": {
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "high"
+        }
+      },
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "high"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"]
+      }
+    },
+    {
+      "name": "disabled-thinking",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ],
+        "thinking": {
+          "type": "disabled"
+        }
+      },
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "none"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"]
+      }
+    },
+    {
+      "name": "structured-output",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ],
+        "output_config": {
+          "format": {
+            "type": "json_schema",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "x": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
+        "text": {
+          "format": {
+            "type": "json_schema",
+            "name": "cli_proxy_structured_output",
+            "strict": false,
+            "schema": {
+              "type": "object",
+              "properties": {
+                "x": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "priority",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ],
+        "speed": "fast"
+      },
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "service_tier": "priority",
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"]
+      }
+    },
+    {
+      "name": "typed-web-search",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ],
+        "tools": [
+          {
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "allowed_domains": ["example.com"],
+            "user_location": {
+              "type": "approximate",
+              "city": "Paris"
+            }
+          }
+        ],
+        "tool_choice": {
+          "type": "tool",
+          "name": "web_search"
+        }
+      },
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "tool_choice": {
+          "type": "web_search"
+        },
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content",
+          "web_search_call.action.sources"
+        ],
+        "tools": [
+          {
+            "type": "web_search",
+            "filters": {
+              "allowed_domains": ["example.com"]
+            },
+            "user_location": {
+              "type": "approximate",
+              "city": "Paris"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "raw-reasoning-replay",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "summary",
+                "signature": "gAAAAAAAAAAAAwMDAwMDAwMDAwMDAwMDAwQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU"
+              },
+              {
+                "type": "tool_use",
+                "id": "call1",
+                "name": "search",
+                "input": {
+                  "q": "x"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "call1",
+                "content": "ok"
+              }
+            ]
+          }
+        ]
+      },
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "reasoning",
+            "summary": [],
+            "content": null,
+            "encrypted_content": "gAAAAAAAAAAAAwMDAwMDAwMDAwMDAwMDAwQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU"
+          },
+          {
+            "type": "function_call",
+            "call_id": "call1",
+            "name": "search",
+            "arguments": "{\"q\":\"x\"}"
+          },
+          {
+            "type": "function_call_output",
+            "call_id": "call1",
+            "output": "ok"
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"]
+      }
+    },
+    {
+      "name": "tool-output-multimodal",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "call1",
+                "name": "search",
+                "input": {
+                  "q": "x"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "call1",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "before"
+                  },
+                  {
+                    "type": "image",
+                    "source": {
+                      "type": "base64",
+                      "media_type": "image/png",
+                      "data": "aGVsbG8="
+                    }
+                  },
+                  {
+                    "type": "text",
+                    "text": "after"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "function_call",
+            "call_id": "call1",
+            "name": "search",
+            "arguments": "{\"q\":\"x\"}"
+          },
+          {
+            "type": "function_call_output",
+            "call_id": "call1",
+            "output": [
+              {
+                "type": "input_text",
+                "text": "before"
+              },
+              {
+                "type": "input_image",
+                "image_url": "data:image/png;base64,aGVsbG8="
+              },
+              {
+                "type": "input_text",
+                "text": "after"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"]
+      }
+    },
+    {
+      "name": "parallel-feedback-order",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "one",
+                "name": "search",
+                "input": {
+                  "q": "1"
+                }
+              },
+              {
+                "type": "tool_use",
+                "id": "two",
+                "name": "search",
+                "input": {
+                  "q": "2"
+                }
+              }
+            ]
+          },
+          {
+            "role": "system",
+            "content": "New context"
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "two",
+                "content": "2"
+              },
+              {
+                "type": "tool_result",
+                "tool_use_id": "one",
+                "content": "1"
+              },
+              {
+                "type": "text",
+                "text": "summarize"
+              }
+            ]
+          }
+        ]
+      },
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "function_call",
+            "call_id": "one",
+            "name": "search",
+            "arguments": "{\"q\":\"1\"}"
+          },
+          {
+            "type": "function_call",
+            "call_id": "two",
+            "name": "search",
+            "arguments": "{\"q\":\"2\"}"
+          },
+          {
+            "type": "function_call_output",
+            "call_id": "one",
+            "output": "1"
+          },
+          {
+            "type": "function_call_output",
+            "call_id": "two",
+            "output": "2"
+          },
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "\u003csystem-reminder\u003e\nNew context\n\u003c/system-reminder\u003e"
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "summarize"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"]
+      }
+    },
+    {
+      "name": "long-call-id",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "call_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "name": "search",
+                "input": {
+                  "q": "1"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "call_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "content": "ok"
+              }
+            ]
+          }
+        ]
+      },
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "function_call",
+            "call_id": "call_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_c484c7ec96f80b88",
+            "name": "search",
+            "arguments": "{\"q\":\"1\"}"
+          },
+          {
+            "type": "function_call_output",
+            "call_id": "call_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_c484c7ec96f80b88",
+            "output": "ok"
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"]
+      }
+    },
+    {
+      "name": "stream-text",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ]
+      },
+      "events": [
+        {
+          "type": "response.created",
+          "response": {
+            "id": "resp_compat",
+            "model": "gpt-6-sol"
+          }
+        },
+        {
+          "type": "response.output_item.added",
+          "output_index": 0,
+          "item": {
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "content": []
+          }
+        },
+        {
+          "type": "response.content_part.added",
+          "item_id": "msg_1",
+          "content_index": 0,
+          "part": {
+            "type": "output_text",
+            "text": ""
+          }
+        },
+        {
+          "type": "response.output_text.delta",
+          "item_id": "msg_1",
+          "content_index": 0,
+          "delta": "Hello ✓"
+        },
+        {
+          "type": "response.content_part.done",
+          "item_id": "msg_1",
+          "content_index": 0,
+          "part": {
+            "type": "output_text",
+            "text": "Hello ✓"
+          }
+        },
+        {
+          "type": "response.output_item.done",
+          "output_index": 0,
+          "item": {
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "content": [
+              {
+                "type": "output_text",
+                "text": "Hello ✓"
+              }
+            ]
+          }
+        },
+        {
+          "type": "response.completed",
+          "response": {
+            "id": "resp_compat",
+            "model": "gpt-6-sol",
+            "status": "completed",
+            "output": [
+              {
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "content": [
+                  {
+                    "type": "output_text",
+                    "text": "Hello ✓"
+                  }
+                ]
+              }
+            ],
+            "usage": {
+              "input_tokens": 100,
+              "input_tokens_details": {
+                "cached_tokens": 40,
+                "cache_write_tokens": 10
+              },
+              "output_tokens": 20,
+              "output_tokens_details": {
+                "reasoning_tokens": 8
+              }
+            }
+          }
+        }
+      ],
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"]
+      },
+      "expectedResponse": {
+        "id": "resp_compat",
+        "type": "message",
+        "role": "assistant",
+        "model": "gpt-6-sol",
+        "content": [
+          {
+            "type": "text",
+            "text": "Hello ✓"
+          }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 50,
+          "output_tokens": 20,
+          "cache_read_input_tokens": 40,
+          "cache_creation_input_tokens": 10,
+          "output_tokens_details": {
+            "thinking_tokens": 8
+          }
+        }
+      },
+      "expectedStream": [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"resp_compat\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gpt-6-sol\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0},\"content\":[],\"stop_reason\":null}}\n\n",
+        "",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello ✓\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":50,\"output_tokens\":20,\"cache_read_input_tokens\":40,\"cache_creation_input_tokens\":10,\"output_tokens_details\":{\"thinking_tokens\":8}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+      ]
+    },
+    {
+      "name": "stream-tool",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ],
+        "tools": [
+          {
+            "name": "search",
+            "description": "Test tool",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "q": {
+                  "type": "string"
+                }
+              },
+              "required": ["q"]
+            }
+          }
+        ]
+      },
+      "events": [
+        {
+          "type": "response.created",
+          "response": {
+            "id": "resp_compat",
+            "model": "gpt-6-sol"
+          }
+        },
+        {
+          "type": "response.output_item.added",
+          "output_index": 0,
+          "item": {
+            "type": "function_call",
+            "id": "fc_call1",
+            "call_id": "call1",
+            "name": "search",
+            "arguments": ""
+          }
+        },
+        {
+          "type": "response.output_item.done",
+          "output_index": 0,
+          "item": {
+            "type": "function_call",
+            "id": "fc_call1",
+            "call_id": "call1",
+            "name": "search",
+            "arguments": "{\"q\":\"x\"}"
+          }
+        },
+        {
+          "type": "response.completed",
+          "response": {
+            "id": "resp_compat",
+            "model": "gpt-6-sol",
+            "status": "completed",
+            "output": [
+              {
+                "type": "function_call",
+                "id": "fc_call1",
+                "call_id": "call1",
+                "name": "search",
+                "arguments": "{\"q\":\"x\"}"
+              }
+            ],
+            "usage": {
+              "input_tokens": 100,
+              "input_tokens_details": {
+                "cached_tokens": 40,
+                "cache_write_tokens": 10
+              },
+              "output_tokens": 20,
+              "output_tokens_details": {
+                "reasoning_tokens": 8
+              }
+            }
+          }
+        }
+      ],
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
+        "tools": [
+          {
+            "name": "search",
+            "description": "Test tool",
+            "type": "function",
+            "parameters": {
+              "properties": {
+                "q": {
+                  "type": "string"
+                }
+              },
+              "required": ["q"],
+              "type": "object"
+            },
+            "strict": false
+          }
+        ]
+      },
+      "expectedResponse": {
+        "id": "resp_compat",
+        "type": "message",
+        "role": "assistant",
+        "model": "gpt-6-sol",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "call1",
+            "name": "search",
+            "input": {
+              "q": "x"
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 50,
+          "output_tokens": 20,
+          "cache_read_input_tokens": 40,
+          "cache_creation_input_tokens": 10,
+          "output_tokens_details": {
+            "thinking_tokens": 8
+          }
+        }
+      },
+      "expectedStream": [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"resp_compat\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gpt-6-sol\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0},\"content\":[],\"stop_reason\":null}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call1\",\"name\":\"search\",\"input\":{}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"x\\\"}\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":50,\"output_tokens\":20,\"cache_read_input_tokens\":40,\"cache_creation_input_tokens\":10,\"output_tokens_details\":{\"thinking_tokens\":8}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+      ]
+    },
+    {
+      "name": "stream-two-text-parts",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ]
+      },
+      "events": [
+        {
+          "type": "response.created",
+          "response": {
+            "id": "resp_compat",
+            "model": "gpt-6-sol"
+          }
+        },
+        {
+          "type": "response.content_part.added",
+          "content_index": 0,
+          "part": {
+            "type": "output_text"
+          }
+        },
+        {
+          "type": "response.output_text.delta",
+          "content_index": 0,
+          "delta": "one"
+        },
+        {
+          "type": "response.content_part.done",
+          "content_index": 0,
+          "part": {
+            "type": "output_text",
+            "text": "one"
+          }
+        },
+        {
+          "type": "response.content_part.added",
+          "content_index": 1,
+          "part": {
+            "type": "output_text"
+          }
+        },
+        {
+          "type": "response.output_text.delta",
+          "content_index": 1,
+          "delta": "two"
+        },
+        {
+          "type": "response.content_part.done",
+          "content_index": 1,
+          "part": {
+            "type": "output_text",
+            "text": "two"
+          }
+        },
+        {
+          "type": "response.completed",
+          "response": {
+            "id": "resp_compat",
+            "model": "gpt-6-sol",
+            "status": "completed",
+            "output": [
+              {
+                "type": "message",
+                "id": "msg1",
+                "content": [
+                  {
+                    "type": "output_text",
+                    "text": "one"
+                  },
+                  {
+                    "type": "output_text",
+                    "text": "two"
+                  }
+                ]
+              }
+            ],
+            "usage": {
+              "input_tokens": 100,
+              "input_tokens_details": {
+                "cached_tokens": 40,
+                "cache_write_tokens": 10
+              },
+              "output_tokens": 20,
+              "output_tokens_details": {
+                "reasoning_tokens": 8
+              }
+            }
+          }
+        }
+      ],
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"]
+      },
+      "expectedResponse": {
+        "id": "resp_compat",
+        "type": "message",
+        "role": "assistant",
+        "model": "gpt-6-sol",
+        "content": [
+          {
+            "type": "text",
+            "text": "one"
+          },
+          {
+            "type": "text",
+            "text": "two"
+          }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 50,
+          "output_tokens": 20,
+          "cache_read_input_tokens": 40,
+          "cache_creation_input_tokens": 10,
+          "output_tokens_details": {
+            "thinking_tokens": 8
+          }
+        }
+      },
+      "expectedStream": [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"resp_compat\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gpt-6-sol\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0},\"content\":[],\"stop_reason\":null}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"one\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"two\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":50,\"output_tokens\":20,\"cache_read_input_tokens\":40,\"cache_creation_input_tokens\":10,\"output_tokens_details\":{\"thinking_tokens\":8}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+      ]
+    },
+    {
+      "name": "stream-interleaved-tools",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ],
+        "tools": [
+          {
+            "name": "search",
+            "description": "Test tool",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "q": {
+                  "type": "string"
+                }
+              },
+              "required": ["q"]
+            }
+          }
+        ]
+      },
+      "events": [
+        {
+          "type": "response.created",
+          "response": {
+            "id": "resp_compat",
+            "model": "gpt-6-sol"
+          }
+        },
+        {
+          "type": "response.output_item.added",
+          "output_index": 0,
+          "item": {
+            "type": "function_call",
+            "id": "fc_a",
+            "call_id": "a",
+            "name": "search",
+            "arguments": ""
+          }
+        },
+        {
+          "type": "response.output_item.added",
+          "output_index": 1,
+          "item": {
+            "type": "function_call",
+            "id": "fc_b",
+            "call_id": "b",
+            "name": "search",
+            "arguments": ""
+          }
+        },
+        {
+          "type": "response.function_call_arguments.delta",
+          "item_id": "fc_a",
+          "delta": "{\"q\":"
+        },
+        {
+          "type": "response.function_call_arguments.delta",
+          "item_id": "fc_b",
+          "delta": "{\"q\":\"b\"}"
+        },
+        {
+          "type": "response.function_call_arguments.done",
+          "item_id": "fc_b",
+          "arguments": "{\"q\":\"b\"}"
+        },
+        {
+          "type": "response.output_item.done",
+          "output_index": 1,
+          "item": {
+            "type": "function_call",
+            "id": "fc_b",
+            "call_id": "b",
+            "name": "search",
+            "arguments": "{\"q\":\"b\"}"
+          }
+        },
+        {
+          "type": "response.function_call_arguments.delta",
+          "item_id": "fc_a",
+          "delta": "\"a\"}"
+        },
+        {
+          "type": "response.output_item.done",
+          "output_index": 0,
+          "item": {
+            "type": "function_call",
+            "id": "fc_a",
+            "call_id": "a",
+            "name": "search",
+            "arguments": "{\"q\":\"a\"}"
+          }
+        },
+        {
+          "type": "response.completed",
+          "response": {
+            "id": "resp_compat",
+            "model": "gpt-6-sol",
+            "status": "completed",
+            "output": [
+              {
+                "type": "function_call",
+                "id": "fc_a",
+                "call_id": "a",
+                "name": "search",
+                "arguments": "{\"q\":\"a\"}"
+              },
+              {
+                "type": "function_call",
+                "id": "fc_b",
+                "call_id": "b",
+                "name": "search",
+                "arguments": "{\"q\":\"b\"}"
+              }
+            ],
+            "usage": {
+              "input_tokens": 100,
+              "input_tokens_details": {
+                "cached_tokens": 40,
+                "cache_write_tokens": 10
+              },
+              "output_tokens": 20,
+              "output_tokens_details": {
+                "reasoning_tokens": 8
+              }
+            }
+          }
+        }
+      ],
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
+        "tools": [
+          {
+            "name": "search",
+            "description": "Test tool",
+            "type": "function",
+            "parameters": {
+              "properties": {
+                "q": {
+                  "type": "string"
+                }
+              },
+              "required": ["q"],
+              "type": "object"
+            },
+            "strict": false
+          }
+        ]
+      },
+      "expectedResponse": {
+        "id": "resp_compat",
+        "type": "message",
+        "role": "assistant",
+        "model": "gpt-6-sol",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "a",
+            "name": "search",
+            "input": {
+              "q": "a"
+            }
+          },
+          {
+            "type": "tool_use",
+            "id": "b",
+            "name": "search",
+            "input": {
+              "q": "b"
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 50,
+          "output_tokens": 20,
+          "cache_read_input_tokens": 40,
+          "cache_creation_input_tokens": 10,
+          "output_tokens_details": {
+            "thinking_tokens": 8
+          }
+        }
+      },
+      "expectedStream": [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"resp_compat\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gpt-6-sol\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0},\"content\":[],\"stop_reason\":null}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"a\",\"name\":\"search\",\"input\":{}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\"}}\n\n",
+        "",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\"}}\n\n",
+        "",
+        "",
+        "",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"a\\\"}\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"b\",\"name\":\"search\",\"input\":{}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"b\\\"}\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":50,\"output_tokens\":20,\"cache_read_input_tokens\":40,\"cache_creation_input_tokens\":10,\"output_tokens_details\":{\"thinking_tokens\":8}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+      ]
+    },
+    {
+      "name": "stream-reasoning-multipart",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ]
+      },
+      "events": [
+        {
+          "type": "response.created",
+          "response": {
+            "id": "resp_compat",
+            "model": "gpt-6-sol"
+          }
+        },
+        {
+          "type": "response.output_item.added",
+          "output_index": 0,
+          "item": {
+            "id": "rs_compat",
+            "type": "reasoning",
+            "encrypted_content": "gAAAAAAAAAAAAwMDAwMDAwMDAwMDAwMDAwQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU",
+            "summary": []
+          }
+        },
+        {
+          "type": "response.reasoning_summary_part.added",
+          "item_id": "rs_compat",
+          "summary_index": 0
+        },
+        {
+          "type": "response.reasoning_summary_text.delta",
+          "item_id": "rs_compat",
+          "summary_index": 0,
+          "delta": "first"
+        },
+        {
+          "type": "response.reasoning_summary_part.done",
+          "item_id": "rs_compat",
+          "summary_index": 0
+        },
+        {
+          "type": "response.reasoning_summary_part.added",
+          "item_id": "rs_compat",
+          "summary_index": 1
+        },
+        {
+          "type": "response.reasoning_summary_text.delta",
+          "item_id": "rs_compat",
+          "summary_index": 1,
+          "delta": "second"
+        },
+        {
+          "type": "response.output_item.done",
+          "output_index": 0,
+          "item": {
+            "id": "rs_compat",
+            "type": "reasoning",
+            "encrypted_content": "gAAAAAAAAAAAAwMDAwMDAwMDAwMDAwMDAwQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU",
+            "summary": [
+              {
+                "type": "summary_text",
+                "text": "first"
+              },
+              {
+                "type": "summary_text",
+                "text": "second"
+              }
+            ]
+          }
+        },
+        {
+          "type": "response.completed",
+          "response": {
+            "id": "resp_compat",
+            "model": "gpt-6-sol",
+            "status": "completed",
+            "output": [
+              {
+                "id": "rs_compat",
+                "type": "reasoning",
+                "encrypted_content": "gAAAAAAAAAAAAwMDAwMDAwMDAwMDAwMDAwQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU",
+                "summary": [
+                  {
+                    "type": "summary_text",
+                    "text": "first"
+                  },
+                  {
+                    "type": "summary_text",
+                    "text": "second"
+                  }
+                ]
+              }
+            ],
+            "usage": {
+              "input_tokens": 100,
+              "input_tokens_details": {
+                "cached_tokens": 40,
+                "cache_write_tokens": 10
+              },
+              "output_tokens": 20,
+              "output_tokens_details": {
+                "reasoning_tokens": 8
+              }
+            }
+          }
+        }
+      ],
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"]
+      },
+      "expectedResponse": {
+        "id": "resp_compat",
+        "type": "message",
+        "role": "assistant",
+        "model": "gpt-6-sol",
+        "content": [
+          {
+            "type": "thinking",
+            "thinking": "firstsecond",
+            "signature": "gAAAAAAAAAAAAwMDAwMDAwMDAwMDAwMDAwQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU"
+          }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 50,
+          "output_tokens": 20,
+          "cache_read_input_tokens": 40,
+          "cache_creation_input_tokens": 10,
+          "output_tokens_details": {
+            "thinking_tokens": 8
+          }
+        }
+      },
+      "expectedStream": [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"resp_compat\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gpt-6-sol\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0},\"content\":[],\"stop_reason\":null}}\n\n",
+        "",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"first\"}}\n\n",
+        "",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"\\n\\n\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"second\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"gAAAAAAAAAAAAwMDAwMDAwMDAwMDAwMDAwQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":50,\"output_tokens\":20,\"cache_read_input_tokens\":40,\"cache_creation_input_tokens\":10,\"output_tokens_details\":{\"thinking_tokens\":8}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+      ]
+    },
+    {
+      "name": "incomplete-max_output_tokens",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ]
+      },
+      "events": [
+        {
+          "type": "response.created",
+          "response": {
+            "id": "resp_compat",
+            "model": "gpt-6-sol"
+          }
+        },
+        {
+          "type": "response.incomplete",
+          "response": {
+            "id": "resp_compat",
+            "model": "gpt-6-sol",
+            "status": "incomplete",
+            "output": [],
+            "usage": {
+              "input_tokens": 100,
+              "input_tokens_details": {
+                "cached_tokens": 40,
+                "cache_write_tokens": 10
+              },
+              "output_tokens": 20,
+              "output_tokens_details": {
+                "reasoning_tokens": 8
+              }
+            },
+            "incomplete_details": {
+              "reason": "max_output_tokens"
+            }
+          }
+        }
+      ],
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"]
+      },
+      "expectedResponse": {
+        "id": "resp_compat",
+        "type": "message",
+        "role": "assistant",
+        "model": "gpt-6-sol",
+        "content": [],
+        "stop_reason": "max_tokens",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 50,
+          "output_tokens": 20,
+          "cache_read_input_tokens": 40,
+          "cache_creation_input_tokens": 10,
+          "output_tokens_details": {
+            "thinking_tokens": 8
+          }
+        }
+      },
+      "expectedStream": [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"resp_compat\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gpt-6-sol\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0},\"content\":[],\"stop_reason\":null}}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":50,\"output_tokens\":20,\"cache_read_input_tokens\":40,\"cache_creation_input_tokens\":10,\"output_tokens_details\":{\"thinking_tokens\":8}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+      ]
+    },
+    {
+      "name": "incomplete-content_filter",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ]
+      },
+      "events": [
+        {
+          "type": "response.created",
+          "response": {
+            "id": "resp_compat",
+            "model": "gpt-6-sol"
+          }
+        },
+        {
+          "type": "response.incomplete",
+          "response": {
+            "id": "resp_compat",
+            "model": "gpt-6-sol",
+            "status": "incomplete",
+            "output": [],
+            "usage": {
+              "input_tokens": 100,
+              "input_tokens_details": {
+                "cached_tokens": 40,
+                "cache_write_tokens": 10
+              },
+              "output_tokens": 20,
+              "output_tokens_details": {
+                "reasoning_tokens": 8
+              }
+            },
+            "incomplete_details": {
+              "reason": "content_filter"
+            }
+          }
+        }
+      ],
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"]
+      },
+      "expectedResponse": {
+        "id": "resp_compat",
+        "type": "message",
+        "role": "assistant",
+        "model": "gpt-6-sol",
+        "content": [],
+        "stop_reason": "refusal",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 50,
+          "output_tokens": 20,
+          "cache_read_input_tokens": 40,
+          "cache_creation_input_tokens": 10,
+          "output_tokens_details": {
+            "thinking_tokens": 8
+          }
+        }
+      },
+      "expectedStream": [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"resp_compat\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gpt-6-sol\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0},\"content\":[],\"stop_reason\":null}}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":50,\"output_tokens\":20,\"cache_read_input_tokens\":40,\"cache_creation_input_tokens\":10,\"output_tokens_details\":{\"thinking_tokens\":8}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+      ]
+    },
+    {
+      "name": "incomplete-context_length_exceeded",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ]
+      },
+      "events": [
+        {
+          "type": "response.created",
+          "response": {
+            "id": "resp_compat",
+            "model": "gpt-6-sol"
+          }
+        },
+        {
+          "type": "response.incomplete",
+          "response": {
+            "id": "resp_compat",
+            "model": "gpt-6-sol",
+            "status": "incomplete",
+            "output": [],
+            "usage": {
+              "input_tokens": 100,
+              "input_tokens_details": {
+                "cached_tokens": 40,
+                "cache_write_tokens": 10
+              },
+              "output_tokens": 20,
+              "output_tokens_details": {
+                "reasoning_tokens": 8
+              }
+            },
+            "incomplete_details": {
+              "reason": "context_length_exceeded"
+            }
+          }
+        }
+      ],
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"]
+      },
+      "expectedResponse": {
+        "id": "resp_compat",
+        "type": "message",
+        "role": "assistant",
+        "model": "gpt-6-sol",
+        "content": [],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 50,
+          "output_tokens": 20,
+          "cache_read_input_tokens": 40,
+          "cache_creation_input_tokens": 10,
+          "output_tokens_details": {
+            "thinking_tokens": 8
+          }
+        }
+      },
+      "expectedStream": [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"resp_compat\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gpt-6-sol\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0},\"content\":[],\"stop_reason\":null}}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":50,\"output_tokens\":20,\"cache_read_input_tokens\":40,\"cache_creation_input_tokens\":10,\"output_tokens_details\":{\"thinking_tokens\":8}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+      ]
+    },
+    {
+      "name": "stop-sequence",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ]
+      },
+      "events": [
+        {
+          "type": "response.created",
+          "response": {
+            "id": "resp_compat",
+            "model": "gpt-6-sol"
+          }
+        },
+        {
+          "type": "response.output_item.added",
+          "output_index": 0,
+          "item": {
+            "type": "message",
+            "id": "msg1",
+            "role": "assistant",
+            "content": []
+          }
+        },
+        {
+          "type": "response.content_part.added",
+          "item_id": "msg1",
+          "content_index": 0,
+          "part": {
+            "type": "output_text",
+            "text": ""
+          }
+        },
+        {
+          "type": "response.output_text.delta",
+          "item_id": "msg1",
+          "content_index": 0,
+          "delta": "done"
+        },
+        {
+          "type": "response.content_part.done",
+          "item_id": "msg1",
+          "content_index": 0,
+          "part": {
+            "type": "output_text",
+            "text": "done"
+          }
+        },
+        {
+          "type": "response.output_item.done",
+          "output_index": 0,
+          "item": {
+            "type": "message",
+            "id": "msg1",
+            "role": "assistant",
+            "content": [
+              {
+                "type": "output_text",
+                "text": "done"
+              }
+            ]
+          }
+        },
+        {
+          "type": "response.completed",
+          "response": {
+            "id": "resp_compat",
+            "model": "gpt-6-sol",
+            "status": "completed",
+            "output": [
+              {
+                "type": "message",
+                "id": "msg1",
+                "role": "assistant",
+                "content": [
+                  {
+                    "type": "output_text",
+                    "text": "done"
+                  }
+                ]
+              }
+            ],
+            "usage": {
+              "input_tokens": 100,
+              "input_tokens_details": {
+                "cached_tokens": 40,
+                "cache_write_tokens": 10
+              },
+              "output_tokens": 20,
+              "output_tokens_details": {
+                "reasoning_tokens": 8
+              }
+            },
+            "stop_reason": "stop_sequence",
+            "stop_sequence": "END"
+          }
+        }
+      ],
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"]
+      },
+      "expectedResponse": {
+        "id": "resp_compat",
+        "type": "message",
+        "role": "assistant",
+        "model": "gpt-6-sol",
+        "content": [
+          {
+            "type": "text",
+            "text": "done"
+          }
+        ],
+        "stop_reason": "stop_sequence",
+        "stop_sequence": "END",
+        "usage": {
+          "input_tokens": 50,
+          "output_tokens": 20,
+          "cache_read_input_tokens": 40,
+          "cache_creation_input_tokens": 10,
+          "output_tokens_details": {
+            "thinking_tokens": 8
+          }
+        }
+      },
+      "expectedStream": [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"resp_compat\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gpt-6-sol\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0},\"content\":[],\"stop_reason\":null}}\n\n",
+        "",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"stop_sequence\",\"stop_sequence\":\"END\"},\"usage\":{\"input_tokens\":50,\"output_tokens\":20,\"cache_read_input_tokens\":40,\"cache_creation_input_tokens\":10,\"output_tokens_details\":{\"thinking_tokens\":8}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+      ]
+    },
+    {
+      "name": "stream-long-name",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ],
+        "tools": [
+          {
+            "name": "mcp__serverserverserverserverserverserverserverserverserverserverserverserver__search",
+            "description": "Test tool",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "q": {
+                  "type": "string"
+                }
+              },
+              "required": ["q"]
+            }
+          }
+        ]
+      },
+      "events": [
+        {
+          "type": "response.created",
+          "response": {
+            "id": "resp_compat",
+            "model": "gpt-6-sol"
+          }
+        },
+        {
+          "type": "response.output_item.added",
+          "output_index": 0,
+          "item": {
+            "type": "function_call",
+            "id": "fc_call1",
+            "call_id": "call1",
+            "name": "mcp__search",
+            "arguments": ""
+          }
+        },
+        {
+          "type": "response.output_item.done",
+          "output_index": 0,
+          "item": {
+            "type": "function_call",
+            "id": "fc_call1",
+            "call_id": "call1",
+            "name": "mcp__search",
+            "arguments": "{\"q\":\"x\"}"
+          }
+        },
+        {
+          "type": "response.completed",
+          "response": {
+            "id": "resp_compat",
+            "model": "gpt-6-sol",
+            "status": "completed",
+            "output": [
+              {
+                "type": "function_call",
+                "id": "fc_call1",
+                "call_id": "call1",
+                "name": "mcp__search",
+                "arguments": "{\"q\":\"x\"}"
+              }
+            ],
+            "usage": {
+              "input_tokens": 100,
+              "input_tokens_details": {
+                "cached_tokens": 40,
+                "cache_write_tokens": 10
+              },
+              "output_tokens": 20,
+              "output_tokens_details": {
+                "reasoning_tokens": 8
+              }
+            }
+          }
+        }
+      ],
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
+        "tools": [
+          {
+            "name": "mcp__search",
+            "description": "Test tool",
+            "type": "function",
+            "parameters": {
+              "properties": {
+                "q": {
+                  "type": "string"
+                }
+              },
+              "required": ["q"],
+              "type": "object"
+            },
+            "strict": false
+          }
+        ]
+      },
+      "expectedResponse": {
+        "id": "resp_compat",
+        "type": "message",
+        "role": "assistant",
+        "model": "gpt-6-sol",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "call1",
+            "name": "mcp__serverserverserverserverserverserverserverserverserverserverserverserver__search",
+            "input": {
+              "q": "x"
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 50,
+          "output_tokens": 20,
+          "cache_read_input_tokens": 40,
+          "cache_creation_input_tokens": 10,
+          "output_tokens_details": {
+            "thinking_tokens": 8
+          }
+        }
+      },
+      "expectedStream": [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"resp_compat\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gpt-6-sol\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0},\"content\":[],\"stop_reason\":null}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call1\",\"name\":\"mcp__serverserverserverserverserverserverserverserverserverserverserverserver__search\",\"input\":{}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"x\\\"}\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":50,\"output_tokens\":20,\"cache_read_input_tokens\":40,\"cache_creation_input_tokens\":10,\"output_tokens_details\":{\"thinking_tokens\":8}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+      ]
+    },
+    {
+      "name": "web-search-response",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ],
+        "tools": [
+          {
+            "type": "web_search_20250305",
+            "name": "web_search"
+          }
+        ]
+      },
+      "events": [
+        {
+          "type": "response.created",
+          "response": {
+            "id": "resp_compat",
+            "model": "gpt-6-sol"
+          }
+        },
+        {
+          "type": "response.output_item.added",
+          "output_index": 0,
+          "item": {
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {
+              "type": "search",
+              "query": "research",
+              "sources": [
+                {
+                  "url": "https://example.com/",
+                  "title": "Example"
+                }
+              ]
+            },
+            "content": []
+          }
+        },
+        {
+          "type": "response.output_item.done",
+          "output_index": 0,
+          "item": {
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {
+              "type": "search",
+              "query": "research",
+              "sources": [
+                {
+                  "url": "https://example.com/",
+                  "title": "Example"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "response.completed",
+          "response": {
+            "id": "resp_compat",
+            "model": "gpt-6-sol",
+            "status": "completed",
+            "output": [
+              {
+                "type": "web_search_call",
+                "id": "ws_1",
+                "status": "completed",
+                "action": {
+                  "type": "search",
+                  "query": "research",
+                  "sources": [
+                    {
+                      "url": "https://example.com/",
+                      "title": "Example"
+                    }
+                  ]
+                }
+              }
+            ],
+            "usage": {
+              "input_tokens": 100,
+              "input_tokens_details": {
+                "cached_tokens": 40,
+                "cache_write_tokens": 10
+              },
+              "output_tokens": 20,
+              "output_tokens_details": {
+                "reasoning_tokens": 8
+              }
+            }
+          }
+        }
+      ],
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": [
+          "reasoning.encrypted_content",
+          "web_search_call.action.sources"
+        ],
+        "tools": [
+          {
+            "type": "web_search"
+          }
+        ]
+      },
+      "expectedResponse": {
+        "id": "resp_compat",
+        "type": "message",
+        "role": "assistant",
+        "model": "gpt-6-sol",
+        "content": [
+          {
+            "type": "server_tool_use",
+            "id": "ws_1",
+            "name": "web_search",
+            "input": {
+              "query": "research"
+            }
+          },
+          {
+            "type": "web_search_tool_result",
+            "tool_use_id": "ws_1",
+            "content": [
+              {
+                "type": "web_search_result",
+                "title": "Example",
+                "url": "https://example.com/",
+                "page_age": null
+              }
+            ]
+          }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 50,
+          "output_tokens": 20,
+          "cache_read_input_tokens": 40,
+          "cache_creation_input_tokens": 10,
+          "output_tokens_details": {
+            "thinking_tokens": 8
+          }
+        }
+      },
+      "expectedStream": [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"resp_compat\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gpt-6-sol\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0},\"content\":[],\"stop_reason\":null}}\n\n",
+        "",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"ws_1\",\"name\":\"web_search\",\"input\":{}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"research\\\"}\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"ws_1\",\"content\":[{\"type\":\"web_search_result\",\"title\":\"Example\",\"url\":\"https://example.com/\",\"page_age\":null}]}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":50,\"output_tokens\":20,\"cache_read_input_tokens\":40,\"cache_creation_input_tokens\":10,\"output_tokens_details\":{\"thinking_tokens\":8}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+      ]
+    },
+    {
+      "name": "executor-const-union-enum",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ],
+        "tools": [
+          {
+            "name": "enum_test",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "mode": {
+                  "oneOf": [
+                    {
+                      "const": "choice0",
+                      "description": "Choose 0"
+                    },
+                    {
+                      "const": "choice1",
+                      "description": "Choose 1"
+                    },
+                    {
+                      "const": "choice2",
+                      "description": "Choose 2"
+                    },
+                    {
+                      "const": "choice3",
+                      "description": "Choose 3"
+                    },
+                    {
+                      "const": "choice4",
+                      "description": "Choose 4"
+                    },
+                    {
+                      "const": "choice5",
+                      "description": "Choose 5"
+                    },
+                    {
+                      "const": "choice6",
+                      "description": "Choose 6"
+                    },
+                    {
+                      "const": "choice7",
+                      "description": "Choose 7"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      },
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
+        "tools": [
+          {
+            "name": "enum_test",
+            "type": "function",
+            "parameters": {
+              "properties": {
+                "mode": {
+                  "enum": [
+                    "choice0",
+                    "choice1",
+                    "choice2",
+                    "choice3",
+                    "choice4",
+                    "choice5",
+                    "choice6",
+                    "choice7"
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            "strict": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "executor-duplicate-union-preserved",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ],
+        "tools": [
+          {
+            "name": "enum_test",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "mode": {
+                  "oneOf": [
+                    {
+                      "const": "choice0",
+                      "description": "Choose 0"
+                    },
+                    {
+                      "const": "choice1",
+                      "description": "Choose 1"
+                    },
+                    {
+                      "const": "choice2",
+                      "description": "Choose 2"
+                    },
+                    {
+                      "const": "choice3",
+                      "description": "Choose 3"
+                    },
+                    {
+                      "const": "choice4",
+                      "description": "Choose 4"
+                    },
+                    {
+                      "const": "choice5",
+                      "description": "Choose 5"
+                    },
+                    {
+                      "const": "choice6",
+                      "description": "Choose 6"
+                    },
+                    {
+                      "const": "choice0",
+                      "description": "Choose 0"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      },
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
+        "tools": [
+          {
+            "name": "enum_test",
+            "type": "function",
+            "parameters": {
+              "properties": {
+                "mode": {
+                  "oneOf": [
+                    {
+                      "const": "choice0",
+                      "description": "Choose 0"
+                    },
+                    {
+                      "const": "choice1",
+                      "description": "Choose 1"
+                    },
+                    {
+                      "const": "choice2",
+                      "description": "Choose 2"
+                    },
+                    {
+                      "const": "choice3",
+                      "description": "Choose 3"
+                    },
+                    {
+                      "const": "choice4",
+                      "description": "Choose 4"
+                    },
+                    {
+                      "const": "choice5",
+                      "description": "Choose 5"
+                    },
+                    {
+                      "const": "choice6",
+                      "description": "Choose 6"
+                    },
+                    {
+                      "const": "choice0",
+                      "description": "Choose 0"
+                    }
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            "strict": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "executor-constrained-enum-preserved",
+      "request": {
+        "model": "claude-sonnet",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hello"
+          }
+        ],
+        "tools": [
+          {
+            "name": "enum_test",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "mode": {
+                  "oneOf": [
+                    {
+                      "const": "choice0",
+                      "description": "Choose 0"
+                    },
+                    {
+                      "const": "choice1",
+                      "description": "Choose 1"
+                    },
+                    {
+                      "const": "choice2",
+                      "description": "Choose 2"
+                    },
+                    {
+                      "const": "choice3",
+                      "description": "Choose 3"
+                    },
+                    {
+                      "const": "choice4",
+                      "description": "Choose 4"
+                    },
+                    {
+                      "const": "choice5",
+                      "description": "Choose 5"
+                    },
+                    {
+                      "const": "choice6",
+                      "description": "Choose 6"
+                    },
+                    {
+                      "const": "choice7",
+                      "description": "Choose 7"
+                    }
+                  ],
+                  "enum": ["choice0"]
+                }
+              }
+            }
+          }
+        ]
+      },
+      "expectedRequest": {
+        "model": "gpt-6-sol",
+        "instructions": "",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "effort": "medium"
+        },
+        "stream": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
+        "tools": [
+          {
+            "name": "enum_test",
+            "type": "function",
+            "parameters": {
+              "properties": {
+                "mode": {
+                  "enum": ["choice0"],
+                  "oneOf": [
+                    {
+                      "const": "choice0",
+                      "description": "Choose 0"
+                    },
+                    {
+                      "const": "choice1",
+                      "description": "Choose 1"
+                    },
+                    {
+                      "const": "choice2",
+                      "description": "Choose 2"
+                    },
+                    {
+                      "const": "choice3",
+                      "description": "Choose 3"
+                    },
+                    {
+                      "const": "choice4",
+                      "description": "Choose 4"
+                    },
+                    {
+                      "const": "choice5",
+                      "description": "Choose 5"
+                    },
+                    {
+                      "const": "choice6",
+                      "description": "Choose 6"
+                    },
+                    {
+                      "const": "choice7",
+                      "description": "Choose 7"
+                    }
+                  ]
+                }
+              },
+              "type": "object"
+            },
+            "strict": false
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -202,7 +202,7 @@ describe('Codex gateway HTTP boundary', () => {
     });
   });
 
-  test('accepts SDK system reminders and promotes them without making user input', async () => {
+  test('preserves SDK system reminders at their conversation position', async () => {
     const response = await request({
       model: 'claude-sonnet-4-6',
       system: [
@@ -237,14 +237,29 @@ describe('Codex gateway HTTP boundary', () => {
     expect(response.status).toBe(200);
     await response.text();
     const body = JSON.parse(mocks.fetch.mock.calls[0][1].body);
-    expect(body.instructions).toBe(
-      'You are an assistant with Bash.\n\n<system-reminder>Use Bash.</system-reminder>',
-    );
+    expect(body.instructions).toBe('');
     expect(body.input).toEqual([
+      {
+        type: 'message',
+        role: 'developer',
+        content: [
+          { type: 'input_text', text: 'You are an assistant with Bash.' },
+        ],
+      },
       {
         type: 'message',
         role: 'user',
         content: [{ type: 'input_text', text: 'Read README.' }],
+      },
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: '<system-reminder>\n<system-reminder>Use Bash.</system-reminder>\n</system-reminder>',
+          },
+        ],
       },
     ]);
     expect(body.tools[0].name).toBe('Bash');
@@ -301,7 +316,7 @@ describe('Codex gateway HTTP boundary', () => {
       type: 'function_call_output',
       call_id: 'screen',
     });
-    expect(translated.input[2].content).toContainEqual({
+    expect(translated.input[1].output).toContainEqual({
       type: 'input_image',
       image_url: 'data:image/png;base64,c2NyZWVu',
     });

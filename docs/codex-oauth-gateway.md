@@ -57,14 +57,21 @@ during refresh is checked again before serving the request.
 
 ### Protocol and operating limits
 
-- Text, base64 images, function tools and SSE/nonstream responses are
-  translated into the Codex backend's Responses format. A screenshot inside
-  a tool result is carried as an adjacent user image message labelled with
-  the originating tool call ID. Gateway-issued encrypted reasoning
-  signatures are replayed on later tool turns.
-- Cached Responses input is subtracted from Anthropic `input_tokens` and
-  reported separately as `cache_read_input_tokens`. Their sum is the actual
-  input count used by usage history, token quotas and billing.
+- Text, base64 images/PDFs, function tools, native web search and structured
+  JSON output are translated into Codex Responses. Multimodal tool results
+  keep their images inside the matching `function_call_output`. Long MCP
+  names are mapped to unique short names and restored for the SDK.
+- Top-level system text becomes developer input; SDK system reminders retain
+  their position in the conversation, following matching tool results.
+- Interleaved upstream tool arguments are buffered into serial Anthropic
+  content blocks. Delta/done snapshots do not duplicate arguments; final
+  output snapshots fill missing content. Native encrypted reasoning signatures
+  pass through `thinking.signature`; previous HappyClaw envelopes remain
+  readable. Both streaming and nonstream responses use the same converter.
+- Cached and cache-write Responses input is subtracted from Anthropic
+  `input_tokens` and reported separately as `cache_read_input_tokens` and
+  `cache_creation_input_tokens`. Reasoning usage is preserved as a detail of
+  output usage. Cache and reasoning details must not be counted twice.
 - Authentication runs before body buffering or rate-counter allocation.
   Each authenticated provider has 120 requests per 60-second window, shared
   across its gateway-key rotations. Rate state has a hard capacity of 1,024
@@ -78,7 +85,17 @@ during refresh is checked again before serving the request.
   pauses upstream reading, and cancellation disconnects the upstream stream.
 - Success logs record model and usage counts. Upstream HTTP error bodies are
   cancelled without being buffered or logged; they can contain user content
-  or secrets.
+  or secrets. HTTP authentication, permission and rate-limit failures retain
+  their Anthropic error types and valid `Retry-After` hints. Semantic terminal
+  events close the upstream reader without waiting for the HTTP connection
+  to close. Malformed SSE fails the request.
+
+The protocol implementation is ported from
+[CLIProxyAPI a2976eb8](https://github.com/router-for-me/CLIProxyAPI/tree/a2976eb8a303f11b4ea5177bce9f9ff752634dfc).
+See [the compatibility matrix](codex-protocol-compatibility.md) for the source
+functions, differential corpus, intentional runtime differences and remaining
+verification boundaries. Its [MIT notice](licenses/CLIProxyAPI-MIT.txt) is
+included with the port.
 
 ### Verify and recover
 

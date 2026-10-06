@@ -1,23 +1,24 @@
-// ─── ChatGPT/Codex 订阅 — Anthropic Messages → Responses 请求翻译 ──
-//
-// 纯函数，可独立单测。翻译规则参考 OpenAI Responses API 公开规范与
-// ccproxy-api codex 插件的实战经验：
-// - top-level system and SDK system-role messages → instructions
-// - tool_use/tool_result → function_call/function_call_output（call_id 原样透传）
-// - 上游强制 stream=true + store=false；剔除 metadata/temperature/max_tokens
-//   （chatgpt.com backend 对这些参数直接返回 Unsupported parameter）。
+// Ported from CLIProxyAPI a2976eb8; see docs/licenses/CLIProxyAPI-MIT.txt.
+// Anthropic Messages → Codex Responses request compatibility.
+// Reference: CLIProxyAPI's Codex/Claude translator (MIT); keep tool identity,
+// multimodal order, and tool-result adjacency consistent across both protocols.
+
+import { createHash } from 'node:crypto';
 
 import { decodeReasoningSignature } from './reasoning-signature.js';
 
 type Json = Record<string, unknown>;
 
-/** Anthropic Messages 请求中我们关心的字段子集（宽松解析，未知字段丢弃）。 */
 export interface AnthropicRequestSubset {
   model?: string;
   system?: string | Array<Json>;
   messages?: Array<Json>;
   tools?: Array<Json>;
   tool_choice?: Json;
+  thinking?: Json;
+  output_config?: Json;
+  service_tier?: string;
+  speed?: string;
 }
 
 export interface ResponsesRequest {
@@ -26,255 +27,601 @@ export interface ResponsesRequest {
   input: Array<Json>;
   tools?: Array<Json>;
   tool_choice?: Json | 'auto' | 'none' | 'required';
+  parallel_tool_calls?: boolean;
   reasoning?: { effort: string; summary: 'auto' };
+  text?: { format: Json };
+  service_tier?: 'priority';
   include?: string[];
   store: false;
   stream: true;
 }
 
+function isRecord(value: unknown): value is Json {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 function contentBlocks(content: unknown): Array<Json> {
-  if (typeof content === 'string') {
-    return [{ type: 'text', text: content }];
+  if (typeof content === 'string') return [{ type: 'text', text: content }];
+  return Array.isArray(content) ? content.filter(isRecord) : [];
+}
+
+function systemTextParts(content: unknown): string[] {
+  return contentBlocks(content)
+    .filter((block) => block.type === 'text' && typeof block.text === 'string')
+    .map((block) => block.text as string)
+    .filter(
+      (text) =>
+        text.length > 0 &&
+        !text.trimStart().startsWith('x-anthropic-billing-header:'),
+    );
+}
+
+function truncateUtf8(value: string, limit: number): string {
+  let result = '';
+  let bytes = 0;
+  for (const char of value) {
+    const size = Buffer.byteLength(char);
+    if (bytes + size > limit) break;
+    result += char;
+    bytes += size;
   }
-  return Array.isArray(content) ? content : [];
+  return result;
 }
 
-function systemToInstructions(
-  system: AnthropicRequestSubset['system'],
-): string {
-  if (!system) return '';
-  if (typeof system === 'string') return system;
-  return system
-    .map((block) => (typeof block.text === 'string' ? block.text : ''))
-    .filter((text) => text.length > 0)
-    .join('\n\n');
+function shortenToolName(name: string): string {
+  if (Buffer.byteLength(name) <= 64) return name;
+  if (name.startsWith('mcp__')) {
+    const separator = name.lastIndexOf('__');
+    if (separator > 0)
+      return truncateUtf8(`mcp__${name.slice(separator + 2)}`, 64);
+  }
+  return truncateUtf8(name, 64);
 }
 
-function toolResultToText(content: unknown): string {
-  if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) return '';
-  return content
-    .map((block) => {
-      const record = block as Json;
-      if (record.type === 'text' && typeof record.text === 'string') {
-        return record.text;
+/** The response converter must invert this same request-local mapping. */
+export function buildCodexToolNameMap(
+  tools?: Array<Json>,
+): Map<string, string> {
+  const names = new Map<string, string>();
+  const used = new Set<string>();
+  for (const tool of tools ?? []) {
+    if (typeof tool.name !== 'string' || !tool.name || names.has(tool.name))
+      continue;
+    const base = shortenToolName(tool.name);
+    let candidate = base;
+    for (let suffix = 1; used.has(candidate); suffix++) {
+      const ending = `_${suffix}`;
+      candidate = `${truncateUtf8(base, 64 - Buffer.byteLength(ending))}${ending}`;
+    }
+    names.set(tool.name, candidate);
+    used.add(candidate);
+  }
+  return names;
+}
+
+/** Both function_call and function_call_output must share this stable identity. */
+export function shortenCodexCallId(id: string): string {
+  if (Buffer.byteLength(id) <= 64) return id;
+  const suffix = `_${createHash('sha256').update(id).digest('hex').slice(0, 16)}`;
+  return `${truncateUtf8(id, 64 - suffix.length)}${suffix}`;
+}
+
+const SCHEMA_MAP_KEYS = [
+  'properties',
+  '$defs',
+  'definitions',
+  'patternProperties',
+  'dependentSchemas',
+  'dependencies',
+];
+const SCHEMA_VALUE_KEYS = [
+  'items',
+  'prefixItems',
+  'contains',
+  'additionalProperties',
+  'propertyNames',
+  'unevaluatedProperties',
+  'unevaluatedItems',
+  'additionalItems',
+  'contentSchema',
+  'anyOf',
+  'oneOf',
+  'allOf',
+  'not',
+  'if',
+  'then',
+  'else',
+];
+
+function hasUnsupportedPattern(pattern: string): boolean {
+  for (let i = 0; i < pattern.length; i++) {
+    if (pattern[i] !== '\\') continue;
+    const next = pattern[++i];
+    if (
+      next === '0' ||
+      ((next === 'p' || next === 'P') && pattern[i + 1] === '{')
+    )
+      return true;
+  }
+  return false;
+}
+
+/** Visit schema positions only: property names and default/enum literals are data. */
+function visitSchemas(root: Json, visitor: (schema: Json) => void): void {
+  const pending: unknown[] = [root];
+  while (pending.length) {
+    const current = pending.pop();
+    if (Array.isArray(current)) {
+      for (const child of current) pending.push(child);
+      continue;
+    }
+    if (!isRecord(current)) continue;
+    visitor(current);
+    for (const key of SCHEMA_MAP_KEYS) {
+      const children = current[key];
+      if (isRecord(children)) {
+        for (const child of Object.values(children)) pending.push(child);
       }
-      return '';
-    })
-    .filter(Boolean)
-    .join('\n');
+    }
+    for (const key of SCHEMA_VALUE_KEYS) pending.push(current[key]);
+  }
 }
 
-function imageToInputImage(source: Json): Json | null {
-  if (source.type !== 'base64' || typeof source.data !== 'string') {
-    return null; // URL 型图片源：Codex backend 仅接受 data URL，跳过
+function scalarConstKey(value: unknown): string | undefined {
+  if (value === null) return 'null';
+  if (typeof value === 'string') return `string:${value}`;
+  if (typeof value === 'boolean') return `boolean:${value}`;
+  if (
+    typeof value === 'number' &&
+    Number.isFinite(value) &&
+    Math.abs(value) <= Number.MAX_SAFE_INTEGER
+  )
+    return `number:${value}`;
+  return undefined;
+}
+
+/** CPA executor compacts only direct function-parameter property schemas. */
+function compactConstUnions(parameters: Json): void {
+  if (!isRecord(parameters.properties)) return;
+  for (const property of Object.values(parameters.properties)) {
+    if (!isRecord(property)) continue;
+    const hasOne = Object.hasOwn(property, 'oneOf');
+    const hasAny = Object.hasOwn(property, 'anyOf');
+    if (hasOne === hasAny) continue;
+    const keyword = hasOne ? 'oneOf' : 'anyOf';
+    const branches = property[keyword];
+    if (!Array.isArray(branches) || branches.length < 8) continue;
+    const values: unknown[] = [];
+    const keys = new Set<string>();
+    for (const branch of branches) {
+      if (
+        !isRecord(branch) ||
+        !Object.hasOwn(branch, 'const') ||
+        Object.keys(branch).some(
+          (key) => !['const', 'description', 'title'].includes(key),
+        )
+      )
+        break;
+      const key = scalarConstKey(branch.const);
+      if (key === undefined || keys.has(key)) break;
+      keys.add(key);
+      values.push(branch.const);
+    }
+    if (values.length !== branches.length) continue;
+    if (Object.hasOwn(property, 'enum')) {
+      if (
+        !Array.isArray(property.enum) ||
+        property.enum.length !== values.length
+      )
+        continue;
+      const enumKeys = property.enum.map(scalarConstKey);
+      if (
+        enumKeys.some((key) => key === undefined || !keys.has(key)) ||
+        new Set(enumKeys).size !== keys.size
+      )
+        continue;
+      // Keep the existing equivalent enum's order and remove only redundancy.
+    } else property.enum = values;
+    delete property[keyword];
   }
-  const mediaType =
-    typeof source.media_type === 'string' ? source.media_type : 'image/png';
+}
+
+function normalizeToolParameters(value: unknown): Json {
+  const root: Json = isRecord(value)
+    ? JSON.parse(JSON.stringify(value))
+    : { type: 'object', properties: {} };
+  visitSchemas(root, (schema) => {
+    delete schema.$schema;
+    delete schema.$id;
+    if (
+      typeof schema.pattern === 'string' &&
+      hasUnsupportedPattern(schema.pattern)
+    )
+      delete schema.pattern;
+    if (isRecord(schema.patternProperties)) {
+      for (const pattern of Object.keys(schema.patternProperties)) {
+        if (hasUnsupportedPattern(pattern))
+          delete schema.patternProperties[pattern];
+      }
+    }
+  });
+  if (root.type === undefined || root.type === null || root.type === '')
+    root.type = 'object';
+  if (
+    (root.type === 'object' ||
+      (Array.isArray(root.type) && root.type.includes('object'))) &&
+    root.properties == null
+  )
+    root.properties = {};
+  compactConstUnions(root);
+  return root;
+}
+
+function imageToInputImage(source: unknown): Json | null {
+  if (
+    !isRecord(source) ||
+    source.type !== 'base64' ||
+    typeof source.data !== 'string'
+  )
+    return null;
   return {
     type: 'input_image',
-    image_url: `data:${mediaType};base64,${source.data}`,
+    image_url: `data:${source.media_type};base64,${source.data}`,
   };
 }
 
-function messageToInputItems(message: Json): Array<Json> {
-  const role = message.role === 'assistant' ? 'assistant' : 'user';
-  const items: Array<Json> = [];
-  const textParts: Array<Json> = [];
-  const imageParts: Array<Json> = [];
-
-  const flushTextMessage = (): void => {
-    if (textParts.length === 0 && imageParts.length === 0) return;
-    const content: Array<Json> = [];
-    if (textParts.length > 0) {
-      content.push({
-        type: role === 'user' ? 'input_text' : 'output_text',
-        text: textParts.map((part) => part.text).join(''),
-      });
-    }
-    content.push(...imageParts);
-    items.push({ type: 'message', role, content });
-    textParts.length = 0;
-    imageParts.length = 0;
+function documentToInputFile(source: unknown): Json | null {
+  if (
+    !isRecord(source) ||
+    source.type !== 'base64' ||
+    source.media_type !== 'application/pdf' ||
+    typeof source.data !== 'string'
+  )
+    return null;
+  return {
+    type: 'input_file',
+    file_data: `data:application/pdf;base64,${source.data}`,
+    filename: 'document.pdf',
   };
+}
 
-  for (const rawBlock of contentBlocks(message.content)) {
-    switch (rawBlock.type) {
-      case 'text': {
-        if (typeof rawBlock.text === 'string' && rawBlock.text.length > 0) {
-          textParts.push(rawBlock);
-        }
+function alignToolResults(
+  blocks: Array<Json>,
+  pendingIds: string[],
+): Array<Json> {
+  const results = blocks.filter((block) => block.type === 'tool_result');
+  if (!pendingIds.length || results.length !== pendingIds.length) return blocks;
+  const byId = new Map<string, Json>();
+  for (const result of results) {
+    if (typeof result.tool_use_id !== 'string' || byId.has(result.tool_use_id))
+      return blocks;
+    byId.set(result.tool_use_id, result);
+  }
+  if (
+    new Set(pendingIds).size !== pendingIds.length ||
+    pendingIds.some((id) => !byId.has(id))
+  )
+    return blocks;
+  let index = 0;
+  return blocks.map((block) =>
+    block.type === 'tool_result' ? byId.get(pendingIds[index++])! : block,
+  );
+}
+
+function toolResultOutput(content: unknown): unknown {
+  if (typeof content === 'string') return content;
+  const converted: Json[] = [];
+  for (const block of contentBlocks(content)) {
+    if (block.type === 'text' && typeof block.text === 'string')
+      converted.push({ type: 'input_text', text: block.text });
+    if (block.type === 'image') {
+      const image = imageToInputImage(block.source);
+      if (image) converted.push(image);
+    }
+  }
+  return converted.length ? converted : '';
+}
+
+function messageToInputItems(
+  message: Json,
+  blocks: Array<Json>,
+  names: Map<string, string>,
+  reminders: Json[],
+): Array<Json> {
+  const role = message.role === 'assistant' ? 'assistant' : 'user';
+  const items: Json[] = [];
+  let content: Json[] = [];
+  const flush = (): void => {
+    if (!content.length) return;
+    items.push({ type: 'message', role, content });
+    content = [];
+  };
+  const flushReminders = (): void => {
+    if (!reminders.length) return;
+    flush();
+    items.push(...reminders.splice(0));
+  };
+  for (const block of blocks) {
+    switch (block.type) {
+      case 'text':
+        if (Array.isArray(message.content)) flushReminders();
+        if (typeof block.text === 'string')
+          content.push({
+            type: role === 'assistant' ? 'output_text' : 'input_text',
+            text: block.text,
+          });
+        break;
+      case 'image': {
+        flushReminders();
+        const image = imageToInputImage(block.source);
+        if (image) content.push(image);
         break;
       }
-      case 'image': {
-        const converted = imageToInputImage((rawBlock.source ?? {}) as Json);
-        if (converted) imageParts.push(converted);
+      case 'document': {
+        flushReminders();
+        const document = documentToInputFile(block.source);
+        if (document) content.push(document);
         break;
       }
       case 'thinking': {
-        // store=false 模式下，上一轮的 reasoning item（encrypted_content）
-        // 必须随 function_call 一起回放，否则上游 400。本网关把它编码在
-        // thinking.signature 里；非本网关签发的签名一律跳过。
-        const signature = decodeReasoningSignature(rawBlock.signature);
+        if (role !== 'assistant') break;
+        const signature = decodeReasoningSignature(block.signature);
         if (!signature) break;
-        flushTextMessage();
-        const reasoningItem: Json = {
+        flush();
+        // Stateless encrypted reasoning is replayed without stale item IDs.
+        items.push({
           type: 'reasoning',
           summary: [],
+          content: null,
           encrypted_content: signature.encryptedContent,
-        };
-        if (signature.id) reasoningItem.id = signature.id;
-        items.push(reasoningItem);
+        });
         break;
       }
-      case 'redacted_thinking': {
-        break;
-      }
-      case 'tool_use': {
-        flushTextMessage();
-        if (typeof rawBlock.name !== 'string' || !rawBlock.name) break;
+      case 'tool_use':
+        flush();
+        if (typeof block.name !== 'string' || typeof block.id !== 'string')
+          break;
         items.push({
           type: 'function_call',
-          call_id:
-            typeof rawBlock.id === 'string' ? rawBlock.id : rawBlock.name,
-          name: rawBlock.name,
-          arguments: JSON.stringify(rawBlock.input ?? {}),
+          call_id: shortenCodexCallId(block.id),
+          name: names.get(block.name) ?? shortenToolName(block.name),
+          arguments: JSON.stringify(block.input ?? {}),
         });
         break;
-      }
-      case 'tool_result': {
-        flushTextMessage();
-        if (typeof rawBlock.tool_use_id !== 'string') break;
-        const images = contentBlocks(rawBlock.content)
-          .filter((block) => block.type === 'image')
-          .map((block) => imageToInputImage((block.source ?? {}) as Json))
-          .filter((image): image is Json => image !== null);
-        const text = toolResultToText(rawBlock.content);
+      case 'tool_result':
+        flush();
+        if (typeof block.tool_use_id !== 'string') break;
         items.push({
           type: 'function_call_output',
-          call_id: rawBlock.tool_use_id,
-          output: text || (images.length ? 'Image result follows.' : ''),
+          call_id: shortenCodexCallId(block.tool_use_id),
+          output: toolResultOutput(block.content),
         });
-        if (images.length) {
-          // Codex's function output remains a string. Carry screenshots in the
-          // adjacent user message and identify their originating tool call.
-          items.push({
-            type: 'message',
-            role: 'user',
-            content: [
-              {
-                type: 'input_text',
-                text: `Images from tool result ${rawBlock.tool_use_id}:`,
-              },
-              ...images,
-            ],
-          });
-        }
         break;
-      }
-      default:
+      // Server-executed search and foreign/redacted thinking are not client calls.
+      case 'server_tool_use':
+      case 'web_search_tool_result':
+      case 'redacted_thinking':
         break;
     }
   }
-  flushTextMessage();
+  flush();
+  flushReminders();
   return items;
 }
 
-function convertTools(tools: Array<Json>): Array<Json> {
-  return tools
-    .filter((tool) => typeof tool.name === 'string')
-    .map((tool) => ({
+function isWebSearchTool(tool: Json): boolean {
+  return (
+    tool.type === 'web_search_20250305' || tool.type === 'web_search_20260209'
+  );
+}
+
+function convertTools(
+  tools: Array<Json>,
+  names: Map<string, string>,
+): Array<Json> {
+  return tools.map((tool) => {
+    if (isWebSearchTool(tool)) {
+      const converted: Json = { type: 'web_search' };
+      if (Array.isArray(tool.allowed_domains))
+        converted.filters = { allowed_domains: tool.allowed_domains };
+      if (isRecord(tool.user_location))
+        converted.user_location = tool.user_location;
+      return converted;
+    }
+    return {
       type: 'function',
-      name: tool.name,
-      description: typeof tool.description === 'string' ? tool.description : '',
-      parameters: (tool.input_schema ?? {
-        type: 'object',
-        properties: {},
-      }) as Json,
+      name:
+        names.get(tool.name as string) ?? shortenToolName(tool.name as string),
+      ...(typeof tool.description === 'string'
+        ? { description: tool.description }
+        : {}),
+      parameters: normalizeToolParameters(tool.input_schema),
       strict: false,
-    }));
+    };
+  });
 }
 
 function convertToolChoice(
   choice: Json | undefined,
-): Json | 'auto' | 'none' | 'required' | undefined {
-  if (!choice) return undefined;
-  switch (choice.type) {
-    case 'auto':
-      return 'auto';
+  names: Map<string, string>,
+  tools: Array<Json>,
+): Json | 'auto' | 'none' | 'required' {
+  switch (choice?.type) {
     case 'any':
       return 'required';
     case 'none':
       return 'none';
-    case 'tool':
-      return typeof choice.name === 'string'
-        ? { type: 'function', name: choice.name }
+    case 'tool': {
+      if (
+        tools.some((tool) => isWebSearchTool(tool) && tool.name === choice.name)
+      )
+        return { type: 'web_search' };
+      const name = typeof choice.name === 'string' ? choice.name : '';
+      return name
+        ? { type: 'function', name: names.get(name) ?? shortenToolName(name) }
         : 'auto';
+    }
     default:
-      return undefined;
+      return 'auto';
   }
 }
 
 export interface AnthropicToResponsesOptions {
-  /** provider 配置的目标 Codex 模型（gpt-6-sol 等）。 */
   targetModel: string;
-  /** reasoning effort；provider customEnv 可覆盖。 */
+  /** Effective request effort, already clamped against the provider catalog. */
   reasoningEffort?: string;
   requestTools?: boolean;
 }
 
-/**
- * 归一 reasoning effort：GPT-6 模型目录已移除 minimal 档（实测上游 400），
- * 历史配置里的 minimal 归到 low；未配置时用目录默认 medium。
- */
 export function normalizeCodexEffort(effort: string | undefined): string {
   if (!effort) return 'medium';
   return effort === 'minimal' ? 'low' : effort;
+}
+
+/** Explicit provider configuration wins; otherwise preserve the SDK's intent. */
+export function resolveCodexRequestEffort(
+  request: AnthropicRequestSubset,
+  configuredOverride?: string,
+): string {
+  if (configuredOverride?.trim())
+    return normalizeCodexEffort(configuredOverride.trim().toLowerCase());
+  switch (request.thinking?.type) {
+    case 'disabled':
+      return 'none';
+    case 'adaptive':
+    case 'auto': {
+      const effort = request.output_config?.effort;
+      return typeof effort === 'string' && effort.trim()
+        ? effort.trim().toLowerCase()
+        : 'xhigh';
+    }
+    case 'enabled': {
+      const budget = request.thinking.budget_tokens;
+      if (typeof budget !== 'number') break;
+      if (budget === -1) return 'auto';
+      if (budget === 0) return 'none';
+      if (budget <= 512) return 'minimal';
+      if (budget <= 1024) return 'low';
+      if (budget <= 8192) return 'medium';
+      if (budget <= 24576) return 'high';
+      return 'xhigh';
+    }
+  }
+  return 'medium';
+}
+
+function convertOutputFormat(
+  config: Json | undefined,
+): { format: Json } | undefined {
+  const format = config?.format;
+  if (
+    !isRecord(format) ||
+    format.type !== 'json_schema' ||
+    !isRecord(format.schema)
+  )
+    return undefined;
+  let strict = format.strict !== false;
+  visitSchemas(format.schema, (schema) => {
+    if (!isRecord(schema.properties)) return;
+    const required = new Set(
+      Array.isArray(schema.required) ? schema.required : [],
+    );
+    if (Object.keys(schema.properties).some((key) => !required.has(key)))
+      strict = false;
+  });
+  return {
+    format: {
+      type: 'json_schema',
+      name:
+        typeof format.name === 'string' && format.name
+          ? format.name
+          : 'cli_proxy_structured_output',
+      strict,
+      schema: JSON.parse(JSON.stringify(format.schema)),
+    },
+  };
 }
 
 export function anthropicToResponses(
   request: AnthropicRequestSubset,
   options: AnthropicToResponsesOptions,
 ): ResponsesRequest {
-  const input: Array<Json> = [];
-  const instructions = [systemToInstructions(request.system)];
+  const input: Json[] = [];
+  const names = buildCodexToolNameMap(request.tools);
+  const systemParts = systemTextParts(request.system);
+  if (systemParts.length)
+    input.push({
+      type: 'message',
+      role: 'developer',
+      content: systemParts.map((text) => ({ type: 'input_text', text })),
+    });
+  const reminders: Json[] = [];
+  let pendingToolUseIds: string[] = [];
   for (const message of request.messages ?? []) {
     if (message.role === 'system') {
-      // SDK reminders can follow the latest user input or tool result. They
-      // retain system priority and never become user text in Responses input.
-      instructions.push(
-        systemToInstructions(
-          message.content as AnthropicRequestSubset['system'],
-        ),
-      );
+      const text = systemTextParts(message.content).join('\n');
+      if (!text.trim()) continue;
+      const reminder = {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: `<system-reminder>\n${text}\n</system-reminder>`,
+          },
+        ],
+      };
+      if (pendingToolUseIds.length) reminders.push(reminder);
+      else input.push(reminder);
       continue;
     }
-    input.push(...messageToInputItems(message));
+    let blocks = contentBlocks(message.content);
+    if (message.role === 'user')
+      blocks = alignToolResults(blocks, pendingToolUseIds);
+    pendingToolUseIds = blocks
+      .filter(
+        (block) => block.type === 'tool_use' && typeof block.id === 'string',
+      )
+      .map((block) => block.id as string);
+    input.push(...messageToInputItems(message, blocks, names, reminders));
   }
-
-  const tools = request.tools ? convertTools(request.tools) : undefined;
-  const toolChoice = convertToolChoice(request.tool_choice);
-
+  input.push(...reminders);
+  const tools = request.tools?.length
+    ? convertTools(request.tools, names)
+    : undefined;
   const payload: ResponsesRequest = {
     model: options.targetModel,
-    instructions: instructions.filter((text) => text.length > 0).join('\n\n'),
+    instructions: '',
     input,
-    tools: tools && tools.length > 0 ? tools : undefined,
-    tool_choice: tools && tools.length > 0 ? toolChoice : undefined,
     reasoning: {
-      effort: normalizeCodexEffort(options.reasoningEffort),
+      effort: resolveCodexRequestEffort(request, options.reasoningEffort),
       summary: 'auto',
     },
     include: ['reasoning.encrypted_content'],
     store: false,
     stream: true,
   };
-
-  if (!payload.tools) {
-    delete payload.tools;
-    delete payload.tool_choice;
+  if (tools?.length) {
+    payload.tools = tools;
+    payload.tool_choice = convertToolChoice(
+      request.tool_choice,
+      names,
+      request.tools!,
+    );
+    payload.parallel_tool_calls =
+      request.tool_choice?.disable_parallel_tool_use !== true;
+    if (request.tools!.some(isWebSearchTool))
+      payload.include!.push('web_search_call.action.sources');
   }
-
+  const format = convertOutputFormat(request.output_config);
+  if (format) payload.text = format;
+  if (
+    request.speed === 'fast' ||
+    ['fast', 'priority'].includes(
+      request.service_tier?.trim().toLowerCase() ?? '',
+    )
+  )
+    payload.service_tier = 'priority';
   return payload;
 }
 

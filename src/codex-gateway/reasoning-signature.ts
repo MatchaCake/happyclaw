@@ -1,12 +1,35 @@
-// ─── ChatGPT/Codex 订阅网关 — reasoning 回放信封 ──────────────────
-//
-// 上游强制 store=false，工具循环第二轮必须把上一轮的 reasoning item
-// （encrypted_content + id）原样带回，否则 function_call 会被 400 拒绝。
-// Anthropic 协议里唯一会被 SDK 原样回传的载体是 thinking 块的
-// signature 字段，因此把这对值编码进 signature；前缀标记保证只回放
-// 本网关写入的信封，来自真实 Anthropic 的签名或损坏数据一律跳过。
+// Codex store=false reasoning continuity travels through thinking.signature.
+// Standard encrypted_content uses CLIProxyAPI's native Fernet-shaped format;
+// legacy codexrs1 envelopes remain readable for existing HappyClaw histories.
+// Ported from CLIProxyAPI a2976eb8. See docs/licenses/CLIProxyAPI-MIT.txt.
 
 const SIGNATURE_PREFIX = 'codexrs1_';
+const MAX_SIGNATURE_LENGTH = 32 * 1024 * 1024;
+
+/**
+ * CLIProxyAPI internal/signature/gpt_validation.go transport-shape check.
+ * This validates the Fernet envelope, not its authenticity or decryptability.
+ */
+export function isCodexReasoningSignature(signature: string): boolean {
+  if (
+    signature.length > MAX_SIGNATURE_LENGTH ||
+    !signature.startsWith('gAAAA') ||
+    !/^[A-Za-z0-9_-]+={0,2}$/.test(signature)
+  ) {
+    return false;
+  }
+  const unpadded = signature.replace(/=+$/, '');
+  if (unpadded.length % 4 === 1) return false;
+  if (signature.includes('=') && signature.length % 4 !== 0) return false;
+  const decoded = Buffer.from(signature, 'base64url');
+  const ciphertextLength = decoded.length - 1 - 8 - 16 - 32;
+  return (
+    decoded.length >= 73 &&
+    decoded[0] === 0x80 &&
+    ciphertextLength > 0 &&
+    ciphertextLength % 16 === 0
+  );
+}
 
 interface ReasoningSignaturePayload {
   /** 上游 reasoning item id（rs_...），可能缺失。 */
@@ -19,6 +42,11 @@ export function encodeReasoningSignature(
   payload: ReasoningSignaturePayload,
 ): string | null {
   if (!payload.encryptedContent) return null;
+  // Standard Codex signatures are carried verbatim, matching CLIProxyAPI.
+  // Retain the legacy envelope for already supported opaque backend payloads.
+  if (isCodexReasoningSignature(payload.encryptedContent)) {
+    return payload.encryptedContent;
+  }
   const json = JSON.stringify({
     v: 1,
     id: payload.id,
@@ -32,11 +60,22 @@ export function decodeReasoningSignature(
 ): ReasoningSignaturePayload | null {
   if (
     typeof signature !== 'string' ||
-    !signature.startsWith(SIGNATURE_PREFIX)
+    signature.length > MAX_SIGNATURE_LENGTH
   ) {
     return null;
   }
+  const normalized = signature.trim();
+  const raw = normalized.startsWith('gpt#') ? normalized.slice(4) : normalized;
+  if (isCodexReasoningSignature(raw)) {
+    return { id: null, encryptedContent: raw };
+  }
+  if (!signature.startsWith(SIGNATURE_PREFIX)) {
+    return null;
+  }
   try {
+    if (!/^[A-Za-z0-9_-]+$/.test(signature.slice(SIGNATURE_PREFIX.length))) {
+      return null;
+    }
     const json = Buffer.from(
       signature.slice(SIGNATURE_PREFIX.length),
       'base64url',

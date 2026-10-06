@@ -24,6 +24,17 @@ const upstreamKey = 'e2e-upstream-not-a-real-secret';
 const accountId = 'e2e-account';
 const model = 'gpt-6-sol';
 const callId = 'call_gateway_e2e';
+const parallelCallId = 'call_gateway_parallel';
+const longToolName = 'verify_' + 'protocol_'.repeat(9);
+const fullMcpName = 'mcp__compat__' + longToolName;
+const encryptedReasoning = Buffer.concat([
+  Buffer.from([0x80]),
+  Buffer.alloc(8),
+  Buffer.alloc(16, 3),
+  Buffer.alloc(32, 4),
+  Buffer.alloc(32, 5),
+]).toString('base64url');
+let mcpExecutions = 0;
 const toolMarker = 'CODEX_GATEWAY_TOOL_EXECUTED';
 const finalText = 'CODEX_GATEWAY_SDK_OK ✓';
 const command = `printf '${toolMarker}\\n' > codex-gateway-probe.txt && cat codex-gateway-probe.txt`;
@@ -72,7 +83,7 @@ async function jsonBody(request) {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
-function fixtureEvents(turn) {
+function fixtureEvents(turn, shortenedMcp) {
   const id = `resp_gateway_e2e_${turn}`;
   const usage =
     turn === 1
@@ -104,19 +115,113 @@ function fixtureEvents(turn) {
           role: 'assistant',
           content: [{ type: 'output_text', text: finalText, annotations: [] }],
         };
+  const reasoning = {
+    type: 'reasoning',
+    id: 'rs_gateway_e2e',
+    summary: [{ type: 'summary_text', text: 'Use Bash and MCP.' }],
+    encrypted_content: encryptedReasoning,
+  };
+  const parallel = {
+    type: 'function_call',
+    id: 'fc_parallel',
+    call_id: parallelCallId,
+    name: shortenedMcp,
+    arguments: JSON.stringify({ marker: 'MCP_PROTOCOL_OK' }),
+  };
+  const nativeSearch = {
+    type: 'web_search_call',
+    id: 'ws_gateway_e2e',
+    status: 'completed',
+    action: {
+      type: 'search',
+      query: 'controlled compatibility case',
+      sources: [
+        { url: 'https://example.invalid/protocol', title: 'Protocol fixture' },
+      ],
+    },
+  };
   return [
     {
       type: 'response.created',
       response: { id, model, status: 'in_progress' },
     },
+    ...(turn === 1
+      ? [
+          {
+            type: 'response.output_item.added',
+            output_index: 0,
+            item: { ...reasoning, summary: [] },
+          },
+          {
+            type: 'response.reasoning_summary_part.added',
+            item_id: reasoning.id,
+            summary_index: 0,
+          },
+          {
+            type: 'response.reasoning_summary_text.delta',
+            item_id: reasoning.id,
+            summary_index: 0,
+            delta: 'Use Bash and MCP.',
+          },
+          {
+            type: 'response.output_item.done',
+            output_index: 0,
+            item: reasoning,
+          },
+        ]
+      : []),
     {
       type: 'response.output_item.added',
-      output_index: 0,
+      output_index: turn === 1 ? 1 : 0,
       item:
         turn === 1 ? { ...output, arguments: '' } : { ...output, content: [] },
     },
+    ...(turn === 2
+      ? [
+          {
+            type: 'response.output_item.done',
+            output_index: 1,
+            item: nativeSearch,
+          },
+        ]
+      : []),
     ...(turn === 1
-      ? []
+      ? [
+          {
+            type: 'response.output_item.added',
+            output_index: 2,
+            item: { ...parallel, arguments: '' },
+          },
+          {
+            type: 'response.function_call_arguments.delta',
+            item_id: output.id,
+            output_index: 1,
+            delta: output.arguments.slice(0, 20),
+          },
+          {
+            type: 'response.function_call_arguments.delta',
+            item_id: parallel.id,
+            output_index: 2,
+            delta: parallel.arguments,
+          },
+          {
+            type: 'response.function_call_arguments.done',
+            item_id: parallel.id,
+            output_index: 2,
+            arguments: parallel.arguments,
+          },
+          {
+            type: 'response.output_item.done',
+            output_index: 2,
+            item: parallel,
+          },
+          {
+            type: 'response.function_call_arguments.delta',
+            item_id: output.id,
+            output_index: 1,
+            delta: output.arguments.slice(20),
+          },
+        ]
       : [
           {
             type: 'response.output_text.delta',
@@ -126,10 +231,21 @@ function fixtureEvents(turn) {
             delta: finalText,
           },
         ]),
-    { type: 'response.output_item.done', output_index: 0, item: output },
+    {
+      type: 'response.output_item.done',
+      output_index: turn === 1 ? 1 : 0,
+      item: output,
+    },
     {
       type: 'response.completed',
-      response: { id, model, status: 'completed', output: [output], usage },
+      response: {
+        id,
+        model,
+        status: 'completed',
+        output:
+          turn === 1 ? [reasoning, output, parallel] : [output, nativeSearch],
+        usage,
+      },
     },
   ];
 }
@@ -171,7 +287,33 @@ try {
       path.join(repository, 'node_modules/@hono/node-server/dist/index.mjs'),
     ).href
   );
-  const { query } = await import(pathToFileURL(sdkPath).href);
+  const { query, createSdkMcpServer, tool } = await import(
+    pathToFileURL(sdkPath).href
+  );
+  const { z } = await import(
+    pathToFileURL(path.join(repository, 'node_modules/zod/index.js')).href
+  );
+  const { writeFile } = await import('node:fs/promises');
+  const mcpServer = createSdkMcpServer({
+    name: 'compat',
+    version: '1.0.0',
+    tools: [
+      tool(
+        longToolName,
+        'Verify the protocol with a real SDK MCP handler',
+        { marker: z.string() },
+        async ({ marker }) => {
+          assert.equal(marker, 'MCP_PROTOCOL_OK');
+          mcpExecutions++;
+          await writeFile(
+            path.join(workspace, 'mcp-gateway-probe.txt'),
+            marker,
+          );
+          return { content: [{ type: 'text', text: marker }] };
+        },
+      ),
+    ],
+  });
   const { createProvider, getProviders } = await import(
     pathToFileURL(path.join(repository, 'dist/runtime-config.js')).href
   );
@@ -216,16 +358,44 @@ try {
       assert.equal(request.headers.authorization, `Bearer ${upstreamKey}`);
       assert.equal(request.headers['chatgpt-account-id'], accountId);
       const body = await jsonBody(request);
+      check(
+        'realSdkStableSessionCache',
+        typeof body.prompt_cache_key === 'string' &&
+          request.headers['session-id'] === body.prompt_cache_key &&
+          (!upstreamRequests.length ||
+            upstreamRequests[0].prompt_cache_key === body.prompt_cache_key),
+      );
       upstreamRequests.push(body);
       assert.ok(upstreamRequests.length <= 2, 'exactly two model turns');
+      const shortenedMcp = body.tools?.find((entry) =>
+        entry.name.includes('verify_'),
+      )?.name;
+      check(
+        'longMcpSchemaMapped',
+        typeof shortenedMcp === 'string' && shortenedMcp.length <= 64,
+      );
       if (upstreamRequests.length === 2) {
         const result = body.input.find(
           (item) =>
             item.type === 'function_call_output' && item.call_id === callId,
         );
+        const replay = body.input.find((item) => item.type === 'reasoning');
+        check(
+          'realSdkReasoningReplay',
+          replay?.encrypted_content === encryptedReasoning && !replay.id,
+        );
+        const mcpFeedback = body.input.find(
+          (item) =>
+            item.type === 'function_call_output' &&
+            item.call_id === parallelCallId,
+        );
+        check(
+          'upstreamReceivedMcpFeedback',
+          JSON.stringify(mcpFeedback?.output).includes('MCP_PROTOCOL_OK'),
+        );
         check(
           'upstreamReceivedBashFeedback',
-          result?.output?.includes(toolMarker),
+          JSON.stringify(result?.output).includes(toolMarker),
         );
       }
       response.writeHead(200, {
@@ -233,7 +403,7 @@ try {
         'Cache-Control': 'no-cache',
       });
       const wire = Buffer.from(
-        fixtureEvents(upstreamRequests.length)
+        fixtureEvents(upstreamRequests.length, shortenedMcp)
           .map(
             (event) =>
               `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
@@ -355,12 +525,12 @@ try {
       systemPrompt:
         'You are a controlled gateway compatibility test. Use the provided Bash tool and return the final response.',
       tools: ['Bash'],
-      allowedTools: ['Bash'],
+      allowedTools: ['Bash', fullMcpName],
       permissionMode: 'dontAsk',
       settingSources: [],
       skills: [],
       plugins: [],
-      mcpServers: {},
+      mcpServers: { compat: mcpServer },
       persistSession: false,
       maxTurns: 4,
       includePartialMessages: true,
@@ -433,7 +603,14 @@ try {
       const translatedSystemText = [
         upstreamRequests[turn].instructions,
         ...upstreamRequests[turn].input
-          .filter((item) => ['system', 'developer'].includes(item.role))
+          .filter(
+            (item) =>
+              ['system', 'developer'].includes(item.role) ||
+              (item.role === 'user' &&
+                item.content?.some((block) =>
+                  block.text?.includes('<system-reminder>'),
+                )),
+          )
           .flatMap((item) => item.content?.map((block) => block.text) ?? []),
       ].join('\n');
       return (
@@ -460,9 +637,33 @@ try {
     .filter((block) => block.type === 'tool_use');
   check(
     'sdkExecutedOneBash',
-    toolUses.length === 1 &&
-      toolUses[0].name === 'Bash' &&
-      toolUses[0].id === callId,
+    toolUses.length === 2 &&
+      toolUses.some((item) => item.name === 'Bash' && item.id === callId),
+  );
+  check(
+    'realLongMcpToolExecuted',
+    mcpExecutions === 1 &&
+      toolUses.some(
+        (item) => item.name === fullMcpName && item.id === parallelCallId,
+      ) &&
+      (await readFile(
+        path.join(workspace, 'mcp-gateway-probe.txt'),
+        'utf8',
+      )) === 'MCP_PROTOCOL_OK',
+  );
+  check(
+    'realSdkNativeWebSearchBlocks',
+    sdkMessages.some(
+      (message) =>
+        message.type === 'assistant' &&
+        message.message.content.some(
+          (block) =>
+            block.type === 'web_search_tool_result' &&
+            block.content?.some(
+              (entry) => entry.url === 'https://example.invalid/protocol',
+            ),
+        ),
+    ),
   );
   const result = sdkMessages.find((message) => message.type === 'result');
   check(

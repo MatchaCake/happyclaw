@@ -106,7 +106,7 @@ describe('normalizeCodexEffort', () => {
 });
 
 describe('anthropicToResponses', () => {
-  test('maps system prompt to instructions and text messages to input items', () => {
+  test('maps the system prompt to developer input and keeps user text', () => {
     const result = anthropicToResponses(
       {
         model: 'claude-haiku-4-5',
@@ -116,11 +116,16 @@ describe('anthropicToResponses', () => {
       { targetModel: 'gpt-5.1-codex' },
     );
 
-    expect(result.instructions).toBe('You are helpful.');
+    expect(result.instructions).toBe('');
     expect(result.model).toBe('gpt-5.1-codex');
     expect(result.stream).toBe(true);
     expect(result.store).toBe(false);
     expect(result.input).toEqual([
+      {
+        type: 'message',
+        role: 'developer',
+        content: [{ type: 'input_text', text: 'You are helpful.' }],
+      },
       {
         type: 'message',
         role: 'user',
@@ -174,7 +179,7 @@ describe('anthropicToResponses', () => {
     ]);
   });
 
-  test('retains system priority across SDK text reminders and the tool-result round', () => {
+  test('preserves SDK reminder positions across the tool-result round', () => {
     const result = anthropicToResponses(
       {
         system: [
@@ -216,14 +221,30 @@ describe('anthropicToResponses', () => {
       },
       { targetModel: 'gpt-6-sol' },
     );
-    expect(result.instructions).toBe(
-      'Base instructions.\n\nWorkspace instructions.\n\nBefore-tool reminder.\n\nAfter-tool reminder.\n\nFollow-up reminder.',
-    );
+    expect(result.instructions).toBe('');
     expect(result.input).toEqual([
+      {
+        type: 'message',
+        role: 'developer',
+        content: [
+          { type: 'input_text', text: 'Base instructions.' },
+          { type: 'input_text', text: 'Workspace instructions.' },
+        ],
+      },
       {
         type: 'message',
         role: 'user',
         content: [{ type: 'input_text', text: 'Use Bash.' }],
+      },
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: '<system-reminder>\nBefore-tool reminder.\n</system-reminder>',
+          },
+        ],
       },
       {
         type: 'function_call',
@@ -231,7 +252,21 @@ describe('anthropicToResponses', () => {
         name: 'Bash',
         arguments: '{"command":"printf hello"}',
       },
-      { type: 'function_call_output', call_id: 'call_bash', output: 'hello' },
+      {
+        type: 'function_call_output',
+        call_id: 'call_bash',
+        output: [{ type: 'input_text', text: 'hello' }],
+      },
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: '<system-reminder>\nAfter-tool reminder.\nFollow-up reminder.\n</system-reminder>',
+          },
+        ],
+      },
     ]);
   });
 
@@ -540,7 +575,12 @@ describe('anthropicToResponses reasoning replay (P0-2)', () => {
         role: 'user',
         content: [{ type: 'input_text', text: 'run the tool' }],
       },
-      { type: 'reasoning', id: 'rs_1', summary: [], encrypted_content: 'ENC1' },
+      {
+        type: 'reasoning',
+        content: null,
+        summary: [],
+        encrypted_content: 'ENC1',
+      },
       {
         type: 'function_call',
         call_id: 'call_1',
@@ -612,7 +652,7 @@ describe('anthropicToResponses reasoning replay (P0-2)', () => {
     expect(nextRequest.input).toEqual([
       {
         type: 'reasoning',
-        id: 'rs_rt',
+        content: null,
         summary: [],
         encrypted_content: 'ENC-RT',
       },
@@ -680,18 +720,14 @@ describe('multimodal tool result round trip', () => {
       expect(request.input[1]).toEqual({
         type: 'function_call_output',
         call_id: 'call-screen',
-        output: withText
-          ? 'Captured the active window'
-          : 'Image result follows.',
-      });
-      expect(request.input[2]).toEqual({
-        type: 'message',
-        role: 'user',
-        content: [
-          { type: 'input_text', text: 'Images from tool result call-screen:' },
+        output: [
+          ...(withText
+            ? [{ type: 'input_text', text: 'Captured the active window' }]
+            : []),
           { type: 'input_image', image_url: 'data:image/png;base64,c2NyZWVu' },
         ],
       });
+      expect(request.input).toHaveLength(2);
     },
   );
 });
