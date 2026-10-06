@@ -10,6 +10,7 @@ import * as replySource from '../src/channel-reply-source.js';
 import { resolveContainerOutputInputTurnId } from '../src/channel-output-correlation.js';
 import { stripRedundantCompletionPreamble } from '../src/reply-finalization.js';
 import { TurnOutputCoordinator } from '../src/turn-output-coordinator.js';
+import { InputUsageProjection } from '../src/input-usage-projection.js';
 import { hasUnfinishedProactiveOutput } from '../src/turn-outcome.js';
 import { getChannelType } from '../src/im-channel.js';
 import { channelTurnScope } from '../src/channel-turn-registry.js';
@@ -57,7 +58,15 @@ function makeOutputRuntime(lane: 'main' | 'session') {
   const sendImWithRetry = vi.fn(async () => true);
   const broadcastNewMessage = vi.fn();
   const commitCursor = vi.fn();
+  const inputUsageProjection = new InputUsageProjection('initial-im-input');
+  inputUsageProjection.admit(inputId);
+  const agentInputUsageProjection = new InputUsageProjection(
+    'initial-im-input',
+  );
+  agentInputUsageProjection.admit(inputId);
   const globals: Record<string, any> = {
+    inputUsageProjection,
+    agentInputUsageProjection,
     ...replyDelivery,
     ...interactionRuntime,
     ...replySource,
