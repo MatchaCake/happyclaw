@@ -1181,6 +1181,31 @@ export function createFeishuConnection(
 
   let client: lark.Client | null = null;
   let wsClient: lark.WSClient | null = null;
+
+  // WSClient.start() resolves before the endpoint pull and WS handshake
+  // finish, and close() does not cancel that in-flight start attempt. A
+  // stop() or reconnect that retires the client inside the handshake window
+  // would otherwise leave a live, auto-reconnecting long connection that no
+  // stop()/disconnect path references any more. Close any client that
+  // reaches ready after it stopped being the current one.
+  function createWsClient(): lark.WSClient {
+    const created: lark.WSClient = new lark.WSClient({
+      appId: config.appId,
+      appSecret: config.appSecret,
+      loggerLevel: lark.LoggerLevel.info,
+      // Detect silently-dead long connections instead of hanging on a
+      // stale-but-OPEN socket (see FEISHU_WS_PING_TIMEOUT_SEC).
+      wsConfig: { pingTimeout: FEISHU_WS_PING_TIMEOUT_SEC },
+      onReady: () => {
+        if (wsClient === created) return;
+        logger.warn(
+          'Closing Feishu WS client that finished connecting after it was retired',
+        );
+        created.close({ force: true });
+      },
+    });
+    return created;
+  }
   let eventDispatcher: lark.EventDispatcher | null = null;
   let connectOptions: ConnectOptions | null = null;
   let botOpenId: string = '';
@@ -3744,14 +3769,7 @@ export function createFeishuConnection(
         }
       }
 
-      wsClient = new lark.WSClient({
-        appId: config.appId,
-        appSecret: config.appSecret,
-        loggerLevel: lark.LoggerLevel.info,
-        // Detect silently-dead long connections instead of hanging on a
-        // stale-but-OPEN socket (see FEISHU_WS_PING_TIMEOUT_SEC).
-        wsConfig: { pingTimeout: FEISHU_WS_PING_TIMEOUT_SEC },
-      });
+      wsClient = createWsClient();
       await wsClient.start({ eventDispatcher });
 
       lastWsStateConnected = true;
@@ -4032,14 +4050,7 @@ export function createFeishuConnection(
       });
 
       // Initialize WebSocket client
-      wsClient = new lark.WSClient({
-        appId: config.appId,
-        appSecret: config.appSecret,
-        loggerLevel: lark.LoggerLevel.info,
-        // Detect silently-dead long connections instead of hanging on a
-        // stale-but-OPEN socket (see FEISHU_WS_PING_TIMEOUT_SEC).
-        wsConfig: { pingTimeout: FEISHU_WS_PING_TIMEOUT_SEC },
-      });
+      wsClient = createWsClient();
 
       try {
         await wsClient.start({ eventDispatcher });
