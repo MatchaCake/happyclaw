@@ -113,7 +113,7 @@ async function turn(jid, prompt, marker, agentId) {
   );
   await waitUntil(
     async () => {
-      const status = await api('GET', '/api/monitor/status');
+      const status = await api('GET', '/api/status');
       const actualJid = agentId ? `${jid}#agent:${agentId}` : jid;
       const runner = status.groups.find((group) => group.jid === actualJid);
       return !runner || (!runner.queryInFlight && !runner.pendingMessages);
@@ -245,7 +245,7 @@ async function run() {
           event.event.toolName === 'Bash',
       ),
     );
-    const sleepRunner = (await api('GET', '/api/monitor/status')).groups.find(
+    const sleepRunner = (await api('GET', '/api/status')).groups.find(
       (group) => group.jid === jid,
     );
     assert(
