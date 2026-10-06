@@ -182,6 +182,148 @@ async function verifyUsage(jid, agentId, marker) {
   );
 }
 
+function ledgerKey(record) {
+  return JSON.stringify([record.eventId, record.model]);
+}
+
+async function ownedMainLedger(jid) {
+  const folder = workspaceFolders.get(jid);
+  assert(
+    ownedWorkspaces.includes(jid) && typeof folder === 'string' && folder,
+    'Ledger reads must be scoped to an owned workspace',
+  );
+  // Records are per (eventId, model), not per SDK result or visible reply.
+  // Retry a changing paginated snapshot rather than silently dropping rows.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const records = new Map();
+    let total;
+    let pageCount = 1;
+    let stable = true;
+    for (let page = 1; page <= pageCount; page++) {
+      const query = new URLSearchParams({
+        groupFolder: folder,
+        agentId: '__main__',
+        days: '2',
+        pageSize: '500',
+        page: String(page),
+      });
+      const snapshot = await api('GET', `/api/usage/records?${query}`);
+      assert(
+        Array.isArray(snapshot.records) &&
+          Number.isInteger(snapshot.total) &&
+          snapshot.total >= 0 &&
+          Number.isInteger(snapshot.totalPages) &&
+          snapshot.totalPages >= 0 &&
+          snapshot.totalPages <= 20,
+        'Invalid owned ledger page',
+      );
+      if (total === undefined) {
+        total = snapshot.total;
+        pageCount = snapshot.totalPages;
+      } else if (
+        total !== snapshot.total ||
+        pageCount !== snapshot.totalPages
+      ) {
+        stable = false;
+      }
+      for (const record of snapshot.records) {
+        assert(
+          record.groupFolder === folder &&
+            record.agentId === null &&
+            typeof record.eventId === 'string' &&
+            !!record.eventId &&
+            typeof record.model === 'string',
+          'Ledger response escaped the owned main scope',
+        );
+        const key = ledgerKey(record);
+        if (records.has(key)) stable = false;
+        records.set(key, record);
+      }
+    }
+    if (stable && records.size === total) return records;
+  }
+  throw new Error('Owned ledger pagination did not stabilize');
+}
+
+async function verifyBackgroundLedger(jid, final, before) {
+  const backgroundCase = cases.at(-1);
+  backgroundCase.ledgerIncrementMatchesFinal = false;
+  backgroundCase.ledgerModelRows = 0;
+  backgroundCase.ledgerEvents = 0;
+  const fields = [
+    ['inputTokens', 'inputTokens'],
+    ['outputTokens', 'outputTokens'],
+    ['cacheReadInputTokens', 'cacheReadTokens'],
+    ['cacheCreationInputTokens', 'cacheCreationTokens'],
+    ['reasoningTokens', 'reasoningTokens'],
+    ['costUSD', 'providerEstimatedCostUSD'],
+  ];
+  let delta;
+  let matched = false;
+  await waitUntil(
+    async () => {
+      const after = await ownedMainLedger(jid);
+      assert(
+        [...before.keys()].every((key) => after.has(key)),
+        'Owned ledger lost pre-existing records',
+      );
+      delta = [...after]
+        .filter(([key]) => !before.has(key))
+        .map(([, row]) => row);
+      if (!delta.length) return false;
+      const totals = Object.fromEntries(fields.map(([key]) => [key, 0]));
+      for (const row of delta) {
+        for (const [key, column] of fields) {
+          assert(
+            Number.isFinite(row[column]) && row[column] >= 0,
+            'Owned ledger contains an invalid token or cost value',
+          );
+          totals[key] += row[column];
+        }
+      }
+      const history = await api(
+        'GET',
+        `/api/groups/${encodeURIComponent(jid)}/messages`,
+      );
+      const message = history.messages.find(
+        (row) =>
+          row.id === final.id &&
+          row.turn_id === final.turn_id &&
+          row.source_kind === 'sdk_final' &&
+          row.finalization_reason === 'completed',
+      );
+      if (!message?.token_usage) return false;
+      let usage;
+      try {
+        usage = JSON.parse(message.token_usage);
+      } catch {
+        throw new Error('Background final has invalid token usage JSON');
+      }
+      if (!usage || typeof usage !== 'object' || Array.isArray(usage))
+        return false;
+      matched =
+        fields
+          .slice(0, 5)
+          .every(([key]) => (usage[key] ?? 0) === totals[key]) &&
+        Number.isFinite(usage.costUSD) &&
+        Math.abs(usage.costUSD - totals.costUSD) <=
+          1e-9 * Math.max(1, Math.abs(totals.costUSD)) &&
+        fields.slice(0, 5).some(([key]) => totals[key] > 0);
+      // Initial ledger rows may have messageId=null before the canonical final
+      // exists. Do not equate that with misattribution or bind them to a previous
+      // reply. The immutable event/model increment is the accounting authority.
+      return matched;
+    },
+    30_000,
+    1000,
+  );
+  backgroundCase.ledgerIncrementMatchesFinal = matched;
+  backgroundCase.ledgerModelRows = delta.length;
+  backgroundCase.ledgerEvents = new Set(delta.map((row) => row.eventId)).size;
+  // durationMs and numTurns repeat on each model row, so they are deliberately
+  // excluded from the sum. Counts also make no claim about SDK result boundaries.
+}
+
 async function run() {
   const me = await api('GET', '/api/auth/me');
   assert.equal(me.user.role, 'admin', 'Use an authorized owner session');
@@ -345,6 +487,7 @@ async function run() {
   }
   const host = ownedWorkspaces[0];
   const bg = `${nonce}_BACKGROUND_DONE`;
+  const backgroundLedgerBefore = await ownedMainLedger(host);
   const backgroundAfter = events.length;
   await turn(
     host,
@@ -372,6 +515,34 @@ async function run() {
       ),
     'Background final response preceded its completion',
   );
+  const backgroundFinal = backgroundEvents
+    .slice(notification + 1)
+    .find(
+      (event) =>
+        event.type === 'new_message' &&
+        event.message?.source_kind === 'sdk_final' &&
+        event.message.finalization_reason === 'completed' &&
+        event.message.content?.trim() === bg,
+    ).message;
+  assert(
+    backgroundEvents.some(
+      (event) =>
+        event.type === 'stream_event' &&
+        event.event?.eventType === 'task_notification' &&
+        event.event.taskStatus === 'completed' &&
+        event.event.isBackground === true &&
+        event.event.inputTurnId === backgroundFinal.turn_id,
+    ) &&
+      backgroundEvents.some(
+        (event) =>
+          event.type === 'stream_event' &&
+          event.event?.inputTurnId === backgroundFinal.turn_id &&
+          typeof event.event.queryRunId === 'string' &&
+          !!event.event.queryRunId,
+      ),
+    'Background notification and stream lack the same immutable input',
+  );
+  await verifyBackgroundLedger(host, backgroundFinal, backgroundLedgerBefore);
   const cloned = await api('POST', '/api/groups', {
     name: `${nonce} public git clone`,
     execution_mode: 'container',
