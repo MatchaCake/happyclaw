@@ -87,15 +87,18 @@ async function turn(jid, prompt, marker, agentId) {
     )?.message;
     return !!final;
   });
-  // Warm inputs receive a new canonical delivery ID; it is deliberately
-  // different from the original user row ID. Correlate the unique marker's
-  // final row with its actual stream turn and persisted row instead.
+  // The stream's presentation turn ID rotates independently of durable input
+  // delivery IDs. Verify scoped streaming and the exact persisted final row.
   assert(
     scopedEvents(jid, agentId, after).some(
       (event) =>
-        event.type === 'stream_event' && event.event?.turnId === final.turn_id,
+        event.type === 'stream_event' &&
+        typeof event.event?.turnId === 'string' &&
+        !!event.event.turnId &&
+        typeof event.event.queryRunId === 'string' &&
+        !!event.event.queryRunId,
     ),
-    'Final response is missing its correlated stream turn',
+    'Missing scoped stream presentation and query identity',
   );
   const route = `/api/groups/${encodeURIComponent(jid)}/messages${agentId ? `?agentId=${encodeURIComponent(agentId)}` : ''}`;
   await waitUntil(
@@ -157,6 +160,26 @@ async function verifyFile(jid, filename, expected) {
     `/api/groups/${encodeURIComponent(jid)}/files/content/${encoded}`,
   );
   assert.equal(response.content.trim(), expected);
+}
+
+async function verifyUsage(jid, agentId, marker) {
+  await waitUntil(
+    async () => {
+      const history = await api(
+        'GET',
+        `/api/groups/${encodeURIComponent(jid)}/messages?agentId=${encodeURIComponent(agentId)}`,
+      );
+      const message = history.messages.find(
+        (row) =>
+          row.source_kind === 'sdk_final' && row.content.trim() === marker,
+      );
+      if (!message?.token_usage) return false;
+      const usage = JSON.parse(message.token_usage);
+      return usage.inputTokens + usage.outputTokens > 0;
+    },
+    15_000,
+    1000,
+  );
 }
 
 async function run() {
@@ -229,6 +252,9 @@ async function run() {
         b,
       ),
     ]);
+    const sessionWarm = `${nonce}_${mode}_SESSION_A_WARM`;
+    await turn(jid, `Reply exactly ${sessionWarm}`, sessionWarm, a);
+    await verifyUsage(jid, a, sessionWarm);
     const interruptAfter = events.length;
     ws.send(
       JSON.stringify({
