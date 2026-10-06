@@ -1353,6 +1353,58 @@ describe('canonical usage ownership', () => {
       expect(replies(owner)[1].token_usage).toBeUndefined();
     });
   }
+  for (const owner of [agentId, '']) {
+    const scope = owner ? 'Agent' : 'main';
+    function snapshot(
+      count: number,
+      projection?: 'input_total',
+      batch = false,
+    ): void {
+      useChatStore.getState().handleStreamEvent(
+        jid,
+        {
+          eventType: 'usage',
+          inputTurnId: 'input-total',
+          turnId: 'presentation-only',
+          usageProjection: projection,
+          usage: {
+            ...usage,
+            inputTokens: count,
+            ...(batch
+              ? { batchIndex: 1, batchCount: 2, eventId: 'legacy-result' }
+              : {}),
+          },
+        },
+        owner || undefined,
+        runId,
+      );
+    }
+    it(`replaces early ${scope} input_total snapshots without adding overlapping totals`, () => {
+      activate(owner);
+      snapshot(10, 'input_total');
+      snapshot(25, 'input_total');
+      receive('input-total', owner);
+      expect(JSON.parse(replies(owner)[0].token_usage!).inputTokens).toBe(25);
+      expect(useChatStore.getState().pendingMessageUsage).toEqual({});
+    });
+    it(`replaces visible ${scope} input_total snapshots and accepts authoritative corrections`, () => {
+      activate(owner);
+      receive('input-total', owner);
+      snapshot(25, 'input_total');
+      snapshot(50, 'input_total');
+      expect(JSON.parse(replies(owner)[0].token_usage!).inputTokens).toBe(50);
+      snapshot(40, 'input_total');
+      expect(JSON.parse(replies(owner)[0].token_usage!).inputTokens).toBe(40);
+    });
+    it(`continues accepting the ${scope} legacy host-merged batch snapshot`, () => {
+      activate(owner);
+      snapshot(20, undefined, true);
+      receive('input-total', owner);
+      expect(JSON.parse(replies(owner)[0].token_usage!).inputTokens).toBe(20);
+      snapshot(20, undefined, true);
+      expect(JSON.parse(replies(owner)[0].token_usage!).inputTokens).toBe(20);
+    });
+  }
   it('rejects old query A usage after query B supersedes it', () => {
     activate(agentId, jid, 'query-b');
     receive('input-b');
