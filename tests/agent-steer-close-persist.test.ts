@@ -5,6 +5,7 @@ import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 
 import { resolveOutputChannelReplySource } from '../src/channel-reply-source.js';
 import { channelTurnScope } from '../src/channel-turn-registry.js';
+import { InputUsageProjection } from '../src/input-usage-projection.js';
 import {
   buildInterruptedReply,
   buildSteeredReply,
@@ -55,6 +56,7 @@ function agentRunEnd(streamedText: string) {
     error: vi.fn(),
   };
   const globals: Record<string, any> = {
+    agentInputUsageProjection: new InputUsageProjection(inputTurnId),
     crypto,
     logger,
     clearTimeout,
@@ -161,6 +163,38 @@ function closeAsSteer(run: ReturnType<typeof agentRunEnd>): void {
 }
 
 describe('conversation agent steer close persists the superseded partial', () => {
+  test('a warm interrupted final keeps its immutable owner and cumulative usage', async () => {
+    const run = agentRunEnd('Warm partial');
+    const warmId = `warm-${crypto.randomUUID()}`;
+    run.globals.activeAgentInputTurnId = warmId;
+    const projection = run.globals
+      .agentInputUsageProjection as InputUsageProjection;
+    projection.admit(warmId);
+    projection.record(
+      warmId,
+      {
+        eventId: 'warm-usage',
+        inputTokens: 12,
+        outputTokens: 3,
+        cacheReadInputTokens: 7,
+        cacheCreationInputTokens: 0,
+        costUSD: 0,
+        durationMs: 1,
+        numTurns: 1,
+      },
+      { eventId: 'warm-usage', inserted: true, providerEstimatedCostUSD: 0.01 },
+    );
+    closeAsSteer(run);
+    await run.finish();
+    const rows = db.getMessagesForTurn(run.virtualChatJid, warmId);
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0].token_usage!)).toMatchObject({
+      inputTokens: 12,
+      cacheReadInputTokens: 7,
+      costUSD: 0.01,
+    });
+    expect(run.partials()).toEqual([]);
+  });
   test('saves the steered partial exactly once', async () => {
     const run = agentRunEnd('Partial answer before the steer');
     const card = activeCard(run);

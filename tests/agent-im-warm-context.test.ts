@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { InputUsageProjection } from '../src/input-usage-projection.js';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, expect, test, vi } from 'vitest';
@@ -164,6 +165,8 @@ async function fixture(
     dispose: vi.fn(),
   }));
   const globals: Record<string, any> = {
+    inputUsageProjection: new InputUsageProjection('cold-a'),
+    agentInputUsageProjection: new InputUsageProjection('cold-a'),
     fs,
     path,
     writeExclusiveIpcResult,

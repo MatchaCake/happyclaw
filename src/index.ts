@@ -178,7 +178,6 @@ import {
   storeScheduledGroupPromptAndCompleteRun,
   storeScheduledGroupWorkspaceResultAndFinalize,
   updateLatestMessageTokenUsage,
-  rebuildMessageTokenUsageFromLedger,
   updateChatName,
   updateTask,
   updateTaskWithRevision,
@@ -536,6 +535,7 @@ import {
   reconcileMonthlyUsage,
 } from './billing.js';
 import { recordUsageEvent } from './usage-service.js';
+import { InputUsageProjection } from './input-usage-projection.js';
 import {
   AgentProfile,
   ChannelMessageMeta,
@@ -1430,54 +1430,6 @@ const HELD_TURN_DIVIDER = '\n\n---\n\n';
 // container/agent-runner/src/index.ts 的 emit 保持字面一致），主进程据此
 // 把挂起中的卡片收口，不再等一个永远不会来的 healthy result。
 const TRUNCATION_EXHAUSTED_STATUS = 'truncation_continue_exhausted';
-// 挂起期间累计的 usage 增量（与 StreamEvent['usage'] 同形），定稿后与最终
-// turn 的 usage 合并成整个回合的总量补到卡片 usage note。
-type HeldUsageTotals = NonNullable<StreamEvent['usage']>;
-function mergeHeldUsage(
-  base: HeldUsageTotals | null,
-  next: HeldUsageTotals,
-): HeldUsageTotals {
-  if (!base)
-    return {
-      ...next,
-      modelUsage: next.modelUsage ? { ...next.modelUsage } : undefined,
-    };
-  const mergedModel: NonNullable<HeldUsageTotals['modelUsage']> = {
-    ...(base.modelUsage || {}),
-  };
-  for (const [model, mu] of Object.entries(next.modelUsage || {})) {
-    const prev = mergedModel[model];
-    mergedModel[model] = prev
-      ? {
-          inputTokens: (prev.inputTokens || 0) + (mu.inputTokens || 0),
-          outputTokens: (prev.outputTokens || 0) + (mu.outputTokens || 0),
-          cacheReadInputTokens:
-            (prev.cacheReadInputTokens || 0) + (mu.cacheReadInputTokens || 0),
-          cacheCreationInputTokens:
-            (prev.cacheCreationInputTokens || 0) +
-            (mu.cacheCreationInputTokens || 0),
-          reasoningTokens:
-            (prev.reasoningTokens || 0) + (mu.reasoningTokens || 0),
-          costUSD: (prev.costUSD || 0) + (mu.costUSD || 0),
-        }
-      : { ...mu };
-  }
-  return {
-    inputTokens: (base.inputTokens || 0) + (next.inputTokens || 0),
-    outputTokens: (base.outputTokens || 0) + (next.outputTokens || 0),
-    cacheReadInputTokens:
-      (base.cacheReadInputTokens || 0) + (next.cacheReadInputTokens || 0),
-    cacheCreationInputTokens:
-      (base.cacheCreationInputTokens || 0) +
-      (next.cacheCreationInputTokens || 0),
-    reasoningTokens: (base.reasoningTokens || 0) + (next.reasoningTokens || 0),
-    costUSD: (base.costUSD || 0) + (next.costUSD || 0),
-    durationMs: (base.durationMs || 0) + (next.durationMs || 0),
-    numTurns: (base.numTurns || 0) + (next.numTurns || 0),
-    modelUsage: Object.keys(mergedModel).length > 0 ? mergedModel : undefined,
-  };
-}
-
 // Sub-Agent 路径的挂起卡 finalizer 注册表（key: virtualChatJid）。主路径复用
 // activeRouteUpdaters（用户消息注入时必经），Sub-Agent 注入点不走 route updater，
 // 由 web.ts / 消息循环在注入成功回调里显式触发。
@@ -5626,6 +5578,8 @@ async function clearTrackedProcessingIndicators(
 interface SendMessageOptions {
   /** Stable logical message id for replay-safe Web projection. */
   messageId?: string;
+  /** Display snapshot for the exact immutable input; never a billing increment. */
+  tokenUsage?: NonNullable<StreamEvent['usage']>;
   /** Whether to forward the reply to the IM channel (Feishu/Telegram). Defaults to true for IM JIDs. */
   sendToIM?: boolean;
   /** IM 渠道实际发送的文本（默认与 text 相同）。挂起序列合并时 text 为
@@ -6864,6 +6818,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let lastReplyMsgId: string | undefined;
   const queryTaskIds = new Set<string>();
   const healthyCompletedInputTurns = new Set<string>();
+  const inputUsageProjection = new InputUsageProjection(lastProcessed.id);
   const processingIndicatorJidsByInput = new Map<string, string>();
   // One cold SDK turn may cover several rapidly-arriving DB inputs. The
   // provider reaction belongs to this active batch's selected message, while
@@ -7053,6 +7008,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     );
     for (const inputTurnId of completedInputTurnIds) {
       healthyCompletedInputTurns.add(inputTurnId);
+      inputUsageProjection.complete(inputTurnId);
     }
   };
   const completeChannelRuntimesForOutput = async (
@@ -7361,16 +7317,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // Workflow card while Claude waits for the background task notification.
   let activeWorkflowRuns: NonNullable<StreamEvent['workflowRun']>[] = [];
   let completedWorkflowRuns: NonNullable<StreamEvent['workflowRun']>[] = [];
-  // 挂起期间各 turn 的 usage 增量累计，定稿后与最终 turn 的 usage 合并
-  // 补到卡片 usage note（否则卡片只显示最后一个 turn 的用量）。
-  let heldCardUsage: HeldUsageTotals | null = null;
-  // The runner emits one replay-safe ledger event per Anthropic message ID.
-  // Buffer those siblings and expose one cumulative usage summary to UI/card.
-  let pendingLedgerUsageBatch: HeldUsageTotals | null = null;
-  // 定稿后等待最终 usage 事件合并补丁的卡片控制器。usage 事件在 result 之后
-  // 到达，而主路径定稿即轮换 session——不留引用的话 usage note 永远打在新空卡
-  // 上（no-op）。每条 result 开始时清空，避免打到过期卡。
-  let heldUsagePatchTarget: StreamingSession | null = null;
   // 挂起序列的 DB 合并锚点：整个序列（含收尾 turn）共用第一个 held turn 的
   // turnId，storeMessageDirect 按 (chat_jid, turn_id) UPSERT 到同一行——
   // 全渠道（Web / 历史 / 飞书卡）永远只有一条回复。与卡片存在性无关：
@@ -7394,6 +7340,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     heldDbTurnId = null;
     await sendMessage(chatJid, joined, {
       sendToIM: false,
+      tokenUsage: inputUsageProjection.snapshot(tid),
       messageMeta: {
         turnId: tid,
         sessionId: activeSessionId,
@@ -7408,7 +7355,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (heldCardParts.length === 0) return;
     const txt = heldCardParts.join(HELD_TURN_DIVIDER);
     heldCardParts = [];
-    heldCardUsage = null;
     // DB 合并行内容已随每个 held turn 更新到位，仅需结束序列锚点
     heldDbTurnId = null;
     if (!streamingSession?.isActive()) return;
@@ -7542,8 +7488,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     streamingAccumulatedText = '';
     streamingAccumulatedThinking = '';
     heldCardParts = [];
-    heldCardUsage = null;
-    heldUsagePatchTarget = null;
     heldDbTurnId = null;
     activeWorkflowRuns = [];
     completedWorkflowRuns = [];
@@ -7642,6 +7586,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         inputMessageId: inputCursor?.id ?? inputTurnId,
         inputChatJid: receipt?.chatJid ?? chatJid,
       });
+      inputUsageProjection.admit(inputTurnId);
       genuineReplyDeliveredByInput.set(inputTurnId, false);
       const exactInputs =
         coveredInputs && coveredInputs.length > 0
@@ -7688,6 +7633,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           if (!admitted) return;
           scheduledGroupRunsByInput.delete(inputTurnId);
           admittedWarmMainInputs.delete(inputTurnId);
+          inputUsageProjection.rollback(inputTurnId);
           channelTurnRuntimes.delete(inputTurnId);
           channelOutboxScopesByInput.delete(inputTurnId);
           activeChannelOutboxScopes.unbind(mainAdmissionKey, admitted.scope);
@@ -7769,7 +7715,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (previousSessionForRotation) {
         const previousText = heldCardParts.join(HELD_TURN_DIVIDER);
         heldCardParts = [];
-        heldCardUsage = null;
         heldDbTurnId = null;
         try {
           if (previousSessionForRotation.isActive()) {
@@ -8269,7 +8214,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   'truncated',
                 ).catch(() => {});
                 heldCardParts = [];
-                heldCardUsage = null;
                 if (streamingSession?.isActive()) {
                   await streamingSession
                     .abort('自动续写未能完成（上游连续断流），以上为已生成内容')
@@ -8278,9 +8222,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               }
               return;
             }
+            let usageProjectionEvent: StreamEvent | undefined;
             // Claude SDK 的 costUSD 只是上游估算。实时 Web/飞书展示前先走
             // 与账本相同的 Kaboo 计价入口，确保流式金额和最终统计一致。
-            // 后面的持久化调用会被 eventId 幂等去重，并负责关联最终消息。
+            // 每个原始event只计价一次；累计display snapshot不送回收费入口。
             if (
               result.streamEvent.eventType === 'usage' &&
               result.streamEvent.usage
@@ -8292,12 +8237,21 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                     registeredGroups[chatJid]?.created_by ||
                     'system',
                   groupFolder: effectiveGroup.folder,
-                  messageId: lastReplyMsgId,
+                  messageId: inputUsageProjection.messageId(result.inputTurnId),
                   source: chatJid.split(':', 1)[0] || 'unknown',
                   usage: result.streamEvent.usage,
                 });
                 result.streamEvent.usage.costUSD =
                   accounting.providerEstimatedCostUSD;
+                inputUsageProjection.record(
+                  result.inputTurnId,
+                  result.streamEvent.usage,
+                  accounting,
+                );
+                usageProjectionEvent = inputUsageProjection.event(
+                  result.inputTurnId,
+                  result.streamEvent,
+                );
               } catch (err) {
                 logger.warn(
                   { err, chatJid },
@@ -8305,20 +8259,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 );
               }
               const ledgerUsage = result.streamEvent.usage;
-              pendingLedgerUsageBatch = mergeHeldUsage(
-                pendingLedgerUsageBatch,
-                ledgerUsage,
-              );
               const batchIndex = Math.max(0, ledgerUsage.batchIndex || 0);
               const batchCount = Math.max(1, ledgerUsage.batchCount || 1);
               if (batchIndex < batchCount - 1) return;
-              result.streamEvent.usage = {
-                ...pendingLedgerUsageBatch,
-                eventId: ledgerUsage.eventId,
-                batchIndex,
-                batchCount,
-              };
-              pendingLedgerUsageBatch = null;
             }
             const streamInputTurnId = result.inputTurnId ?? lastProcessed.id;
             // Proactive SDK text is private model-loop state. Do not even feed
@@ -8337,7 +8280,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             if (
               shouldBroadcastSdkStreamEvent(interactionMode, result.streamEvent)
             ) {
-              broadcastStreamEvent(chatJid, result.streamEvent);
+              if (
+                result.streamEvent.eventType !== 'usage' ||
+                usageProjectionEvent
+              ) {
+                broadcastStreamEvent(
+                  chatJid,
+                  usageProjectionEvent ?? result.streamEvent,
+                );
+              }
             }
 
             // ── 累积 text_delta / thinking_delta 文本（中断时用于保存已输出内容）──
@@ -8399,28 +8350,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   heldCardBaseText() + answerProjection.visibleAnswerText,
                 );
               }
-              if (
-                se.eventType === 'usage' &&
-                se.usage &&
-                heldCardParts.length > 0
-              ) {
-                // 挂起中：累计本 turn 的 usage 增量，不喂卡
-                //（patchUsageNote 在 streaming 态本就 no-op，累计后定稿时合并补丁）。
-                heldCardUsage = mergeHeldUsage(heldCardUsage, se.usage);
-              } else if (
-                se.eventType === 'usage' &&
-                se.usage &&
-                heldUsagePatchTarget
-              ) {
-                // 挂起回合刚定稿：合并挂起期累计 + 最终 turn 的 usage，
-                // 补到已定稿的旧卡上（session 已轮换，正常喂卡会打到新空卡上 no-op）。
-                const target = heldUsagePatchTarget;
-                heldUsagePatchTarget = null;
-                const merged = heldCardUsage
-                  ? mergeHeldUsage(heldCardUsage, se.usage)
-                  : se.usage;
-                heldCardUsage = null;
-                void target.patchUsageNote(merged);
+              if (se.eventType === 'usage') {
+                const exactCard = result.inputTurnId
+                  ? channelStreamingSessionsByInput.get(result.inputTurnId)
+                      ?.session
+                  : undefined;
+                if (exactCard && usageProjectionEvent?.usage) {
+                  void exactCard.patchUsageNote(usageProjectionEvent.usage);
+                }
               } else if (
                 !(se.eventType === 'text_delta' && !se.parentToolUseId)
               ) {
@@ -8458,7 +8395,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   false,
                 ).catch(() => {});
                 heldCardParts = [];
-                heldCardUsage = null;
                 if (streamingSession?.isActive()) {
                   if (steered) {
                     await streamingSession.complete(heldText).catch(() => {});
@@ -8501,8 +8437,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                       interruptedText,
                       {
                         sendToIM: false,
+                        tokenUsage: inputUsageProjection.snapshot(
+                          result.inputTurnId,
+                        ),
                         messageMeta: {
-                          turnId: result.streamEvent.turnId || lastProcessed.id,
+                          turnId: result.inputTurnId || lastProcessed.id,
                           sessionId:
                             result.streamEvent.sessionId || activeSessionId,
                           sourceKind: 'interrupt_partial',
@@ -8510,6 +8449,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                         },
                       },
                     );
+                    if (lastReplyMsgId && result.inputTurnId) {
+                      inputUsageProjection.bindMessage(
+                        result.inputTurnId,
+                        lastReplyMsgId,
+                      );
+                    }
                   }
                   sentReply = true;
                   clearStreamingSnapshot(chatJid);
@@ -8686,31 +8631,19 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               }
             }
 
-            // Persist token usage to the latest agent message + usage_records
+            // Persist the display total only to this immutable input's row.
             if (se.eventType === 'usage' && se.usage) {
               try {
-                writeUsageRecords({
-                  userId:
-                    effectiveGroup.created_by ||
-                    registeredGroups[chatJid]?.created_by ||
-                    'system',
-                  groupFolder: effectiveGroup.folder,
-                  messageId: lastReplyMsgId,
-                  source: chatJid.split(':', 1)[0] || 'unknown',
-                  usage: se.usage,
-                });
-                if (lastReplyMsgId) {
-                  rebuildMessageTokenUsageFromLedger(
-                    chatJid,
-                    effectiveGroup.folder,
-                    lastReplyMsgId,
-                  );
-                } else {
+                const messageId = inputUsageProjection.messageId(
+                  result.inputTurnId,
+                );
+                const total = inputUsageProjection.snapshot(result.inputTurnId);
+                if (messageId && total) {
                   updateLatestMessageTokenUsage(
                     chatJid,
-                    JSON.stringify(se.usage),
-                    undefined,
-                    se.usage.costUSD,
+                    JSON.stringify(total),
+                    messageId,
+                    total.costUSD,
                   );
                 }
 
@@ -9079,8 +9012,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 text,
                 effectiveGroup.folder,
               );
-              // 新 result 到达即关闭上一轮的 usage 合并补丁窗口
-              heldUsagePatchTarget = null;
               // DB 合并用：进入卡片分支前留存已有挂起前缀（分支内会改动 parts）
               const heldBaseForDb = heldCardBaseText();
               const wasInHeldSeq = heldDbTurnId !== null;
@@ -9308,6 +9239,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 dbText,
                 {
                   messageId: scheduledGroupResultMessageId,
+                  tokenUsage: inputUsageProjection.snapshot(
+                    outputChannelScope.inputId,
+                  ),
                   sendToIM:
                     (scheduledGroupRuns.length === 0 ||
                       scheduledGroupDeliveryContract.frameworkDeliversFinalText) &&
@@ -9348,6 +9282,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 },
               );
               lastReplyMsgId = replySendOutcome.messageId;
+              if (lastReplyMsgId)
+                inputUsageProjection.bindMessage(
+                  outputChannelScope.inputId,
+                  lastReplyMsgId,
+                );
               const scheduledGroupProjectionDurable =
                 scheduledGroupRuns.length > 0
                   ? settleScheduledGroupWorkspaceProjection({
@@ -9438,7 +9377,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                     classifyImSendFailure(cardFinalization.error) !==
                       'uncertain');
                 if (pendingStreamingCardCompleted) {
-                  heldUsagePatchTarget = pendingStreamingCardCompletion;
                   heldCardParts = [];
                 } else if (cardFinalization.error) {
                   streamingCardDeliveryUncertain =
@@ -9755,7 +9693,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               : '后台任务未全部完成，会话已结束';
           await finalizeHeldDbMessage(heldNote, 'interrupted').catch(() => {});
           heldCardParts = [];
-          heldCardUsage = null;
           await streamingSession.abort(heldNote).catch(() => {});
         } else if (providerFailoverPending) {
           await streamingSession
@@ -9813,7 +9750,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           : '后台任务未全部完成，会话已结束';
       await finalizeHeldDbMessage(heldNote, 'interrupted').catch(() => {});
       heldCardParts = [];
-      heldCardUsage = null;
     }
 
     if (channelTurnRuntimes.size > 0) {
@@ -9967,8 +9903,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         if (interruptedText) {
           lastReplyMsgId = await sendMessage(chatJid, interruptedText, {
             sendToIM: false,
+            tokenUsage: inputUsageProjection.snapshot(
+              ipcReplyTurnTracker.inputTurnId,
+            ),
             messageMeta: {
-              turnId: lastProcessed.id,
+              turnId: ipcReplyTurnTracker.inputTurnId,
               sessionId: activeSessionId,
               sourceKind: 'interrupt_partial',
               finalizationReason: 'interrupted',
@@ -9996,8 +9935,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         );
         lastReplyMsgId = await sendMessage(chatJid, partialReply, {
           sendToIM: false,
+          tokenUsage: inputUsageProjection.snapshot(
+            ipcReplyTurnTracker.inputTurnId,
+          ),
           messageMeta: {
-            turnId: lastProcessed.id,
+            turnId: ipcReplyTurnTracker.inputTurnId,
             sessionId: activeSessionId,
             sourceKind: 'interrupt_partial',
             finalizationReason: 'error',
@@ -11012,9 +10954,22 @@ async function sendMessageWithOutcome(
               text,
               timestamp,
               true,
-              { meta: options.messageMeta },
+              {
+                meta: options.messageMeta,
+                tokenUsage: options.tokenUsage
+                  ? JSON.stringify(options.tokenUsage)
+                  : undefined,
+              },
             );
           })();
+    if (options.tokenUsage) {
+      updateLatestMessageTokenUsage(
+        jid,
+        JSON.stringify(options.tokenUsage),
+        persistedMsgId,
+        options.tokenUsage.costUSD,
+      );
+    }
     if (!sendToIM || !isIMChannel) targetDelivered = true;
 
     broadcastNewMessage(
@@ -11028,6 +10983,9 @@ async function sendMessageWithOutcome(
         timestamp,
         is_from_me: true,
         turn_id: options.messageMeta?.turnId ?? null,
+        token_usage: options.tokenUsage
+          ? JSON.stringify(options.tokenUsage)
+          : undefined,
         session_id: options.messageMeta?.sessionId ?? null,
         sdk_message_uuid: options.messageMeta?.sdkMessageUuid ?? null,
         source_kind: options.messageMeta?.sourceKind ?? null,
@@ -15810,6 +15768,7 @@ async function processAgentConversation(
     ? `${replySourceImJid}#agent:${agentId}`
     : undefined;
   const healthyAgentCompletedInputTurns = new Set<string>();
+  const agentInputUsageProjection = new InputUsageProjection(lastProcessed.id);
   const agentProcessingIndicatorJidsByInput = new Map<string, string>();
   const initialAgentProcessingIndicatorOwners =
     await activateBatchProcessingIndicators(
@@ -15961,6 +15920,7 @@ async function processAgentConversation(
     activeAgentBuilderTurns.clearCompleted(agentBuilderScope, completedInputs);
     for (const inputTurnId of completedInputTurnIds) {
       healthyAgentCompletedInputTurns.add(inputTurnId);
+      agentInputUsageProjection.complete(inputTurnId);
     }
   };
   const completeAgentChannelRuntimesForOutput = async (
@@ -16242,10 +16202,6 @@ async function processAgentConversation(
   let activeAgentWorkflowRuns: NonNullable<StreamEvent['workflowRun']>[] = [];
   let completedAgentWorkflowRuns: NonNullable<StreamEvent['workflowRun']>[] =
     [];
-  let heldAgentUsage: HeldUsageTotals | null = null;
-  let pendingAgentLedgerUsageBatch: HeldUsageTotals | null = null;
-  // 定稿后等待最终 usage 事件做合并补丁（Sub 路径 session 不轮换，引用即当前卡）
-  let heldAgentUsagePatchPending = false;
   // 挂起序列的 DB 合并锚点（全渠道一条回复）：序列内所有 turn 复用同一
   // 消息 id / turnId，INSERT OR REPLACE 覆盖同一行。与卡片存在性无关。
   let heldAgentDbMsgId: string | null = null;
@@ -16269,6 +16225,7 @@ async function processAgentConversation(
     heldAgentDbTurnId = null;
     try {
       const timestamp = new Date().toISOString();
+      const tokenUsage = agentInputUsageProjection.snapshot(tid ?? undefined);
       storeMessageDirect(
         msgId,
         virtualChatJid,
@@ -16278,6 +16235,7 @@ async function processAgentConversation(
         timestamp,
         true,
         {
+          tokenUsage: tokenUsage ? JSON.stringify(tokenUsage) : undefined,
           meta: {
             turnId: tid ?? undefined,
             sessionId: currentAgentSessionId,
@@ -16286,6 +16244,13 @@ async function processAgentConversation(
           },
         },
       );
+      if (tokenUsage)
+        updateLatestMessageTokenUsage(
+          virtualChatJid,
+          JSON.stringify(tokenUsage),
+          msgId,
+          tokenUsage.costUSD,
+        );
       broadcastNewMessage(
         virtualChatJid,
         {
@@ -16296,6 +16261,7 @@ async function processAgentConversation(
           content: joined,
           timestamp,
           is_from_me: true,
+          token_usage: tokenUsage ? JSON.stringify(tokenUsage) : undefined,
           turn_id: tid,
           session_id: currentAgentSessionId,
           sdk_message_uuid: null,
@@ -16430,8 +16396,6 @@ async function processAgentConversation(
     // legacy warm-process residue at the durable input completion boundary.
     agentStreamingAccText = '';
     heldAgentParts = [];
-    heldAgentUsage = null;
-    heldAgentUsagePatchPending = false;
     heldAgentDbMsgId = null;
     heldAgentDbTurnId = null;
     activeAgentWorkflowRuns = [];
@@ -16508,6 +16472,7 @@ async function processAgentConversation(
         lifecycle: nextLifecycle,
         inputMessageId: inputCursor?.id ?? inputTurnId,
       });
+      agentInputUsageProjection.admit(inputTurnId);
       agentAnyReplyProjectedByInput.set(inputTurnId, false);
       agentGenuineReplyDeliveredByInput.set(inputTurnId, false);
       const exactInputs =
@@ -16546,6 +16511,7 @@ async function processAgentConversation(
           const admitted = admittedWarmAgentInputs.get(inputTurnId);
           if (!admitted) return;
           admittedWarmAgentInputs.delete(inputTurnId);
+          agentInputUsageProjection.rollback(inputTurnId);
           agentChannelTurnRuntimes.delete(inputTurnId);
           agentChannelOutboxScopesByInput.delete(inputTurnId);
           agentAnyReplyProjectedByInput.delete(inputTurnId);
@@ -16585,7 +16551,6 @@ async function processAgentConversation(
     if (inputTurnId) {
       activeAgentInputTurnId = inputTurnId;
       bindAgentTurnOutputCoordinator(inputTurnId);
-      lastAgentReplyMsgId = undefined;
       lastAgentReplyText = undefined;
       agentReplySentByInput.set(inputTurnId, false);
       agentAnyReplyProjectedByInput.set(inputTurnId, false);
@@ -16625,7 +16590,6 @@ async function processAgentConversation(
       if (heldAgentParts.length > 0) {
         const txt = heldAgentParts.join(HELD_TURN_DIVIDER);
         heldAgentParts = [];
-        heldAgentUsage = null;
         heldAgentDbMsgId = null;
         heldAgentDbTurnId = null;
         if (previousAgentSession?.isActive()) {
@@ -16736,7 +16700,6 @@ async function processAgentConversation(
   let agentDeterministicTerminalError: string | null = null;
   let hadError = false;
   let lastError = '';
-  let lastAgentReplyMsgId: string | undefined;
   let lastAgentReplyText: string | undefined;
   const agentReplySentByInput = new Map<string, boolean>([
     [lastProcessed.id, false],
@@ -17022,7 +16985,6 @@ async function processAgentConversation(
             'truncated',
           );
           heldAgentParts = [];
-          heldAgentUsage = null;
           if (agentStreamingSession?.isActive()) {
             await agentStreamingSession
               .abort('自动续写未能完成（上游连续断流），以上为已生成内容')
@@ -17031,8 +16993,9 @@ async function processAgentConversation(
         }
         return;
       }
+      let usageProjectionEvent: StreamEvent | undefined;
       // Keep live Web/Feishu cost on the same Kaboo ledger authority as the
-      // persisted usage page. The later write is replay-safe on eventId.
+      // persisted usage page. Only raw events enter the accounting ledger.
       if (
         output.streamEvent.eventType === 'usage' &&
         output.streamEvent.usage
@@ -17045,12 +17008,21 @@ async function processAgentConversation(
               'system',
             groupFolder: effectiveGroup.folder,
             agentId,
-            messageId: lastAgentReplyMsgId,
+            messageId: agentInputUsageProjection.messageId(output.inputTurnId),
             source: chatJid.split(':', 1)[0] || 'unknown',
             usage: output.streamEvent.usage,
           });
           output.streamEvent.usage.costUSD =
             accounting.providerEstimatedCostUSD;
+          agentInputUsageProjection.record(
+            output.inputTurnId,
+            output.streamEvent.usage,
+            accounting,
+          );
+          usageProjectionEvent = agentInputUsageProjection.event(
+            output.inputTurnId,
+            output.streamEvent,
+          );
         } catch (err) {
           logger.warn(
             { err, chatJid, agentId },
@@ -17058,20 +17030,9 @@ async function processAgentConversation(
           );
         }
         const ledgerUsage = output.streamEvent.usage;
-        pendingAgentLedgerUsageBatch = mergeHeldUsage(
-          pendingAgentLedgerUsageBatch,
-          ledgerUsage,
-        );
         const batchIndex = Math.max(0, ledgerUsage.batchIndex || 0);
         const batchCount = Math.max(1, ledgerUsage.batchCount || 1);
         if (batchIndex < batchCount - 1) return;
-        output.streamEvent.usage = {
-          ...pendingAgentLedgerUsageBatch,
-          eventId: ledgerUsage.eventId,
-          batchIndex,
-          batchCount,
-        };
-        pendingAgentLedgerUsageBatch = null;
       }
       const agentStreamInputTurnId = output.inputTurnId ?? lastProcessed.id;
       // Native-message mode has no framework-owned Assistant answer lane.
@@ -17087,7 +17048,13 @@ async function processAgentConversation(
         agentStreamingAccText = agentAnswerProjection.visibleAnswerText;
       }
       if (shouldBroadcastSdkStreamEvent(interactionMode, output.streamEvent)) {
-        broadcastStreamEvent(chatJid, output.streamEvent, agentId);
+        if (output.streamEvent.eventType !== 'usage' || usageProjectionEvent) {
+          broadcastStreamEvent(
+            chatJid,
+            usageProjectionEvent ?? output.streamEvent,
+            agentId,
+          );
+        }
       }
 
       // ── Feed stream events into Feishu streaming card ──
@@ -17101,21 +17068,12 @@ async function processAgentConversation(
             heldAgentBaseText() + agentAnswerProjection.visibleAnswerText,
           );
         }
-        if (se.eventType === 'usage' && se.usage && heldAgentParts.length > 0) {
-          // 挂起中：累计 usage 增量，不喂卡（定稿后合并补丁）
-          heldAgentUsage = mergeHeldUsage(heldAgentUsage, se.usage);
-        } else if (
-          se.eventType === 'usage' &&
-          se.usage &&
-          heldAgentUsagePatchPending
-        ) {
-          // 挂起回合刚定稿：合并挂起期累计 + 最终 turn 的 usage 打到卡上
-          heldAgentUsagePatchPending = false;
-          const merged = heldAgentUsage
-            ? mergeHeldUsage(heldAgentUsage, se.usage)
-            : se.usage;
-          heldAgentUsage = null;
-          void agentStreamingSession.patchUsageNote(merged);
+        if (se.eventType === 'usage') {
+          const exactCard = output.inputTurnId
+            ? agentStreamingSessionsByInput.get(output.inputTurnId)?.session
+            : undefined;
+          if (exactCard && usageProjectionEvent?.usage)
+            void exactCard.patchUsageNote(usageProjectionEvent.usage);
         } else if (!(se.eventType === 'text_delta' && !se.parentToolUseId)) {
           feedStreamEventToCard(
             agentStreamingSession,
@@ -17149,7 +17107,6 @@ async function processAgentConversation(
             false,
           );
           heldAgentParts = [];
-          heldAgentUsage = null;
           if (agentStreamingSession?.isActive()) {
             if (steered) {
               await agentStreamingSession.complete(heldText).catch(() => {});
@@ -17179,6 +17136,9 @@ async function processAgentConversation(
               const msgId = crypto.randomUUID();
               const timestamp = new Date().toISOString();
               ensureChatExists(virtualChatJid);
+              const tokenUsage = agentInputUsageProjection.snapshot(
+                output.inputTurnId,
+              );
               const persistedMsgId = storeMessageDirect(
                 msgId,
                 virtualChatJid,
@@ -17188,8 +17148,11 @@ async function processAgentConversation(
                 timestamp,
                 true,
                 {
+                  tokenUsage: tokenUsage
+                    ? JSON.stringify(tokenUsage)
+                    : undefined,
                   meta: {
-                    turnId: output.streamEvent.turnId || lastProcessed.id,
+                    turnId: output.inputTurnId || lastProcessed.id,
                     sessionId:
                       output.streamEvent.sessionId || currentAgentSessionId,
                     sourceKind: 'interrupt_partial',
@@ -17197,6 +17160,19 @@ async function processAgentConversation(
                   },
                 },
               );
+              if (tokenUsage)
+                updateLatestMessageTokenUsage(
+                  virtualChatJid,
+                  JSON.stringify(tokenUsage),
+                  persistedMsgId,
+                  tokenUsage.costUSD,
+                );
+              if (output.inputTurnId) {
+                agentInputUsageProjection.bindMessage(
+                  output.inputTurnId,
+                  persistedMsgId,
+                );
+              }
               broadcastNewMessage(
                 virtualChatJid,
                 {
@@ -17207,7 +17183,10 @@ async function processAgentConversation(
                   content: interruptedText,
                   timestamp,
                   is_from_me: true,
-                  turn_id: output.streamEvent.turnId || lastProcessed.id,
+                  token_usage: tokenUsage
+                    ? JSON.stringify(tokenUsage)
+                    : undefined,
+                  turn_id: output.inputTurnId || lastProcessed.id,
                   session_id:
                     output.streamEvent.sessionId || currentAgentSessionId,
                   sdk_message_uuid: null,
@@ -17238,32 +17217,17 @@ async function processAgentConversation(
         output.streamEvent.usage
       ) {
         try {
-          // Sub-Agent 的 effectiveGroup 可能没有 created_by，从父群组继承
-          writeUsageRecords({
-            userId:
-              effectiveGroup.created_by ||
-              registeredGroups[chatJid]?.created_by ||
-              'system',
-            groupFolder: effectiveGroup.folder,
-            agentId,
-            messageId: lastAgentReplyMsgId,
-            source: chatJid.split(':', 1)[0] || 'unknown',
-            usage: output.streamEvent.usage,
-          });
-          if (lastAgentReplyMsgId) {
-            rebuildMessageTokenUsageFromLedger(
-              virtualChatJid,
-              effectiveGroup.folder,
-              lastAgentReplyMsgId,
-            );
-          } else {
+          const messageId = agentInputUsageProjection.messageId(
+            output.inputTurnId,
+          );
+          const total = agentInputUsageProjection.snapshot(output.inputTurnId);
+          if (messageId && total)
             updateLatestMessageTokenUsage(
               virtualChatJid,
-              JSON.stringify(output.streamEvent.usage),
-              undefined,
-              output.streamEvent.usage.costUSD,
+              JSON.stringify(total),
+              messageId,
+              total.costUSD,
             );
-          }
         } catch (err) {
           logger.warn(
             { err, chatJid, agentId },
@@ -17503,7 +17467,6 @@ async function processAgentConversation(
         const occupiesPrimarySlot = occupiesPrimaryReplyDeliverySlot(
           output.sourceKind,
         );
-        heldAgentUsagePatchPending = false;
         const isFirstReply = !(
           agentReplySentByInput.get(outputAgentScope.inputId) ?? false
         );
@@ -17526,10 +17489,12 @@ async function processAgentConversation(
         const dbTurnId = inHeldSeq
           ? heldAgentDbTurnId || outputAgentScope.inputId
           : outputAgentScope.inputId;
-        lastAgentReplyMsgId = msgId;
         lastAgentReplyText = dbText;
         const timestamp = new Date().toISOString();
         ensureChatExists(virtualChatJid);
+        const tokenUsage = agentInputUsageProjection.snapshot(
+          outputAgentScope.inputId,
+        );
         const persistedMsgId = storeMessageDirect(
           msgId,
           virtualChatJid,
@@ -17539,6 +17504,7 @@ async function processAgentConversation(
           timestamp,
           true,
           {
+            tokenUsage: tokenUsage ? JSON.stringify(tokenUsage) : undefined,
             meta: {
               turnId: dbTurnId,
               sessionId: output.sessionId || currentAgentSessionId,
@@ -17547,6 +17513,17 @@ async function processAgentConversation(
               finalizationReason: output.finalizationReason || 'completed',
             },
           },
+        );
+        if (tokenUsage)
+          updateLatestMessageTokenUsage(
+            virtualChatJid,
+            JSON.stringify(tokenUsage),
+            persistedMsgId,
+            tokenUsage.costUSD,
+          );
+        agentInputUsageProjection.bindMessage(
+          outputAgentScope.inputId,
+          persistedMsgId,
         );
         if (holdReason) {
           heldAgentDbMsgId = persistedMsgId;
@@ -17565,6 +17542,7 @@ async function processAgentConversation(
             content: dbText,
             timestamp,
             is_from_me: true,
+            token_usage: tokenUsage ? JSON.stringify(tokenUsage) : undefined,
             turn_id: dbTurnId,
             session_id: output.sessionId || currentAgentSessionId,
             sdk_message_uuid: output.sdkMessageUuid ?? null,
@@ -17712,8 +17690,6 @@ async function processAgentConversation(
           );
           const cardCompleted = cardFinalization.acknowledged;
           if (cardCompleted) {
-            // 定稿后等最终 usage 事件做合并补丁（挂起期累计 + 最终 turn）
-            heldAgentUsagePatchPending = true;
             heldAgentParts = [];
           } else if (cardFinalization.error) {
             agentStreamingCardDeliveryUncertain =
@@ -17745,7 +17721,6 @@ async function processAgentConversation(
                 : 'Agent streaming card final ACK was rejected; falling back to exact static delivery',
             );
             heldAgentParts = [];
-            heldAgentUsage = null;
           } else {
             logger.error(
               { chatJid, agentId, inputTurnId: outputAgentScope.inputId },
@@ -18315,7 +18290,6 @@ async function processAgentConversation(
             : '后台任务未全部完成，会话已结束';
           finalizeHeldAgentDbMessage(heldNote, 'interrupted');
           heldAgentParts = [];
-          heldAgentUsage = null;
           await agentStreamingSession.abort(heldNote).catch(() => {});
         } else if (agentProviderFailoverPending) {
           await agentStreamingSession
@@ -18374,7 +18348,6 @@ async function processAgentConversation(
         'interrupted',
       );
       heldAgentParts = [];
-      heldAgentUsage = null;
     }
 
     if (agentChannelTurnRuntimes.size > 0) {
@@ -18548,6 +18521,9 @@ async function processAgentConversation(
           const msgId = crypto.randomUUID();
           const timestamp = new Date().toISOString();
           ensureChatExists(virtualChatJid);
+          const tokenUsage = agentInputUsageProjection.snapshot(
+            activeAgentInputTurnId,
+          );
           const persistedMsgId = storeMessageDirect(
             msgId,
             virtualChatJid,
@@ -18557,8 +18533,9 @@ async function processAgentConversation(
             timestamp,
             true,
             {
+              tokenUsage: tokenUsage ? JSON.stringify(tokenUsage) : undefined,
               meta: {
-                turnId: lastProcessed.id,
+                turnId: activeAgentInputTurnId,
                 sessionId: currentAgentSessionId,
                 sourceKind: 'interrupt_partial',
                 finalizationReason: 'interrupted',
@@ -18575,7 +18552,8 @@ async function processAgentConversation(
               content: interruptedText,
               timestamp,
               is_from_me: true,
-              turn_id: lastProcessed.id,
+              token_usage: tokenUsage ? JSON.stringify(tokenUsage) : undefined,
+              turn_id: activeAgentInputTurnId,
               session_id: currentAgentSessionId,
               sdk_message_uuid: null,
               source_kind: 'interrupt_partial',
@@ -18616,6 +18594,7 @@ async function processAgentConversation(
         const msgId = crypto.randomUUID();
         const timestamp = new Date().toISOString();
         ensureChatExists(virtualChatJid);
+        const tokenUsage = agentInputUsageProjection.snapshot(partialInputId);
         const persistedMsgId = storeMessageDirect(
           msgId,
           virtualChatJid,
@@ -18625,6 +18604,7 @@ async function processAgentConversation(
           timestamp,
           true,
           {
+            tokenUsage: tokenUsage ? JSON.stringify(tokenUsage) : undefined,
             meta: {
               turnId: partialInputId,
               sessionId: currentAgentSessionId,
@@ -18643,6 +18623,7 @@ async function processAgentConversation(
             content: partialReply,
             timestamp,
             is_from_me: true,
+            token_usage: tokenUsage ? JSON.stringify(tokenUsage) : undefined,
             turn_id: partialInputId,
             session_id: currentAgentSessionId,
             sdk_message_uuid: null,
