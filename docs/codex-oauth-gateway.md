@@ -1,12 +1,110 @@
-# Using a ChatGPT/Codex Subscription via an OAuth Gateway
+# ChatGPT/Codex subscriptions: built-in and external gateways
 
-This guide describes a deployment-level integration: how to use a paid
-ChatGPT/Codex subscription (OAuth login) as a HappyClaw conversation
-provider. It requires no code changes — HappyClaw only needs a provider
-that speaks the Anthropic messages protocol, and a local OAuth gateway
-supplies exactly that.
+HappyClaw includes a ChatGPT/Codex OAuth gateway. Use the built-in login for
+an account attached to a HappyClaw provider. An external gateway such as
+CLIProxyAPI remains an alternative when you need a separately managed
+account pool. These are two independent integrations: the built-in flow does
+not read or update the host's Codex CLI login file.
 
-## How it works
+## Built-in gateway
+
+### Sign in and select a provider
+
+1. As an administrator with system configuration access, open provider setup
+   (`/setup/providers`) and choose **ChatGPT 订阅**.
+2. Click **登录 ChatGPT**, open the generated authorization URL, and sign in
+   with the account whose Codex access you want to use. Access depends on the
+   account's current subscription and OpenAI's availability rules.
+3. The OAuth redirect goes to `http://localhost:1455/auth/callback`. This is
+   expected; HappyClaw does not start a callback listener on your browser's
+   computer. Copy the complete callback URL from the address bar and paste it
+   into HappyClaw's callback field. The URL contains the one-time code and
+   state; keep it private and finish the flow within ten minutes.
+4. Enable the provider, choose its target Codex model and reasoning effort,
+   then select it for the workspace. Use the available model catalog rather
+   than a model name copied from an old example.
+
+HappyClaw exchanges the code with PKCE, reads the official namespaced JWT
+identity claims, and saves OAuth secrets encrypted in its provider secret
+store. **重新登录 ChatGPT** replaces that provider's login; clearing or
+disabling it stops authorization through its gateway key. No additional
+Docker gateway service or device-code-login switch is needed for this flow.
+
+### Runtime and account isolation
+
+```text
+Claude Agent SDK (host or agent container)
+       | Anthropic Messages + provider gateway key
+       v
+HappyClaw /gateway/chatgpt/v1/messages
+       | OAuth access token + selected ChatGPT account header
+       v
+ChatGPT / Codex Responses backend
+```
+
+The provider's gateway key is distinct from the upstream OAuth secrets.
+Only that key is given to the runner; the host service owns access-token
+refresh. HappyClaw derives the local gateway address for host and container
+execution automatically. The saved internal URL is a routing placeholder,
+not an external service to deploy or expose separately.
+
+Each provider identifies one authorization. It is not an account-rotation
+pool. Requests refresh short-lived tokens when needed, share a single refresh
+per provider, and re-read persisted credentials after concurrent changes.
+A failed compare-and-swap never returns an old credential snapshot or
+silently overwrites a reauthorization. A provider disabled or key rotated
+during refresh is checked again before serving the request.
+
+### Protocol and operating limits
+
+- Text, base64 images, function tools and SSE/nonstream responses are
+  translated into the Codex backend's Responses format. A screenshot inside
+  a tool result is carried as an adjacent user image message labelled with
+  the originating tool call ID. Gateway-issued encrypted reasoning
+  signatures are replayed on later tool turns.
+- Cached Responses input is subtracted from Anthropic `input_tokens` and
+  reported separately as `cache_read_input_tokens`. Their sum is the actual
+  input count used by usage history, token quotas and billing.
+- Authentication runs before body buffering or rate-counter allocation.
+  Each authenticated provider has 120 requests per 60-second window, shared
+  across its gateway-key rotations. Rate state has a hard capacity of 1,024
+  active provider windows; a full table rejects new windows until expiry.
+- Requests are capped at 32 MiB. Invalid message, tool or image shapes return
+  400; unsupported image URL sources are rejected explicitly instead of
+  silently disappearing. Images must use the supported base64 source shape.
+- Upstream headers have a 30-second deadline and streams a 60-second idle
+  deadline. Nonstream aggregation also has a ten-minute deadline and a
+  32 MiB budget. Individual SSE events are bounded. Downstream backpressure
+  pauses upstream reading, and cancellation disconnects the upstream stream.
+- Success logs record model and usage counts. Upstream HTTP error bodies are
+  cancelled without being buffered or logged; they can contain user content
+  or secrets.
+
+### Verify and recover
+
+Send a short message in a workspace using the newly authorized provider.
+Then verify a streamed reply, a tool round trip (including an image result
+if your workflow uses screenshots), and usage history. Local protocol tests
+use synthetic tokens and mocked upstream streams; they do not establish
+that an account can access the live backend.
+
+| Symptom                         | Check                                                                                                                               |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| Login callback rejected         | Finish the same user's flow within ten minutes and paste its complete callback URL; do not reuse a consumed code.                   |
+| 401 or authentication error     | Verify the provider is enabled and still authorized. Use its HappyClaw re-login action if the refresh grant expired or was revoked. |
+| 429 from HappyClaw gateway      | Wait for the provider's fixed rate window to expire; all workspaces sharing that provider share its budget.                         |
+| 413                             | Reduce the request below the 32 MiB envelope, including image base64 overhead.                                                      |
+| 400 invalid messages request    | Check supported message/tool shapes and use base64 image sources.                                                                   |
+| Upstream model/plan rejection   | Select a model available to the linked account and check its current Codex access.                                                  |
+| Stream timeout or premature EOF | Retry after checking upstream connectivity; a partial reply is reported as an error, not a successful terminal.                     |
+
+## External CLIProxyAPI gateway (optional)
+
+The following deployment is separate from HappyClaw's built-in OAuth login.
+Here CLIProxyAPI owns account credentials, refresh and pooling; HappyClaw
+uses it as an ordinary third-party Anthropic-compatible provider.
+
+### How the external gateway works
 
 HappyClaw's provider system is Anthropic-native. The gateway sits between
 HappyClaw and OpenAI: it owns the Codex OAuth login and token refresh, and
@@ -32,17 +130,16 @@ Two properties make this setup practical:
   automatically using the stored refresh token and rewrites the credential
   file in place.
 
-## Prerequisites
+### External prerequisites
 
-- A ChatGPT account with a paid subscription (Plus/Pro); free accounts
-  cannot use Codex.
+- A ChatGPT account eligible for the Codex models you intend to use.
 - In the ChatGPT web app, enable **Settings → Security → Device code
   login** for Codex on the account you plan to use. This is an
   account-level switch and must be enabled before the device-code flow
   below will succeed.
 - Docker on the HappyClaw host.
 
-## 1. Deploy the gateway
+### 1. Deploy the gateway
 
 This guide uses [CLIProxyAPI](https://github.com/eceasy/cli-proxy-api)
 (`eceasy/cli-proxy-api`), which supports Codex OAuth accounts and an
@@ -79,7 +176,7 @@ docker run -d --name cpa-server --restart always \
   eceasy/cli-proxy-api:latest
 ```
 
-Port binding notes:
+Port binding notes (the `172.17.0.1` example is for Linux Docker):
 
 - `172.17.0.1` is the Docker bridge gateway. Binding there keeps the
   service unreachable from the public internet while still reachable from
@@ -88,7 +185,7 @@ Port binding notes:
 - If HappyClaw runs Agents directly on the host (host execution mode),
   bind to `127.0.0.1` instead.
 
-## 2. Log in with a device code
+### 2. Log in with a device code
 
 Run the device-code login inside the container:
 
@@ -106,7 +203,7 @@ On success the credential file (named after the account) appears in the
 `auths/` directory, the gateway hot-reloads it without a restart, and the
 account joins the serving pool.
 
-## 3. Verify the gateway
+### 3. Verify the gateway
 
 ```bash
 # Model list
@@ -126,7 +223,7 @@ pick one from `/v1/models` (for example `gpt-5.6-sol`). Tool use and SSE
 streaming on `/v1/messages` work as with any Anthropic-compatible
 endpoint.
 
-## 4. Add the provider in HappyClaw
+### 4. Add the provider in HappyClaw
 
 In the web UI, go to **Provider setup** (`/setup/providers`), create a
 third-party provider, and fill in:
@@ -140,7 +237,7 @@ third-party provider, and fill in:
 Enable the provider and switch the target workspace to it. No other
 HappyClaw configuration changes are needed.
 
-## 5. Multiple accounts
+### 5. Multiple accounts
 
 Two layouts are supported:
 
@@ -156,7 +253,7 @@ Two layouts are supported:
 Both layouts refresh tokens independently; keeping the container running
 (`restart: always`) is what keeps refreshes happening.
 
-## Security notes
+### External gateway security notes
 
 - Never expose the gateway port publicly. Bind to the Docker bridge or
   loopback only, and keep `remote-management.allow-remote: false`.
@@ -170,7 +267,7 @@ Both layouts refresh tokens independently; keeping the container running
   password, or revoking the authorization invalidates the refresh token;
   re-run the device-code login to recover.
 
-## Troubleshooting
+### External gateway troubleshooting
 
 | Symptom                                                 | Likely cause / fix                                                                                      |
 | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
