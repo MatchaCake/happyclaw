@@ -120,6 +120,8 @@ function agentRunEnd(streamedText: string) {
     activeImReplyRoutes: new Map(),
     activeAgentBuilderTurns: new Map(),
     activeChannelTurns: new Map(),
+    activeChannelTurnActivators: new Map(),
+    activateAgentChannelTurn: vi.fn(),
     ipcWatcherManager: undefined,
   };
   const harness = createRuntimeSourceHarness(globals);
