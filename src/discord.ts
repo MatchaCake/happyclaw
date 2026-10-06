@@ -918,6 +918,7 @@ export function createDiscordConnection(
             GatewayIntentBits.GuildMessageReactions,
           ],
           partials: [Partials.Channel, Partials.Message],
+          rest: { retries: 0 },
         });
         discordClient = connectedClient;
 
