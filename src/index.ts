@@ -28,6 +28,7 @@ import {
   preAcceptImDeliveryError,
 } from './im-send-retry-policy.js';
 import { createIpcSendDeduplicator } from './ipc-send-dedup.js';
+import { writeExclusiveIpcResult } from './ipc-exclusive-result.js';
 import {
   DEFAULT_IPC_WATCHER_FALLBACK_MS,
   IpcWatcherManager,
@@ -14458,9 +14459,7 @@ async function processTaskIpc(
             current_run: getActiveTaskRunForTask(t.id) ?? null,
           }));
           const resultData = JSON.stringify({ success: true, tasks: taskList });
-          const tmpPath = `${resultFilePath}.tmp`;
-          fs.writeFileSync(tmpPath, resultData);
-          fs.renameSync(tmpPath, resultFilePath);
+          writeExclusiveIpcResult(listTasksDir, resultFilePath, resultData);
           logger.debug(
             { sourceGroup, taskCount: taskList.length },
             'Task list sent via IPC',
@@ -14470,9 +14469,7 @@ async function processTaskIpc(
             success: false,
             error: err instanceof Error ? err.message : String(err),
           });
-          const tmpPath = `${resultFilePath}.tmp`;
-          fs.writeFileSync(tmpPath, errorResult);
-          fs.renameSync(tmpPath, resultFilePath);
+          writeExclusiveIpcResult(listTasksDir, resultFilePath, errorResult);
           logger.error({ sourceGroup, err }, 'Failed to list tasks via IPC');
         }
       }
@@ -14746,19 +14743,19 @@ async function processTaskIpc(
             success: false,
             error: 'No user associated with this group',
           });
-          const tmpPath = `${resultFilePath}.tmp`;
           fs.mkdirSync(path.dirname(resultFilePath), { recursive: true });
-          fs.writeFileSync(tmpPath, errorResult);
-          fs.renameSync(tmpPath, resultFilePath);
+          writeExclusiveIpcResult(tasksDir, resultFilePath, errorResult);
           break;
         }
 
         try {
           const result = await installSkillForUser(userId, pkg);
-          const tmpPath = `${resultFilePath}.tmp`;
           fs.mkdirSync(path.dirname(resultFilePath), { recursive: true });
-          fs.writeFileSync(tmpPath, JSON.stringify(result));
-          fs.renameSync(tmpPath, resultFilePath);
+          writeExclusiveIpcResult(
+            tasksDir,
+            resultFilePath,
+            JSON.stringify(result),
+          );
           logger.info(
             { sourceGroup, userId, pkg, success: result.success },
             'Skill installation via IPC completed',
@@ -14768,10 +14765,8 @@ async function processTaskIpc(
             success: false,
             error: err instanceof Error ? err.message : String(err),
           });
-          const tmpPath = `${resultFilePath}.tmp`;
           fs.mkdirSync(path.dirname(resultFilePath), { recursive: true });
-          fs.writeFileSync(tmpPath, errorResult);
-          fs.renameSync(tmpPath, resultFilePath);
+          writeExclusiveIpcResult(tasksDir, resultFilePath, errorResult);
           logger.error(
             { sourceGroup, userId, pkg, err },
             'Skill installation via IPC failed',
@@ -14822,18 +14817,18 @@ async function processTaskIpc(
             success: false,
             error: 'No user associated with this group',
           });
-          const tmpPath = `${resultFilePath}.tmp`;
           fs.mkdirSync(path.dirname(resultFilePath), { recursive: true });
-          fs.writeFileSync(tmpPath, errorResult);
-          fs.renameSync(tmpPath, resultFilePath);
+          writeExclusiveIpcResult(tasksDir, resultFilePath, errorResult);
           break;
         }
 
         const result = await deleteSkillForUser(userId, skillId);
-        const tmpPath = `${resultFilePath}.tmp`;
         fs.mkdirSync(path.dirname(resultFilePath), { recursive: true });
-        fs.writeFileSync(tmpPath, JSON.stringify(result));
-        fs.renameSync(tmpPath, resultFilePath);
+        writeExclusiveIpcResult(
+          tasksDir,
+          resultFilePath,
+          JSON.stringify(result),
+        );
         logger.info(
           { sourceGroup, userId, skillId, success: result.success },
           'Skill uninstall via IPC completed',
@@ -15318,9 +15313,7 @@ async function handleDiscordIpcRequest(
   fs.mkdirSync(path.dirname(resultFilePath), { recursive: true });
 
   const writeResult = (payload: object): void => {
-    const tmpPath = `${resultFilePath}.tmp`;
-    fs.writeFileSync(tmpPath, JSON.stringify(payload));
-    fs.renameSync(tmpPath, resultFilePath);
+    writeExclusiveIpcResult(tasksDir, resultFilePath, JSON.stringify(payload));
   };
 
   try {
