@@ -75,20 +75,38 @@ async function turn(jid, prompt, marker, agentId) {
   }, 30_000);
   const isFinal = (message) =>
     message?.is_from_me &&
-    message.turn_id === receipt.id &&
+    typeof message.turn_id === 'string' &&
+    message.turn_id.length > 0 &&
     message.source_kind === 'sdk_final' &&
     message.finalization_reason === 'completed' &&
     message.content?.trim() === marker;
-  await waitUntil(() =>
-    scopedEvents(jid, agentId, after).some(
+  let final;
+  await waitUntil(() => {
+    final = scopedEvents(jid, agentId, after).find(
       (event) => event.type === 'new_message' && isFinal(event.message),
+    )?.message;
+    return !!final;
+  });
+  // Warm inputs receive a new canonical delivery ID; it is deliberately
+  // different from the original user row ID. Correlate the unique marker's
+  // final row with its actual stream turn and persisted row instead.
+  assert(
+    scopedEvents(jid, agentId, after).some(
+      (event) =>
+        event.type === 'stream_event' && event.event?.turnId === final.turn_id,
     ),
+    'Final response is missing its correlated stream turn',
   );
   const route = `/api/groups/${encodeURIComponent(jid)}/messages${agentId ? `?agentId=${encodeURIComponent(agentId)}` : ''}`;
   await waitUntil(
     async () => {
       const history = await api('GET', route);
-      return history.messages.some(isFinal);
+      return history.messages.some(
+        (message) =>
+          message.id === final.id &&
+          message.turn_id === final.turn_id &&
+          isFinal(message),
+      );
     },
     15_000,
     1000,
