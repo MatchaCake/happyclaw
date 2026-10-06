@@ -8,6 +8,7 @@
  */
 
 import { Hono, type Context } from 'hono';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -103,7 +104,10 @@ function readWorkspaceMeta(
   try {
     const data = fs.readFileSync(getWorkspaceMcpMetaPath(group), 'utf-8');
     return JSON.parse(data);
-  } catch {
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      throw err;
+    }
     return { mcpServers: {} };
   }
 }
@@ -113,8 +117,29 @@ function writeWorkspaceMeta(
   meta: WorkspaceMeta,
 ): void {
   const metaPath = getWorkspaceMcpMetaPath(group);
+  try {
+    const existing = fs.readFileSync(metaPath, 'utf-8');
+    JSON.parse(existing);
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      throw err;
+    }
+  }
   fs.mkdirSync(path.dirname(metaPath), { recursive: true });
-  fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+  const tmpPath = `${metaPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(meta, null, 2), {
+      flag: 'wx',
+      mode: 0o600,
+    });
+    fs.renameSync(tmpPath, metaPath);
+  } finally {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      /* already renamed or never created */
+    }
+  }
 }
 
 function readWorkspaceSettings(
@@ -123,7 +148,10 @@ function readWorkspaceSettings(
   try {
     const data = fs.readFileSync(getWorkspaceSettingsPath(group), 'utf-8');
     return JSON.parse(data);
-  } catch {
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      throw err;
+    }
     return {};
   }
 }
@@ -133,8 +161,29 @@ function writeWorkspaceSettings(
   settings: Record<string, unknown>,
 ): void {
   const settingsPath = getWorkspaceSettingsPath(group);
+  try {
+    const existing = fs.readFileSync(settingsPath, 'utf-8');
+    JSON.parse(existing);
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      throw err;
+    }
+  }
   fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
-  fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+  const tmpPath = `${settingsPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(settings, null, 2), {
+      flag: 'wx',
+      mode: 0o600,
+    });
+    fs.renameSync(tmpPath, settingsPath);
+  } finally {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      /* already renamed or never created */
+    }
+  }
 }
 
 /**
