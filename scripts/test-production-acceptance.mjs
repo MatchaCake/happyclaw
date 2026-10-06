@@ -404,8 +404,17 @@ try {
   }
   for (const taskId of ownedTasks) {
     try {
-      const task = (await api('GET', '/api/tasks')).tasks.find(
-        (item) => item.id === taskId,
+      let task;
+      // Cancellation becomes durable before the process finishes stopping.
+      // Wait for the scheduler's process ownership to clear before deletion.
+      await waitUntil(
+        async () => {
+          const state = await api('GET', '/api/tasks');
+          task = state.tasks.find((item) => item.id === taskId);
+          return !state.runningTaskIds.includes(taskId);
+        },
+        60_000,
+        1000,
       );
       assert(task, 'Acceptance task is missing');
       const deleted = await api(
