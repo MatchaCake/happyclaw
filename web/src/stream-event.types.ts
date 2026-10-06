@@ -368,6 +368,8 @@ export interface StreamEvent {
     content: string;
     status: 'pending' | 'in_progress' | 'completed';
   }>;
+  /** input_total is a complete per-input display snapshot, never a billable delta. */
+  usageProjection?: 'input_total';
   /** Token usage data emitted at query completion */
   usage?: {
     /** Stable logical run ID used to make analytics and billing idempotent. */

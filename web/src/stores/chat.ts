@@ -2763,6 +2763,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const inputTurnId = event.inputTurnId || event.turnId;
       if (!inputTurnId) return;
       const usage = event.usage;
+      // input_total replaces the complete input snapshot, including when it
+      // arrives before the final. Legacy result batches are already merged by
+      // the host; both formats replace here instead of re-counting replayed data.
       const tokenUsageJson = JSON.stringify({
         inputTokens: usage.inputTokens,
         outputTokens: usage.outputTokens,
