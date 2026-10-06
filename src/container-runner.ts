@@ -369,11 +369,38 @@ function removePreviousSettingsProjection(
   return cleaned;
 }
 
-function readSettingsRecord(filePath: string): Record<string, unknown> {
+function writeAtomicFile(
+  filePath: string,
+  contents: string,
+  mode: number,
+): void {
+  const tmpPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, contents, { flag: 'wx', mode });
+    fs.renameSync(tmpPath, filePath);
+  } finally {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function readSettingsRecord(
+  filePath: string,
+  options?: { ignoreSyntaxError?: boolean },
+): Record<string, unknown> {
   try {
     const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
     return isSettingsRecord(parsed) ? parsed : {};
-  } catch {
+  } catch (error) {
+    if (
+      !options?.ignoreSyntaxError &&
+      (error instanceof SyntaxError || (error as Error)?.name === 'SyntaxError')
+    ) {
+      throw error;
+    }
     return {};
   }
 }
@@ -391,8 +418,26 @@ function ensureSettingsJson(
     path.dirname(settingsFile),
     '.happyclaw-native-settings.json',
   );
-  const current = readSettingsRecord(settingsFile);
-  const previousProjection = readSettingsRecord(projectionFile);
+  let current: Record<string, unknown>;
+  try {
+    current = readSettingsRecord(settingsFile);
+  } catch (error) {
+    if (
+      error instanceof SyntaxError ||
+      (error as Error)?.name === 'SyntaxError'
+    ) {
+      return;
+    }
+    throw error;
+  }
+  let previousProjection: Record<string, unknown>;
+  try {
+    previousProjection = readSettingsRecord(projectionFile, {
+      ignoreSyntaxError: true,
+    });
+  } catch {
+    previousProjection = {};
+  }
   const existing = mergeSettingsRecord(
     removePreviousSettingsProjection(current, previousProjection),
     options?.baseSettings ?? {},
@@ -424,7 +469,7 @@ function ensureSettingsJson(
     /* write anyway */
   }
   if (settingsChanged) {
-    fs.writeFileSync(settingsFile, newContent, { mode: 0o644 });
+    writeAtomicFile(settingsFile, newContent, 0o644);
   }
 
   const projectionContent = `${JSON.stringify(options?.baseSettings ?? {}, null, 2)}\n`;
@@ -438,7 +483,7 @@ function ensureSettingsJson(
   } catch {
     /* write anyway */
   }
-  fs.writeFileSync(projectionFile, projectionContent, { mode: 0o600 });
+  writeAtomicFile(projectionFile, projectionContent, 0o600);
 }
 
 export interface ContainerInput {
