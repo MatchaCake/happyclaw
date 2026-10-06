@@ -1494,13 +1494,17 @@ export function createDiscordChannel(
         typingExpiry.arm(chatId, leaseId);
         // Discord typing indicator lasts 10s, repeat every 9s
         if (!typingIntervals.has(chatId)) {
-          await inner.setTyping(chatId, true);
+          // Reserve the per-chat pulse synchronously, before the provider
+          // round trip: a concurrent acquire for another lease (or a release
+          // racing this await) must see and own this single interval, or the
+          // interval created after the await is orphaned forever.
           const interval = setInterval(async () => {
             try {
               if (inner) await inner.setTyping(chatId, true);
             } catch {}
           }, 9000);
           typingIntervals.set(chatId, interval);
+          await inner.setTyping(chatId, true);
         }
       } else {
         const leases = typingLeases.get(chatId);
