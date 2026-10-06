@@ -411,14 +411,18 @@ export async function yieldTelegramAnimationDocument(
   return true;
 }
 
-export type TelegramOutboundFileKind = 'video' | 'audio' | 'voice' | 'document';
+export type TelegramOutboundFileKind = 'audio' | 'voice' | 'document';
 
-/** Telegram's native APIs accept a narrower set than generic MIME viewers. */
+/**
+ * Telegram's native APIs accept a narrower set than generic MIME viewers.
+ * Videos go through sendDocument: sendVideo without width/height makes
+ * clients render a square placeholder, while sendDocument keeps the
+ * original file and its real aspect ratio.
+ */
 export function telegramOutboundFileKind(
   fileName: string,
 ): TelegramOutboundFileKind {
   const ext = (fileName.split('.').pop() || '').toLowerCase();
-  if (ext === 'mp4') return 'video';
   if (ext === 'mp3' || ext === 'm4a') return 'audio';
   if (ext === 'ogg' || ext === 'opus') return 'voice';
   return 'document';
@@ -2315,13 +2319,7 @@ export function createTelegramConnection(
           ? { message_thread_id: target.messageThreadId }
           : {};
         const fileKind = telegramOutboundFileKind(fileName);
-        if (fileKind === 'video') {
-          await activeBot.api.sendVideo(
-            target.chatId,
-            inputFile,
-            threadOptions,
-          );
-        } else if (fileKind === 'audio') {
+        if (fileKind === 'audio') {
           await activeBot.api.sendAudio(
             target.chatId,
             inputFile,
