@@ -848,9 +848,23 @@ const BACKGROUND_PROTOCOL_DEBT_TIMEOUT_MS = 15_000;
 const BACKGROUND_PROTOCOL_FAILURE_EXIT_GRACE_MS = 1_000;
 
 function writeOutput(output: ContainerOutput): void {
-  const correlatedOutput: ContainerOutput = activeOutputInputTurnId
+  let correlatedOutput: ContainerOutput = activeOutputInputTurnId
     ? { ...output, inputTurnId: output.inputTurnId ?? activeOutputInputTurnId }
     : output;
+  if (
+    correlatedOutput.streamEvent?.eventType === 'usage' &&
+    correlatedOutput.inputTurnId
+  ) {
+    // Copy the emitted frame's immutable owner, not the mutable presentation
+    // turn or whichever queued input happens to be active when it is written.
+    correlatedOutput = {
+      ...correlatedOutput,
+      streamEvent: {
+        ...correlatedOutput.streamEvent,
+        inputTurnId: correlatedOutput.inputTurnId,
+      },
+    };
+  }
   console.log(OUTPUT_START_MARKER);
   console.log(JSON.stringify(correlatedOutput));
   console.log(OUTPUT_END_MARKER);

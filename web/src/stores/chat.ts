@@ -245,10 +245,20 @@ export function mergeMessagesChronologically(
     // payload has been enriched with the REST-only ingest cursor. Never erase
     // an already-authoritative sequence or pagination can silently fall back
     // to the provider timestamp boundary.
-    const next =
+    let next =
       old?.ingest_sequence !== undefined && m.ingest_sequence === undefined
         ? { ...m, ingest_sequence: old.ingest_sequence }
         : m;
+    if (
+      old?.token_usage !== undefined &&
+      next.token_usage === undefined &&
+      old.chat_jid === next.chat_jid &&
+      old.turn_id === next.turn_id
+    ) {
+      // Final WS projections can omit usage already received for this exact
+      // row. A later enriched REST value still replaces the local projection.
+      next = { ...next, token_usage: old.token_usage };
+    }
     if (
       !old ||
       old.content !== next.content ||
@@ -356,6 +366,86 @@ function markThinkingEnded(prev: StreamingState, next: StreamingState): void {
   }
 }
 
+interface PendingMessageUsage {
+  chatJid: string;
+  agentId?: string;
+  inputTurnId: string;
+  tokenUsageJson: string;
+  receivedAt: number;
+}
+
+const PENDING_MESSAGE_USAGE_TTL_MS = 5 * 60 * 1000;
+const MAX_PENDING_MESSAGE_USAGE = 128;
+
+function messageUsageKey(
+  chatJid: string,
+  agentId: string | undefined,
+  inputTurnId: string,
+): string {
+  return JSON.stringify([chatJid, agentId ?? null, inputTurnId]);
+}
+
+function prunePendingMessageUsage(
+  pending: Record<string, PendingMessageUsage>,
+): Record<string, PendingMessageUsage> {
+  const oldest = Date.now() - PENDING_MESSAGE_USAGE_TTL_MS;
+  return Object.fromEntries(
+    Object.entries(pending)
+      .filter(([, entry]) => entry.receivedAt > oldest)
+      .sort((a, b) => a[1].receivedAt - b[1].receivedAt)
+      .slice(-MAX_PENDING_MESSAGE_USAGE),
+  );
+}
+
+function clearPendingMessageUsage(
+  pending: Record<string, PendingMessageUsage>,
+  chatJid: string,
+  agentId?: string,
+  allAgents = false,
+): Record<string, PendingMessageUsage> {
+  return Object.fromEntries(
+    Object.entries(pending).filter(
+      ([, entry]) =>
+        entry.chatJid !== chatJid || (!allAgents && entry.agentId !== agentId),
+    ),
+  );
+}
+
+function isUsageAnswer(message: Message, runtimeJid: string): boolean {
+  return (
+    message.chat_jid === runtimeJid &&
+    message.is_from_me &&
+    message.sender !== '__system__' &&
+    message.source_kind !== 'sdk_send_message' &&
+    message.source_kind !== 'scheduled_task_result' &&
+    !!message.turn_id
+  );
+}
+
+function mergePendingMessageUsage(
+  messages: Message[],
+  pending: Record<string, PendingMessageUsage>,
+  chatJid: string,
+  agentId?: string,
+): { messages: Message[]; pending: Record<string, PendingMessageUsage> } {
+  const next = prunePendingMessageUsage(pending);
+  const runtimeJid = agentId ? `${chatJid}#agent:${agentId}` : chatJid;
+  return {
+    messages: messages.map((message) => {
+      if (!isUsageAnswer(message, runtimeJid)) return message;
+      const key = messageUsageKey(chatJid, agentId, message.turn_id!);
+      const entry = next[key];
+      if (!entry) return message;
+      delete next[key];
+      // Enriched REST/final rows already contain the authoritative ledger total.
+      return message.token_usage
+        ? message
+        : { ...message, token_usage: entry.tokenUsageJson };
+    }),
+    pending: next,
+  };
+}
+
 interface ChatState {
   groups: Record<string, GroupInfo>;
   adminHostOnlyMode: boolean;
@@ -364,6 +454,8 @@ interface ChatState {
   waiting: Record<string, boolean>;
   /** Exact GroupQueue query attempt per main/agent runtime JID. */
   activeRuns: ClientActiveRuns;
+  /** Usage received before its canonical final row; bounded and session-scoped. */
+  pendingMessageUsage: Record<string, PendingMessageUsage>;
   followUps: Record<string, QueuedFollowUp[]>;
   hasMore: Record<string, boolean>;
   loading: boolean;
@@ -1679,6 +1771,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   messages: {},
   waiting: {},
   activeRuns: {},
+  pendingMessageUsage: {},
   followUps: {},
   hasMore: {},
   loading: false,
@@ -1792,10 +1885,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // Messages come in DESC order from API, reverse to chronological for display
         const sorted = [...data.messages].reverse();
         set((s) => {
-          const merged = mergeMessagesChronologically(
-            s.messages[jid] || [],
-            sorted,
+          const mergedUsage = mergePendingMessageUsage(
+            mergeMessagesChronologically(s.messages[jid] || [], sorted),
+            s.pendingMessageUsage,
+            jid,
           );
+          const merged = mergedUsage.messages;
           const nextWaiting = { ...s.waiting };
           if (s.activeRuns[jid]) {
             nextWaiting[jid] = true;
@@ -1804,6 +1899,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           }
 
           return {
+            pendingMessageUsage: mergedUsage.pending,
             messages: {
               ...s.messages,
               [jid]: merged,
@@ -1854,10 +1950,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (data.messages.length > 0) {
         // Messages from getMessagesAfter are already in ASC order
         set((s) => {
-          const merged = mergeMessagesChronologically(
-            s.messages[jid] || [],
-            data.messages,
+          const mergedUsage = mergePendingMessageUsage(
+            mergeMessagesChronologically(s.messages[jid] || [], data.messages),
+            s.pendingMessageUsage,
+            jid,
           );
+          const merged = mergedUsage.messages;
           // Check if agent has truly finalized (explicit sdk_send_message should not clear streaming)
           // interrupt_partial 到达时若流式卡片已冻结，不视为"agent 已回复"，
           // 避免清除冻结的富内容。消息仍添加到列表，10s 兜底计时器做最终清理。
@@ -1908,6 +2006,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           }
 
           return {
+            pendingMessageUsage: mergedUsage.pending,
             messages: { ...s.messages, [jid]: merged },
             waiting:
               agentReplied || hasSystemError
@@ -2208,6 +2307,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
         `/api/groups/${encodeURIComponent(jid)}/reset-session`,
         agentId ? { agentId } : undefined,
       );
+      set((s) => ({
+        pendingMessageUsage: clearPendingMessageUsage(
+          s.pendingMessageUsage,
+          jid,
+          agentId,
+        ),
+      }));
       if (agentId) {
         set((s) => {
           const nextStreaming = { ...s.agentStreaming };
@@ -2309,6 +2415,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
             s.thinkingDurationCache,
           ),
           agents: nextAgents,
+          pendingMessageUsage: clearPendingMessageUsage(
+            s.pendingMessageUsage,
+            jid,
+            undefined,
+            true,
+          ),
           agentMessages: nextAgentMessages,
           agentStreaming: nextAgentStreaming,
           agentWaiting: nextAgentWaiting,
@@ -2574,6 +2686,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
         return {
           groups: nextGroups,
+          pendingMessageUsage: clearPendingMessageUsage(
+            s.pendingMessageUsage,
+            jid,
+            undefined,
+            true,
+          ),
           messages: nextMessages,
           waiting: nextWaiting,
           hasMore: nextHasMore,
@@ -2636,6 +2754,81 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     const runtimeJid = agentId ? `${chatJid}#agent:${agentId}` : chatJid;
     if (!shouldApplyRunScopedPayload(get().activeRuns, runtimeJid, runId)) {
+      return;
+    }
+
+    if (event.eventType === 'usage' && event.usage) {
+      // Warm delivery IDs differ from presentation turn IDs. An old protocol
+      // event may use only an exact turn match; never guess the latest reply.
+      const inputTurnId = event.inputTurnId || event.turnId;
+      if (!inputTurnId) return;
+      const usage = event.usage;
+      const tokenUsageJson = JSON.stringify({
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        cacheReadInputTokens: usage.cacheReadInputTokens,
+        cacheCreationInputTokens: usage.cacheCreationInputTokens,
+        reasoningTokens: usage.reasoningTokens,
+        costUSD: usage.costUSD,
+        durationMs: usage.durationMs,
+        numTurns: usage.numTurns,
+        modelUsage: usage.modelUsage,
+      });
+      let snapshotMessages: Message[] | undefined;
+      let snapshotHasMore = false;
+      set((s) => {
+        const pending = prunePendingMessageUsage(s.pendingMessageUsage);
+        const messages = agentId
+          ? s.agentMessages[agentId] || []
+          : s.messages[chatJid] || [];
+        let targetIdx = -1;
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (
+            isUsageAnswer(messages[i], runtimeJid) &&
+            messages[i].turn_id === inputTurnId
+          ) {
+            targetIdx = i;
+            break;
+          }
+        }
+        const key = messageUsageKey(chatJid, agentId, inputTurnId);
+        if (targetIdx < 0) {
+          pending[key] = {
+            chatJid,
+            agentId,
+            inputTurnId,
+            tokenUsageJson,
+            receivedAt: Date.now(),
+          };
+          return { pendingMessageUsage: prunePendingMessageUsage(pending) };
+        }
+        delete pending[key];
+        const updated = [...messages];
+        updated[targetIdx] = {
+          ...updated[targetIdx],
+          token_usage: tokenUsageJson,
+        };
+        if (agentId) {
+          snapshotMessages = updated;
+          snapshotHasMore = !!s.agentHasMore[agentId];
+          return {
+            agentMessages: { ...s.agentMessages, [agentId]: updated },
+            pendingMessageUsage: pending,
+          };
+        }
+        return {
+          messages: { ...s.messages, [chatJid]: updated },
+          pendingMessageUsage: pending,
+        };
+      });
+      if (agentId && snapshotMessages) {
+        void saveAgentMessageSnapshot(
+          chatJid,
+          agentId,
+          snapshotMessages,
+          snapshotHasMore,
+        );
+      }
       return;
     }
 
@@ -2740,74 +2933,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
             });
           }
         }, 10_000);
-        return;
-      }
-
-      // Agent usage is emitted after the sdk_final message. At that point the
-      // final-message handler has already cleared agentStreaming and marked the
-      // Agent idle, so the generic late-event guard below would otherwise drop
-      // the usage event. Patch the persisted final bubble directly before that
-      // guard so token totals appear immediately without requiring a reload.
-      if (event.eventType === 'usage' && event.usage) {
-        const usage = event.usage;
-        const tokenUsageJson = JSON.stringify({
-          inputTokens: usage.inputTokens,
-          outputTokens: usage.outputTokens,
-          cacheReadInputTokens: usage.cacheReadInputTokens,
-          cacheCreationInputTokens: usage.cacheCreationInputTokens,
-          reasoningTokens: usage.reasoningTokens,
-          costUSD: usage.costUSD,
-          durationMs: usage.durationMs,
-          numTurns: usage.numTurns,
-          modelUsage: usage.modelUsage,
-        });
-        let snapshotMessages: Message[] | null = null;
-        let snapshotHasMore = false;
-        set((s) => {
-          const messages = s.agentMessages[agentId] || [];
-          let targetIdx = -1;
-          if (event.turnId) {
-            for (let i = messages.length - 1; i >= 0; i--) {
-              if (
-                messages[i].is_from_me &&
-                messages[i].turn_id === event.turnId &&
-                messages[i].source_kind !== 'sdk_send_message'
-              ) {
-                targetIdx = i;
-                break;
-              }
-            }
-          } else {
-            for (let i = messages.length - 1; i >= 0; i--) {
-              if (
-                messages[i].is_from_me &&
-                messages[i].source_kind !== 'sdk_send_message'
-              ) {
-                targetIdx = i;
-                break;
-              }
-            }
-          }
-          if (targetIdx < 0) return s;
-          const updated = [...messages];
-          updated[targetIdx] = {
-            ...updated[targetIdx],
-            token_usage: tokenUsageJson,
-          };
-          snapshotMessages = updated;
-          snapshotHasMore = !!s.agentHasMore[agentId];
-          return {
-            agentMessages: { ...s.agentMessages, [agentId]: updated },
-          };
-        });
-        if (snapshotMessages) {
-          void saveAgentMessageSnapshot(
-            chatJid,
-            agentId,
-            snapshotMessages,
-            snapshotHasMore,
-          );
-        }
         return;
       }
 
@@ -3109,60 +3234,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return;
     }
 
-    // ⑤.5 usage 事件 → 实时更新最近一条 AI 消息的 token_usage
-    if (event.eventType === 'usage' && event.usage) {
-      const usage = event.usage;
-      // 构造与 DB 中 token_usage JSON 一致的格式
-      const tokenUsageJson = JSON.stringify({
-        inputTokens: usage.inputTokens,
-        outputTokens: usage.outputTokens,
-        cacheReadInputTokens: usage.cacheReadInputTokens,
-        cacheCreationInputTokens: usage.cacheCreationInputTokens,
-        reasoningTokens: usage.reasoningTokens,
-        costUSD: usage.costUSD,
-        durationMs: usage.durationMs,
-        numTurns: usage.numTurns,
-        modelUsage: usage.modelUsage,
-      });
-      set((s) => {
-        const msgs = s.messages[chatJid];
-        if (!msgs || msgs.length === 0) return s;
-        // 优先按 turn_id 找对应正式回复，避免把 usage 绑到 send_message 上
-        let targetIdx = -1;
-        if (event.turnId) {
-          for (let i = msgs.length - 1; i >= 0; i--) {
-            if (
-              msgs[i].is_from_me &&
-              msgs[i].turn_id === event.turnId &&
-              msgs[i].source_kind !== 'sdk_send_message'
-            ) {
-              targetIdx = i;
-              break;
-            }
-          }
-        }
-        if (targetIdx < 0) {
-          for (let i = msgs.length - 1; i >= 0; i--) {
-            if (
-              msgs[i].is_from_me &&
-              msgs[i].source_kind !== 'sdk_send_message'
-            ) {
-              targetIdx = i;
-              break;
-            }
-          }
-        }
-        if (targetIdx < 0) return s;
-        const updated = [...msgs];
-        updated[targetIdx] = {
-          ...updated[targetIdx],
-          token_usage: tokenUsageJson,
-        };
-        return { messages: { ...s.messages, [chatJid]: updated } };
-      });
-      // 不 return — usage 事件同时落入主对话 streaming（如需 recentEvents 展示）
-    }
-
     // ⑥ 主对话 streaming — 使用 applyStreamEvent 共享函数
     set((s) => {
       // If streaming state was already cleared (final message received),
@@ -3226,6 +3297,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       delivery_run_id: wsMsg.delivery_run_id ?? null,
       delivery_updated_at: wsMsg.delivery_updated_at ?? null,
     };
+    const resetsContext =
+      msg.sender === '__system__' &&
+      (msg.content === 'context_reset' ||
+        msg.content === 'context_fresh_window');
     const isProactiveUtterance =
       msg.is_from_me &&
       msg.sender !== '__system__' &&
@@ -3240,7 +3315,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set((s) => {
         const existing = s.agentMessages[agentId] || [];
         const isNewMessage = !existing.some((item) => item.id === msg.id);
-        const updated = mergeMessagesChronologically(existing, [msg]);
+        const mergedUsage = mergePendingMessageUsage(
+          mergeMessagesChronologically(existing, [msg]),
+          resetsContext
+            ? clearPendingMessageUsage(s.pendingMessageUsage, chatJid, agentId)
+            : s.pendingMessageUsage,
+          chatJid,
+          agentId,
+        );
+        const updated = mergedUsage.messages;
         snapshotMessages = updated;
         snapshotHasMore = !!s.agentHasMore[agentId];
         const isAgentReply =
@@ -3303,6 +3386,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
         return {
           agentMessages: { ...s.agentMessages, [agentId]: updated },
+          pendingMessageUsage: mergedUsage.pending,
           agentWaiting: nextAgentWaiting,
           agentStreaming: nextAgentStreaming,
           unreadReplies: nextUnread,
@@ -3349,7 +3433,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const isNewMessage = !existing.some((item) => item.id === msg.id);
 
       // 消息已存在时保留原顺序，仅执行状态收尾（清 waiting/streaming）
-      const updated = mergeMessagesChronologically(existing, [msg]);
+      const mergedUsage = mergePendingMessageUsage(
+        mergeMessagesChronologically(existing, [msg]),
+        resetsContext
+          ? clearPendingMessageUsage(s.pendingMessageUsage, chatJid)
+          : s.pendingMessageUsage,
+        chatJid,
+      );
+      const updated = mergedUsage.messages;
       didReceiveProactiveUtterance = isNewMessage && isProactiveUtterance;
 
       const isAgentReply =
@@ -3414,6 +3505,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
         return {
           messages: { ...s.messages, [chatJid]: updated },
+          pendingMessageUsage: mergedUsage.pending,
           waiting: {
             ...s.waiting,
             [chatJid]: exactRunActive || holdsRunningWorkflow,
@@ -3463,6 +3555,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           : s.unreadReplies;
       return {
         messages: { ...s.messages, [chatJid]: updated },
+        pendingMessageUsage: mergedUsage.pending,
         unreadReplies: nextUnread,
         ...(startsDirectRun
           ? { waiting: { ...s.waiting, [chatJid]: true } }
@@ -3547,6 +3640,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
         delete nextAgentHasMore[agentId];
         return {
           agents: { ...s.agents, [chatJid]: filtered },
+          pendingMessageUsage: clearPendingMessageUsage(
+            s.pendingMessageUsage,
+            chatJid,
+            agentId,
+            false,
+          ),
           agentStreaming: nextAgentStreaming,
           activeAgentTab: nextActiveTab,
           sdkTasks: nextSdkTasks,
@@ -3774,6 +3873,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
         );
         return {
           agents: { ...s.agents, [jid]: updated },
+          pendingMessageUsage: clearPendingMessageUsage(
+            s.pendingMessageUsage,
+            jid,
+            agentId,
+            false,
+          ),
           agentMessages: nextAgentMessages,
           agentStreaming: nextAgentStreaming,
           agentWaiting: nextAgentWaiting,
@@ -3896,12 +4001,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const sorted = [...data.messages].reverse();
       let snapshotMessages = sorted;
       set((s) => {
-        const nextMessages = loadMore
+        const loadedMessages = loadMore
           ? mergeMessagesChronologically(s.agentMessages[agentId] || [], sorted)
           : sorted;
+        const mergedUsage = mergePendingMessageUsage(
+          loadedMessages,
+          s.pendingMessageUsage,
+          jid,
+          agentId,
+        );
+        const nextMessages = mergedUsage.messages;
         snapshotMessages = nextMessages;
         return {
           agentMessages: { ...s.agentMessages, [agentId]: nextMessages },
+          pendingMessageUsage: mergedUsage.pending,
           agentHasMore: { ...s.agentHasMore, [agentId]: data.hasMore },
         };
       });
@@ -3933,9 +4046,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
     if (get().clearing[jid]) return;
     set((s) => {
       const existing = s.agentMessages[agentId] || [];
-      const merged = mergeMessagesChronologically(existing, snapshot.messages);
+      const mergedUsage = mergePendingMessageUsage(
+        mergeMessagesChronologically(existing, snapshot.messages),
+        s.pendingMessageUsage,
+        jid,
+        agentId,
+      );
+      const merged = mergedUsage.messages;
       return {
         agentMessages: { ...s.agentMessages, [agentId]: merged },
+        pendingMessageUsage: mergedUsage.pending,
         agentHasMore: {
           ...s.agentHasMore,
           [agentId]: s.agentHasMore[agentId] ?? snapshot.hasMore,
@@ -4011,10 +4131,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
         let snapshotMessages: Message[] | null = null;
         let snapshotHasMore = false;
         set((s) => {
-          const merged = mergeMessagesChronologically(
-            s.agentMessages[agentId] || [],
-            data.messages,
+          const mergedUsage = mergePendingMessageUsage(
+            mergeMessagesChronologically(
+              s.agentMessages[agentId] || [],
+              data.messages,
+            ),
+            s.pendingMessageUsage,
+            jid,
+            agentId,
           );
+          const merged = mergedUsage.messages;
           snapshotMessages = merged;
           snapshotHasMore = !!s.agentHasMore[agentId];
           const agentReplied = data.messages.some(
@@ -4033,6 +4159,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
           return {
             agentMessages: { ...s.agentMessages, [agentId]: merged },
+            pendingMessageUsage: mergedUsage.pending,
             agentWaiting: agentReplied
               ? { ...s.agentWaiting, [agentId]: false }
               : s.agentWaiting,
