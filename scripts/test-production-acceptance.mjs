@@ -524,23 +524,29 @@ async function run() {
         event.message.finalization_reason === 'completed' &&
         event.message.content?.trim() === bg,
     ).message;
+  const backgroundQueryId = backgroundEvents[notification].event.queryRunId;
+  assert(
+    typeof backgroundQueryId === 'string' &&
+      !!backgroundQueryId &&
+      backgroundEvents.some(
+        (event) =>
+          event.type === 'run_started' && event.runId === backgroundQueryId,
+      ),
+    'Background completion notification lacks its invocation query identity',
+  );
+  // Ordinary stream events keep their presentation identity. Only usage
+  // projections carry the immutable input owner used by canonical final rows.
   assert(
     backgroundEvents.some(
       (event) =>
         event.type === 'stream_event' &&
-        event.event?.eventType === 'task_notification' &&
-        event.event.taskStatus === 'completed' &&
-        event.event.isBackground === true &&
-        event.event.inputTurnId === backgroundFinal.turn_id,
-    ) &&
-      backgroundEvents.some(
-        (event) =>
-          event.type === 'stream_event' &&
-          event.event?.inputTurnId === backgroundFinal.turn_id &&
-          typeof event.event.queryRunId === 'string' &&
-          !!event.event.queryRunId,
-      ),
-    'Background notification and stream lack the same immutable input',
+        event.event?.eventType === 'usage' &&
+        event.event.usageProjection === 'input_total' &&
+        event.event.inputTurnId === backgroundFinal.turn_id &&
+        event.event.queryRunId === backgroundQueryId &&
+        event.runId === backgroundQueryId,
+    ),
+    'Background usage projection lacks its canonical input and query owner',
   );
   await verifyBackgroundLedger(host, backgroundFinal, backgroundLedgerBefore);
   const cloned = await api('POST', '/api/groups', {

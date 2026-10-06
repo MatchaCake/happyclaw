@@ -214,36 +214,54 @@ async function checkVisibleUsage(marker, usage) {
   const trigger = row
     .locator('[data-slot="tooltip-trigger"]')
     .filter({ hasText: expectedTotal });
-  let details;
-  if ((await trigger.count()) === 1) {
-    await trigger.hover();
-    const tooltip = page.locator('[data-slot="tooltip-content"]:visible');
-    if (await waitUntil(async () => (await tooltip.count()) > 0, 3000, 100)) {
-      details = await tooltip.last().innerText();
-    }
-  }
-  if (!details) {
-    // Support a native title tooltip if the badge implementation uses one.
-    details = await total.evaluate((element) =>
-      element.closest('[title]')?.getAttribute('title'),
-    );
-  }
-  await page.mouse.move(0, 0);
-  if (!details) return { total: true, tooltip: false };
-  const text = normalizeText(details);
   const inputOutput = `输入 ${formatNum(breakdown.inputTokens)} / 输出 ${formatNum(breakdown.outputTokens)}`;
   const cache = `缓存读取 ${formatNum(breakdown.cacheReadInputTokens)} / 缓存写入 ${formatNum(breakdown.cacheCreationInputTokens)} / 推理 ${formatNum(breakdown.reasoningTokens)}`;
-  return {
-    total: true,
-    tooltip:
+  const matches = (details) => {
+    const text = normalizeText(details);
+    return (
       text.includes(inputOutput) &&
       (!(
         breakdown.cacheReadInputTokens ||
         breakdown.cacheCreationInputTokens ||
         breakdown.reasoningTokens
       ) ||
-        text.includes(cache)),
+        text.includes(cache))
+    );
   };
+  if ((await trigger.count()) === 1) {
+    await trigger.hover();
+    const tooltipMatches = await waitUntil(
+      async () => {
+        // A previous tooltip can remain visible during its exit animation. Read
+        // the content owned by this exact trigger's aria-describedby, then wait
+        // for its delayed portal to show the current bubble's usage.
+        const details = await trigger.evaluate((element) => {
+          const id = element.getAttribute('aria-describedby');
+          const content = id
+            ? document
+                .getElementById(id)
+                ?.closest('[data-slot="tooltip-content"]')
+            : undefined;
+          if (!content || !content.getBoundingClientRect().width)
+            return undefined;
+          return content.innerText;
+        });
+        return Boolean(details && matches(details));
+      },
+      3000,
+      100,
+    );
+    if (tooltipMatches) {
+      await page.mouse.move(0, 0);
+      return { total: true, tooltip: true };
+    }
+  }
+  // Support a native title tooltip if the badge implementation uses one.
+  const details = await total.evaluate((element) =>
+    element.closest('[title]')?.getAttribute('title'),
+  );
+  await page.mouse.move(0, 0);
+  return { total: true, tooltip: Boolean(details && matches(details)) };
 }
 
 async function run() {
