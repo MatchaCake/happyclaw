@@ -97,12 +97,12 @@ describe('Telegram sendFile media routing (live connection)', () => {
     return connection;
   }
 
-  test('sendFile(clip.mp4) uses sendVideo, not sendDocument', async () => {
+  test('sendFile(clip.mp4) uses sendDocument to keep the aspect ratio', async () => {
     const conn = await connect();
     await conn.sendFile('424242', touch('clip.mp4'), 'clip.mp4');
-    expect(api.sendVideo).toHaveBeenCalledOnce();
-    expect(api.sendVideo.mock.calls[0][0]).toBe(424242);
-    expect(api.sendDocument).not.toHaveBeenCalled();
+    expect(api.sendDocument).toHaveBeenCalledOnce();
+    expect(api.sendDocument.mock.calls[0][0]).toBe(424242);
+    expect(api.sendVideo).not.toHaveBeenCalled();
     expect(api.sendAudio).not.toHaveBeenCalled();
   });
 
