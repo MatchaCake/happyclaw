@@ -1226,6 +1226,30 @@ async function buildFileContentBlock(params: {
   return `[${prefixLabel}: ${safeName} → ${savedRelPath}]`;
 }
 
+/**
+ * Disconnect a DWClient without letting a CONNECTING socket crash the host.
+ *
+ * The SDK's cleanup() calls socket.removeAllListeners() and then terminate().
+ * If its auto-reconnect handshake is still in flight, ws emits 'error' on the
+ * next tick ("closed before the connection was established") with no listener
+ * attached, which surfaces as an uncaughtException. Keep a no-op sink on the
+ * socket the SDK just discarded.
+ */
+function disconnectDWClient(dwClient: DWClient): void {
+  const socket = (
+    dwClient as unknown as {
+      socket?: {
+        listenerCount(event: string): number;
+        on(event: 'error', listener: () => void): unknown;
+      };
+    }
+  ).socket;
+  dwClient.disconnect();
+  if (socket && socket.listenerCount('error') === 0) {
+    socket.on('error', () => {});
+  }
+}
+
 // ─── Factory Function ───────────────────────────────────────────
 
 export function createDingTalkConnection(
@@ -3050,8 +3074,7 @@ export function createDingTalkConnection(
         }
         if (nextClient) {
           try {
-            if (client === nextClient) client.disconnect();
-            else nextClient.disconnect();
+            disconnectDWClient(nextClient);
           } catch (cleanupError) {
             logger.warn(
               { cleanupError },
@@ -3074,7 +3097,7 @@ export function createDingTalkConnection(
       const currentClient = client;
       if (currentClient) {
         try {
-          currentClient.disconnect();
+          disconnectDWClient(currentClient);
         } catch (err) {
           logger.debug({ err }, 'Error disconnecting DingTalk client');
         }
