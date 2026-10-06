@@ -61,12 +61,22 @@ export const CodexMessagesRequestSchema = z
     system: z.union([z.string(), z.array(text)]).optional(),
     messages: z
       .array(
-        z
-          .object({
-            role: z.enum(['user', 'assistant']),
-            content: z.union([z.string(), z.array(block)]),
-          })
-          .passthrough(),
+        z.discriminatedUnion('role', [
+          z
+            .object({
+              role: z.enum(['user', 'assistant']),
+              content: z.union([z.string(), z.array(block)]),
+            })
+            .passthrough(),
+          // Claude Agent SDK also appends system reminders inside messages.
+          // Keep these as instructions; tools/images have no system meaning.
+          z
+            .object({
+              role: z.literal('system'),
+              content: z.union([z.string(), z.array(text)]),
+            })
+            .passthrough(),
+        ]),
       )
       .min(1),
     tools: z
