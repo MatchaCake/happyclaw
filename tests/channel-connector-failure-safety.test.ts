@@ -38,7 +38,13 @@ describe('provider connector initial failure safety contract', () => {
       "logger.error({ err }, 'DingTalk initial connection failed')",
     );
     expect(dingtalk.slice(dingtalkStart, dingtalkStart + 700)).toContain(
-      'client.disconnect()',
+      'disconnectDWClient(nextClient)',
+    );
+    const helperStart = dingtalk.indexOf('function disconnectDWClient(');
+    const helperEnd = dingtalk.indexOf('// ─── Factory Function', helperStart);
+    expect(helperStart).toBeGreaterThan(-1);
+    expect(dingtalk.slice(helperStart, helperEnd)).toContain(
+      'dwClient.disconnect()',
     );
   });
 });

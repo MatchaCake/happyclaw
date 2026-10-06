@@ -337,21 +337,28 @@ function buildDeliverBody(
 
 // ─── Markdown helpers ────────────────────────────────────────
 
+function isTableDivider(line: string): boolean {
+  // Trim once and split at mandatory separators: no overlapping whitespace
+  // quantifiers or optional separators can backtrack over an untrusted line.
+  let body = line.trim();
+  if (body.startsWith('|')) body = body.slice(1);
+  if (body.endsWith('|')) body = body.slice(0, -1);
+  return body.split('|').every((cell) => /^:?-+:?$/.test(cell.trim()));
+}
+
 export function ensureTableBlankLines(text: string): string {
   const lines = text.split('\n');
   const result: string[] = [];
-  const tableDividerRegex = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
-  const tableRowRegex = /^\s*\|?.*\|.*\|?\s*$/;
 
   for (let i = 0; i < lines.length; i++) {
     const currentLine = lines[i];
     const nextLine = lines[i + 1] ?? '';
     if (
-      tableRowRegex.test(currentLine) &&
-      tableDividerRegex.test(nextLine) &&
+      currentLine.includes('|') &&
+      isTableDivider(nextLine) &&
       i > 0 &&
       lines[i - 1].trim() !== '' &&
-      !tableRowRegex.test(lines[i - 1])
+      !lines[i - 1].includes('|')
     ) {
       result.push('');
     }

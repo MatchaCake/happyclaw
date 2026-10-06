@@ -1,6 +1,7 @@
 import { Bot, InputFile, type Context } from 'grammy';
 import crypto from 'crypto';
 import fsPromises from 'node:fs/promises';
+import { readMp4VideoDimensions } from './mp4-video-dimensions.js';
 import { downloadHttpsBuffer } from './im-media-download.js';
 import { Agent as HttpsAgent } from 'node:https';
 import { ProxyAgent } from 'proxy-agent';
@@ -411,18 +412,14 @@ export async function yieldTelegramAnimationDocument(
   return true;
 }
 
-export type TelegramOutboundFileKind = 'audio' | 'voice' | 'document';
+export type TelegramOutboundFileKind = 'video' | 'audio' | 'voice' | 'document';
 
-/**
- * Telegram's native APIs accept a narrower set than generic MIME viewers.
- * Videos go through sendDocument: sendVideo without width/height makes
- * clients render a square placeholder, while sendDocument keeps the
- * original file and its real aspect ratio.
- */
+/** Telegram's native APIs accept a narrower set than generic MIME viewers. */
 export function telegramOutboundFileKind(
   fileName: string,
 ): TelegramOutboundFileKind {
   const ext = (fileName.split('.').pop() || '').toLowerCase();
+  if (ext === 'mp4') return 'video';
   if (ext === 'mp3' || ext === 'm4a') return 'audio';
   if (ext === 'ogg' || ext === 'opus') return 'voice';
   return 'document';
@@ -546,7 +543,12 @@ export interface TelegramConnection {
     caption?: string,
     fileName?: string,
   ): Promise<void>;
-  sendFile(chatId: string, filePath: string, fileName: string): Promise<void>;
+  sendFile(
+    chatId: string,
+    filePath: string,
+    fileName: string,
+    options?: { asDocument?: boolean },
+  ): Promise<void>;
   sendChatAction(chatId: string, action: 'typing'): Promise<void>;
   clearAckReaction(chatId: string, inputMessageId: string): Promise<void>;
   isConnected(): boolean;
@@ -2286,6 +2288,7 @@ export function createTelegramConnection(
       chatId: string,
       filePath: string,
       fileName: string,
+      options?: { asDocument?: boolean },
     ): Promise<void> {
       const activeBot = requireOutboundBot();
 
@@ -2318,8 +2321,35 @@ export function createTelegramConnection(
         const threadOptions = target.messageThreadId
           ? { message_thread_id: target.messageThreadId }
           : {};
-        const fileKind = telegramOutboundFileKind(fileName);
-        if (fileKind === 'audio') {
+        const fileKind = options?.asDocument
+          ? 'document'
+          : telegramOutboundFileKind(fileName);
+        if (fileKind === 'video') {
+          const dimensions = await readMp4VideoDimensions(filePath).catch(
+            (err) => {
+              logger.warn({ err, fileName }, 'Failed to read MP4 dimensions');
+              return undefined;
+            },
+          );
+          if (dimensions) {
+            await activeBot.api.sendVideo(target.chatId, inputFile, {
+              ...dimensions,
+              ...threadOptions,
+            });
+          } else {
+            // Choose a single presentation before the provider call. A failed
+            // sendVideo must never trigger a second, potentially duplicate send.
+            logger.warn(
+              { fileName },
+              'MP4 dimensions unavailable; sending original file as document',
+            );
+            await activeBot.api.sendDocument(
+              target.chatId,
+              inputFile,
+              threadOptions,
+            );
+          }
+        } else if (fileKind === 'audio') {
           await activeBot.api.sendAudio(
             target.chatId,
             inputFile,

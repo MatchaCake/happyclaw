@@ -91,22 +91,38 @@ async function connectFirstAvailable(
   addresses: ResolvedPublicAddress[],
   port: number,
   connectAddress: ConnectAddress,
+  signal: AbortSignal,
 ): Promise<net.Socket> {
   let lastError: Error | undefined;
   for (const address of addresses) {
+    if (signal.aborted) throw new Error('CONNECT tunnel cancelled');
     try {
       const socket = connectAddress(address, port);
       await new Promise<void>((resolve, reject) => {
-        const onConnect = () => {
+        const cleanUp = () => {
+          socket.off('connect', onConnect);
           socket.off('error', onError);
+          socket.off('close', onClose);
+          signal.removeEventListener('abort', onAbort);
+        };
+        const onConnect = () => {
+          cleanUp();
           resolve();
         };
-        const onError = (error: Error) => {
-          socket.off('connect', onConnect);
+        const fail = (error: Error) => {
+          cleanUp();
+          socket.destroy();
           reject(error);
         };
+        const onError = (error: Error) => fail(error);
+        const onClose = () =>
+          fail(new Error('Upstream closed before connecting'));
+        const onAbort = () => fail(new Error('CONNECT tunnel cancelled'));
         socket.once('connect', onConnect);
         socket.once('error', onError);
+        socket.once('close', onClose);
+        signal.addEventListener('abort', onAbort, { once: true });
+        if (signal.aborted) onAbort();
       });
       return socket;
     } catch (error) {
@@ -161,11 +177,22 @@ export async function startPinnedHttpsProxy(
     // a peer reset (ECONNRESET) with no listener reaches uncaughtException.
     // Attach durable handlers that tear down both ends of the tunnel instead.
     let upstream: net.Socket | undefined;
+    let tunnelEstablished = false;
+    const cancellation = new AbortController();
     const tearDown = () => {
+      if (cancellation.signal.aborted) return;
+      cancellation.abort();
       clientSocket.destroy();
       upstream?.destroy();
     };
     clientSocket.on('error', tearDown);
+    clientSocket.on('close', tearDown);
+    clientSocket.on('end', () => {
+      if (!tunnelEstablished) tearDown();
+    });
+    // CONNECT hands off a paused socket. Start a zero-byte read so an empty
+    // FIN is observed while DNS/connect is pending, without consuming TLS data.
+    clientSocket.read(0);
 
     const target = parseConnectAuthority(request.url);
     if (
@@ -184,6 +211,7 @@ export async function startPinnedHttpsProxy(
         target.hostname,
         'init_git_url hostname',
       );
+      if (cancellation.signal.aborted || clientSocket.destroyed) return;
       if (
         addresses.length === 0 ||
         addresses.some(({ address }) => isPrivateHostname(address))
@@ -201,14 +229,32 @@ export async function startPinnedHttpsProxy(
           socket.once('close', () => sockets.delete(socket));
           return socket;
         },
+        cancellation.signal,
       );
       upstream.on('error', tearDown);
+      upstream.on('close', () => {
+        if (upstream?.readableEnded && !cancellation.signal.aborted) {
+          // Preserve buffered pack bytes on an orderly FIN.
+          clientSocket.end();
+        } else {
+          tearDown();
+        }
+      });
+      if (cancellation.signal.aborted || clientSocket.destroyed) {
+        upstream.destroy();
+        return;
+      }
+      tunnelEstablished = true;
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
       if (head.length > 0) upstream.write(head);
       clientSocket.pipe(upstream);
       upstream.pipe(clientSocket);
     } catch {
-      clientSocket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n');
+      if (!cancellation.signal.aborted && !clientSocket.destroyed) {
+        clientSocket.end(
+          'HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n',
+        );
+      }
     }
   });
 

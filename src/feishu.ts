@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import * as fsPromises from 'node:fs/promises';
 import * as path from 'node:path';
 import * as lark from '@larksuiteoapi/node-sdk';
+import { fenceFeishuWebSocketLifecycle } from './feishu-ws-lifecycle.js';
 import {
   cancelAwaitingForwardBundleRoot,
   findForwardBundleCommentTail,
@@ -1181,6 +1182,7 @@ export function createFeishuConnection(
 
   let client: lark.Client | null = null;
   let wsClient: lark.WSClient | null = null;
+  let wsConnectionGeneration = 0;
 
   // WSClient.start() resolves before the endpoint pull and WS handshake
   // finish, and close() does not cancel that in-flight start attempt. A
@@ -1204,7 +1206,7 @@ export function createFeishuConnection(
         created.close({ force: true });
       },
     });
-    return created;
+    return fenceFeishuWebSocketLifecycle(created);
   }
   let eventDispatcher: lark.EventDispatcher | null = null;
   let connectOptions: ConnectOptions | null = null;
@@ -3746,6 +3748,8 @@ export function createFeishuConnection(
 
   async function reconnectWebSocket(reason: string): Promise<void> {
     if (reconnecting || !connectOptions) return;
+    const generation = wsConnectionGeneration;
+    const options = connectOptions;
     reconnecting = true;
     reconnectRequestedAt = Date.now();
     disconnectedChecks = 0;
@@ -3760,7 +3764,7 @@ export function createFeishuConnection(
       }
       if (wsClient) {
         try {
-          await wsClient.close();
+          await wsClient.close({ force: true });
         } catch (err) {
           logger.debug(
             { err },
@@ -3769,18 +3773,24 @@ export function createFeishuConnection(
         }
       }
 
-      wsClient = createWsClient();
-      await wsClient.start({ eventDispatcher });
+      if (generation !== wsConnectionGeneration || !eventDispatcher) return;
+      const nextWsClient = createWsClient();
+      wsClient = nextWsClient;
+      await nextWsClient.start({ eventDispatcher });
+      if (generation !== wsConnectionGeneration || wsClient !== nextWsClient) {
+        nextWsClient.close({ force: true });
+        return;
+      }
 
       lastWsStateConnected = true;
       logger.info({ reason }, 'Feishu WebSocket reconnected');
       await recoverQueuedInbox('reconnect');
       await runBackfill('reconnect');
-      connectOptions.onReady();
+      if (generation === wsConnectionGeneration) options.onReady();
     } catch (err) {
       logger.error({ err, reason }, 'Feishu WebSocket reconnect failed');
     } finally {
-      reconnecting = false;
+      if (generation === wsConnectionGeneration) reconnecting = false;
     }
   }
 
@@ -3835,6 +3845,7 @@ export function createFeishuConnection(
         logger.warn('Feishu config is empty, running in Web-only mode');
         return false;
       }
+      const generation = ++wsConnectionGeneration;
       connectOptions = opts;
       disconnectedChecks = 0;
       reconnectRequestedAt = Date.now();
@@ -4049,16 +4060,26 @@ export function createFeishuConnection(
         },
       });
 
-      // Initialize WebSocket client
-      wsClient = createWsClient();
+      // stop() can retire this connect while REST inventory is still loading.
+      if (generation !== wsConnectionGeneration) return false;
+      const nextWsClient = createWsClient();
+      wsClient = nextWsClient;
 
       try {
-        await wsClient.start({ eventDispatcher });
+        await nextWsClient.start({ eventDispatcher });
+        if (
+          generation !== wsConnectionGeneration ||
+          wsClient !== nextWsClient
+        ) {
+          nextWsClient.close({ force: true });
+          return false;
+        }
         logger.info('Feishu WebSocket client started');
         lastWsStateConnected = true;
         startHealthMonitor();
         await recoverQueuedInbox('startup');
         await runBackfill('startup');
+        if (generation !== wsConnectionGeneration) return false;
         onReady();
         return true;
       } catch (err) {
@@ -4066,6 +4087,8 @@ export function createFeishuConnection(
           { err },
           'Failed to start Feishu client, running in Web-only mode',
         );
+        nextWsClient.close({ force: true });
+        if (generation !== wsConnectionGeneration) return false;
         // Clean up partially initialized state
         stopHealthMonitor();
         connectOptions = null;
@@ -4077,6 +4100,17 @@ export function createFeishuConnection(
     },
 
     async stop(): Promise<void> {
+      wsConnectionGeneration += 1;
+      const retiredWsClient = wsClient;
+      wsClient = null;
+      // Retire the transport before any asynchronous indicator cleanup.
+      if (retiredWsClient) {
+        try {
+          retiredWsClient.close({ force: true });
+        } catch (err) {
+          logger.warn({ err }, 'Error stopping Feishu client');
+        }
+      }
       stopHealthMonitor();
       if (inboxRecoveryTimer) {
         clearTimeout(inboxRecoveryTimer);
@@ -4091,16 +4125,6 @@ export function createFeishuConnection(
       reconnecting = false;
       disconnectedChecks = 0;
       await ackReactions.clearAll();
-      if (wsClient) {
-        logger.info('Stopping Feishu client');
-        try {
-          await wsClient.close();
-          logger.info('Feishu client stopped successfully');
-        } catch (err) {
-          logger.warn({ err }, 'Error stopping Feishu client');
-        }
-        wsClient = null;
-      }
       client = null;
       lastWsStateConnected = false;
     },
