@@ -2,7 +2,7 @@
 //
 // 纯函数，可独立单测。翻译规则参考 OpenAI Responses API 公开规范与
 // ccproxy-api codex 插件的实战经验：
-// - system → instructions
+// - top-level system and SDK system-role messages → instructions
 // - tool_use/tool_result → function_call/function_call_output（call_id 原样透传）
 // - 上游强制 stream=true + store=false；剔除 metadata/temperature/max_tokens
 //   （chatgpt.com backend 对这些参数直接返回 Unsupported parameter）。
@@ -237,7 +237,18 @@ export function anthropicToResponses(
   options: AnthropicToResponsesOptions,
 ): ResponsesRequest {
   const input: Array<Json> = [];
+  const instructions = [systemToInstructions(request.system)];
   for (const message of request.messages ?? []) {
+    if (message.role === 'system') {
+      // SDK reminders can follow the latest user input or tool result. They
+      // retain system priority and never become user text in Responses input.
+      instructions.push(
+        systemToInstructions(
+          message.content as AnthropicRequestSubset['system'],
+        ),
+      );
+      continue;
+    }
     input.push(...messageToInputItems(message));
   }
 
@@ -246,7 +257,7 @@ export function anthropicToResponses(
 
   const payload: ResponsesRequest = {
     model: options.targetModel,
-    instructions: systemToInstructions(request.system),
+    instructions: instructions.filter((text) => text.length > 0).join('\n\n'),
     input,
     tools: tools && tools.length > 0 ? tools : undefined,
     tool_choice: tools && tools.length > 0 ? toolChoice : undefined,

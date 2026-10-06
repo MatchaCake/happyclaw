@@ -174,6 +174,67 @@ describe('anthropicToResponses', () => {
     ]);
   });
 
+  test('retains system priority across SDK text reminders and the tool-result round', () => {
+    const result = anthropicToResponses(
+      {
+        system: [
+          { type: 'text', text: 'Base instructions.' },
+          { type: 'text', text: 'Workspace instructions.' },
+        ],
+        messages: [
+          { role: 'user', content: 'Use Bash.' },
+          { role: 'system', content: 'Before-tool reminder.' },
+          {
+            role: 'assistant',
+            content: [
+              {
+                type: 'tool_use',
+                id: 'call_bash',
+                name: 'Bash',
+                input: { command: 'printf hello' },
+              },
+            ],
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'call_bash',
+                content: [{ type: 'text', text: 'hello' }],
+              },
+            ],
+          },
+          {
+            role: 'system',
+            content: [
+              { type: 'text', text: 'After-tool reminder.' },
+              { type: 'text', text: 'Follow-up reminder.' },
+            ],
+          },
+        ],
+      },
+      { targetModel: 'gpt-6-sol' },
+    );
+    expect(result.instructions).toBe(
+      'Base instructions.\n\nWorkspace instructions.\n\nBefore-tool reminder.\n\nAfter-tool reminder.\n\nFollow-up reminder.',
+    );
+    expect(result.input).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'Use Bash.' }],
+      },
+      {
+        type: 'function_call',
+        call_id: 'call_bash',
+        name: 'Bash',
+        arguments: '{"command":"printf hello"}',
+      },
+      { type: 'function_call_output', call_id: 'call_bash', output: 'hello' },
+    ]);
+  });
+
   test('drops tools/tool_choice when no tools are provided', () => {
     const result = anthropicToResponses(
       { messages: [{ role: 'user', content: 'hi' }] },

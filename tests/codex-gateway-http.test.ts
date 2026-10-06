@@ -130,7 +130,15 @@ describe('Codex gateway HTTP boundary', () => {
     {},
     { messages: null },
     { messages: 'bad' },
-    { messages: [{ role: 'system', content: 'bad' }] },
+    { messages: [{ role: 'unknown', content: 'bad' }] },
+    {
+      messages: [
+        {
+          role: 'system',
+          content: [{ type: 'tool_use', id: 'call', name: 'Bash', input: {} }],
+        },
+      ],
+    },
     { messages: [{ role: 'user', content: [null] }] },
     { messages: [{ role: 'user', content: 'hi' }], tools: 'bad' },
     {
@@ -192,6 +200,56 @@ describe('Codex gateway HTTP boundary', () => {
       Authorization: 'Bearer fake-upstream',
       'chatgpt-account-id': 'business-workspace',
     });
+  });
+
+  test('accepts SDK system reminders and promotes them without making user input', async () => {
+    const response = await request({
+      model: 'claude-sonnet-4-6',
+      system: [
+        {
+          type: 'text',
+          text: 'You are an assistant with Bash.',
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'Read README.' }] },
+        {
+          role: 'system',
+          content: [
+            {
+              type: 'text',
+              text: '<system-reminder>Use Bash.</system-reminder>',
+            },
+          ],
+        },
+      ],
+      tools: [
+        { name: 'Bash', input_schema: { type: 'object', properties: {} } },
+      ],
+      stream: true,
+      max_tokens: 32_000,
+      thinking: { type: 'adaptive' },
+      output_config: { effort: 'high' },
+      context_management: { edits: [] },
+      metadata: { user_id: 'sdk-test' },
+    });
+    expect(response.status).toBe(200);
+    await response.text();
+    const body = JSON.parse(mocks.fetch.mock.calls[0][1].body);
+    expect(body.instructions).toBe(
+      'You are an assistant with Bash.\n\n<system-reminder>Use Bash.</system-reminder>',
+    );
+    expect(body.input).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'Read README.' }],
+      },
+    ]);
+    expect(body.tools[0].name).toBe('Bash');
+    expect(body.thinking).toBeUndefined();
+    expect(body.metadata).toBeUndefined();
   });
 
   test('SSE publishes cache-exclusive usage and a single successful terminal', async () => {
