@@ -62,6 +62,9 @@ jobs:
       - name: Provider failure upstream smoke
         run: node tests/e2e/provider-failure-upstream.mjs fast
 
+      - name: Codex gateway real SDK tool-loop smoke
+        run: node tests/e2e/codex-gateway-sdk.mjs
+
       - name: Mobile browser interaction tests
         run: npm --prefix web run test:e2e
 
