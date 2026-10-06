@@ -18,6 +18,9 @@ Agent 镜像；`data/`、本机环境变量、Keychain、渠道凭据及 launchd
   `riba2534/happyclaw-agent:git-<完整提交 SHA>`。分支构建只发布不可变提交标签，不得推进
   公共 `latest`；Mac mini 不做本地镜像构建。
 - 明确记录本次远程分支名和预期提交 SHA，不使用浮动的本地工作树作为部署来源。
+- Mac mini 的安全 IPC 结果发布依赖 `/usr/bin/python3` 的原生目录相对系统调用。
+  在切换前检查 `open`、`rename` 和 `unlink` 均支持 `dir_fd`；能力缺失时不得降级为
+  路径写入或继续部署。
 
 连接并设置本次部署参数：
 
@@ -43,6 +46,8 @@ test -z "$(git status --porcelain)" || {
   echo 'Remote worktree is not clean; deployment stopped.' >&2
   exit 1
 }
+
+/usr/bin/python3 -I -S -c 'import os; assert all(f in os.supports_dir_fd for f in (os.open, os.rename, os.unlink)), "Secure IPC dir_fd support unavailable"'
 
 export HAPPYCLAW_PREVIOUS_SHA="$(git rev-parse HEAD)"
 printf 'Rollback commit: %s\n' "$HAPPYCLAW_PREVIOUS_SHA"
