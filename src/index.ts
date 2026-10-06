@@ -1242,6 +1242,91 @@ type ReplyRouteAdmission = (
   receipt?: IpcDeliveryReceipt,
 ) => IpcPrePublishAdmission | false;
 const activeRouteAdmissions = new Map<string, ReplyRouteAdmission>();
+type ChannelTurnActivationRequest = {
+  inputTurnId: string;
+  queryRunId: string;
+  activationSequence: number;
+  runnerInstanceId: string;
+};
+const activeChannelTurnActivators = new Map<
+  string,
+  (request: ChannelTurnActivationRequest) => void
+>();
+
+function createChannelTurnActivator(options: {
+  scope: string;
+  queueJid: string;
+  initialInputId: string;
+  initialQueryRunId: string | null;
+  resolveContext: (inputTurnId: string) => ChannelTurnContext | undefined;
+  isCompleted: (inputTurnId: string) => boolean;
+}): (request: ChannelTurnActivationRequest) => void {
+  let runnerId: string | null = null;
+  let sequence = 0;
+  let inputId = options.initialInputId;
+  const retiredInputIds = new Set<string>();
+  return (request) => {
+    // A can report idle before its queued B file is drained, and C can then
+    // reserve a new query. B retains the identity of its own publication.
+    const admittedQueryId =
+      request.inputTurnId === options.initialInputId
+        ? options.initialQueryRunId
+        : queue.getPublishedIpcQueryId(options.queueJid, request.inputTurnId);
+    if (!admittedQueryId || request.queryRunId !== admittedQueryId) {
+      throw new Error('Channel activation belongs to a superseded query.');
+    }
+    if (
+      runnerId === request.runnerInstanceId &&
+      (request.activationSequence <= sequence ||
+        retiredInputIds.has(request.inputTurnId))
+    ) {
+      throw new Error('Channel activation was superseded by a newer input.');
+    }
+    if (options.isCompleted(request.inputTurnId)) {
+      throw new Error('Channel input has already completed.');
+    }
+    const context = options.resolveContext(request.inputTurnId);
+    if (runnerId !== request.runnerInstanceId) {
+      retiredInputIds.clear();
+    } else if (inputId !== request.inputTurnId) {
+      retiredInputIds.add(inputId);
+    }
+    // Non-Feishu inputs clear or replace the old binding only when the runner
+    // really starts them, never when they are merely queued on the host.
+    bindActiveChannelTurn(options.scope, request.inputTurnId, context);
+    runnerId = request.runnerInstanceId;
+    sequence = request.activationSequence;
+    inputId = request.inputTurnId;
+  };
+}
+
+function activateRequestedChannelTurn(
+  data: Record<string, unknown>,
+  sourceGroup: string,
+  ipcAgentId: string | null,
+  ipcTaskId: string | null,
+): void {
+  if (
+    typeof data.requestId !== 'string' ||
+    !SAFE_REQUEST_ID_RE.test(data.requestId) ||
+    typeof data.inputTurnId !== 'string' ||
+    typeof data.queryRunId !== 'string' ||
+    typeof data.runnerInstanceId !== 'string' ||
+    !Number.isSafeInteger(data.activationSequence) ||
+    Number(data.activationSequence) < 1 ||
+    !verifyAndConsumeWorkspaceMemoryMutation(
+      { groupFolder: sourceGroup, agentId: ipcAgentId, taskRunId: ipcTaskId },
+      data,
+      data.mutationSignature,
+    )
+  ) {
+    throw new Error('Invalid or expired channel turn activation.');
+  }
+  const scope = channelTurnScope(sourceGroup, ipcAgentId);
+  const activate = activeChannelTurnActivators.get(scope);
+  if (!activate) throw new Error('Channel runner is no longer active.');
+  activate(data as unknown as ChannelTurnActivationRequest);
+}
 
 function invokeActiveRouteAdmission(
   folder: string,
@@ -7384,6 +7469,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     scope?: ActiveChannelOutboxScope;
     lifecycle?: typeof activeDurableCardLifecycle;
     inputMessageId: string;
+    inputChatJid: string;
   }
   const admittedWarmMainInputs = new Map<string, AdmittedWarmMainInput>();
   const mainAdmissionKey = channelTurnScope(effectiveGroup.folder);
@@ -7554,6 +7640,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         scope: nextScope,
         lifecycle: nextLifecycle,
         inputMessageId: inputCursor?.id ?? inputTurnId,
+        inputChatJid: receipt?.chatJid ?? chatJid,
       });
       genuineReplyDeliveredByInput.set(inputTurnId, false);
       const exactInputs =
@@ -8033,6 +8120,36 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     lastProcessed.id,
     currentChannelContext,
   );
+  const activateMainChannelTurn = createChannelTurnActivator({
+    scope: mainAdmissionKey,
+    queueJid: chatJid,
+    initialInputId: lastProcessed.id,
+    initialQueryRunId: queue.getActiveQueryId(chatJid),
+    isCompleted: (inputTurnId) => healthyCompletedInputTurns.has(inputTurnId),
+    resolveContext: (inputTurnId) => {
+      if (inputTurnId === lastProcessed.id) return currentChannelContext;
+      const admitted = admittedWarmMainInputs.get(inputTurnId);
+      if (!admitted) throw new Error('Channel input was not admitted.');
+      const context = getMessageChannelTurnContext(
+        admitted.inputChatJid,
+        admitted.inputMessageId,
+      );
+      if (context && context.sourceJid !== admitted.sourceJid) {
+        throw new Error(
+          'Admitted channel input context does not match its source.',
+        );
+      }
+      return context
+        ? {
+            ...context,
+            targetJid: admitted.inputChatJid,
+            workspaceJid: chatJid,
+            sessionAgentId: null,
+          }
+        : undefined;
+    },
+  });
+  activeChannelTurnActivators.set(mainAdmissionKey, activateMainChannelTurn);
   activeIpcReplyTurnTrackers.set(effectiveGroup.folder, ipcReplyTurnTracker);
   activeAgentBuilderTurns.startBatch(
     effectiveGroup.folder,
@@ -9477,7 +9594,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 sentReply = true;
                 // 挂起中的进度消息不占用首条回复名额，后台任务完成后的最终
                 // 汇总仍需投递到无流式卡片的 IM 渠道。
-                if (!holdReason) {
+                if (!holdReason && replyDeliveryAcknowledged) {
                   sentReplyByInput.set(outputChannelScope.inputId, true);
                 }
               }
@@ -9523,7 +9640,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   ? result.ipcReceipts.map((receipt) => receipt.deliveryId)
                   : [result.inputTurnId ?? lastProcessed.id];
                 for (const inputId of acknowledgedInputIds) {
-                  channelPhysicalDeliveryAckByInput.set(inputId, true);
+                  if (holdReason) {
+                    channelNonTerminalDeliveryAckByInput.set(inputId, true);
+                  } else {
+                    channelPhysicalDeliveryAckByInput.set(inputId, true);
+                  }
                 }
               }
               if (result.inputTurnCompleted) {
@@ -9572,6 +9693,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (idleTimer) clearTimeout(idleTimer);
     activeRouteUpdaters.delete(effectiveGroup.folder);
     activeRouteAdmissions.delete(mainAdmissionKey);
+    if (
+      activeChannelTurnActivators.get(mainAdmissionKey) ===
+      activateMainChannelTurn
+    ) {
+      activeChannelTurnActivators.delete(mainAdmissionKey);
+    }
     activeImReplyRoutes.delete(effectiveGroup.folder);
     activeAgentBuilderTurns.delete(effectiveGroup.folder);
     activeChannelTurns.delete(channelTurnScope(effectiveGroup.folder));
@@ -12787,20 +12914,7 @@ function writeTaskResult(
   }
   try {
     fs.mkdirSync(path.dirname(resultFilePath), { recursive: true });
-    const tmpPath = `${resultFilePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
-    try {
-      fs.writeFileSync(tmpPath, JSON.stringify(payload), {
-        flag: 'wx',
-        mode: 0o600,
-      });
-      fs.renameSync(tmpPath, resultFilePath);
-    } finally {
-      try {
-        fs.unlinkSync(tmpPath);
-      } catch {
-        /* already renamed or never created */
-      }
-    }
+    writeExclusiveIpcResult(tasksDir, resultFilePath, JSON.stringify(payload));
   } catch (err) {
     logger.error(
       { tasksDir, type, requestId, err },
@@ -12848,6 +12962,8 @@ async function processTaskIpc(
     before?: string;
     // Host-side Feishu capability broker
     inputTurnId?: string;
+    queryRunId?: string;
+    activationSequence?: number;
     scheduledTaskRunId?: string;
     operation?: string;
     params?: Record<string, unknown>;
@@ -14479,6 +14595,19 @@ async function processTaskIpc(
         isAdminHome,
       );
       break;
+
+    case 'activate_channel_turn': {
+      try {
+        activateRequestedChannelTurn(data, sourceGroup, ipcAgentId, ipcTaskId);
+        writeTaskResult(tasksDir, data.type, data.requestId, { success: true });
+      } catch (error) {
+        writeTaskResult(tasksDir, data.type, data.requestId, {
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      break;
+    }
 
     case 'feishu_capability': {
       const startedAt = Date.now();
@@ -16663,6 +16792,37 @@ async function processAgentConversation(
     lastProcessed.id,
     currentAgentChannelContext,
   );
+  const activateAgentChannelTurn = createChannelTurnActivator({
+    scope: agentAdmissionKey,
+    queueJid: virtualJid,
+    initialInputId: lastProcessed.id,
+    initialQueryRunId: queue.getActiveQueryId(virtualJid),
+    isCompleted: (inputTurnId) =>
+      healthyAgentCompletedInputTurns.has(inputTurnId),
+    resolveContext: (inputTurnId) => {
+      if (inputTurnId === lastProcessed.id) return currentAgentChannelContext;
+      const admitted = admittedWarmAgentInputs.get(inputTurnId);
+      if (!admitted) throw new Error('Channel input was not admitted.');
+      const context = getMessageChannelTurnContext(
+        virtualChatJid,
+        admitted.inputMessageId,
+      );
+      if (context && context.sourceJid !== admitted.sourceJid) {
+        throw new Error(
+          'Admitted channel input context does not match its source.',
+        );
+      }
+      return context
+        ? {
+            ...context,
+            targetJid: virtualChatJid,
+            workspaceJid: chatJid,
+            sessionAgentId: agentId,
+          }
+        : undefined;
+    },
+  });
+  activeChannelTurnActivators.set(agentAdmissionKey, activateAgentChannelTurn);
   const isCursorCommitted = (inputTurnId = activeAgentInputTurnId): boolean =>
     cursorCommittedInputTurns.has(inputTurnId);
   const commitCursor = (inputTurnId = activeAgentInputTurnId): void => {
@@ -17674,7 +17834,11 @@ async function processAgentConversation(
             ? output.ipcReceipts.map((receipt) => receipt.deliveryId)
             : [output.inputTurnId ?? lastProcessed.id];
           for (const inputId of acknowledgedInputIds) {
-            agentPhysicalDeliveryAckByInput.set(inputId, true);
+            if (holdReason) {
+              agentNonTerminalDeliveryAckByInput.set(inputId, true);
+            } else {
+              agentPhysicalDeliveryAckByInput.set(inputId, true);
+            }
             // 挂起中的进度消息（后台任务未完成）不占用首条回复名额；
             // 否则无流式卡片的渠道（Telegram/QQ 等）会丢掉后续最终汇总。
             if (!holdReason) agentReplySentByInput.set(inputId, true);
@@ -17693,6 +17857,13 @@ async function processAgentConversation(
         }
 
         if (output.inputTurnCompleted) {
+          if (!agentReplyDeliveryAcknowledged) {
+            retryUnfinishedTurn = true;
+            hadError = true;
+            throw new Error(
+              'host_turn_settlement_failed: final agent reply was not physically acknowledged',
+            );
+          }
           if (!(await completeAgentChannelRuntimesForOutput(output))) {
             throw new Error(
               'host_turn_settlement_failed: primary agent output did not reach a durable terminal state',
@@ -18122,6 +18293,12 @@ async function processAgentConversation(
     // ── Streaming card cleanup ──
     activeHeldCardFinalizers.delete(virtualChatJid);
     activeRouteAdmissions.delete(agentAdmissionKey);
+    if (
+      activeChannelTurnActivators.get(agentAdmissionKey) ===
+      activateAgentChannelTurn
+    ) {
+      activeChannelTurnActivators.delete(agentAdmissionKey);
+    }
     for (const [inputTurnId, coordinator] of agentTurnOutputCoordinators) {
       activeTurnOutputs.unbind(agentAdmissionKey, inputTurnId, coordinator);
     }
@@ -18949,11 +19126,6 @@ async function startMessageLoop(): Promise<void> {
                     taskRunId: null,
                   },
                   receipt.deliveryId,
-                );
-                bindActiveChannelTurn(
-                  channelTurnScope(group.folder),
-                  receipt.deliveryId,
-                  warmChannelContext,
                 );
               }
               invokeActiveRouteUpdater(
@@ -20121,6 +20293,18 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
     );
     const missedMessages = selectChannelReplyBatch(interactionBatch.messages);
     const requiredInteractionMode = interactionBatch.interactionMode;
+    const warmChannelContext = resolveBatchChannelContext(
+      missedMessages,
+      homeChatJid,
+      agentId,
+    );
+    const requiredFeishuCliAccountId =
+      (effectiveGroup.executionMode || 'container') === 'container'
+        ? resolveFeishuCliBoundAccountId({
+            channelContext: warmChannelContext,
+            workspaceChannelAccountId: effectiveGroup.channel_account_id,
+          })
+        : null;
 
     // IM and Web share one pipe-first path, mirroring the main conversation
     // loop: a warm runner admits the input through activeRouteAdmissions,
@@ -20193,7 +20377,7 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
           lastAgentSourceJid,
           undefined,
           deliveryTarget,
-          undefined,
+          warmChannelContext,
           (receipt) =>
             invokeActiveRouteAdmission(
               agent?.group_folder ?? group.folder,
@@ -20201,7 +20385,10 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
               receipt,
               agentId,
             ),
-          { interactionMode: requiredInteractionMode },
+          {
+            feishuCliAccountId: requiredFeishuCliAccountId,
+            interactionMode: requiredInteractionMode,
+          },
         )
       : 'no_active';
     if (sendResult === 'sent' && deliveryTarget) {
@@ -22106,23 +22293,6 @@ async function main(): Promise<void> {
             inputTurnId,
           );
         }
-      }
-      if (inputTurnId) {
-        const scope = channelTurnScope(folder, runtimeAgentId);
-        const persistedContext =
-          sourceJid && inputCursor && inputChatJid
-            ? getMessageChannelTurnContext(inputChatJid, inputCursor.id)
-            : null;
-        const context =
-          persistedContext && persistedContext.sourceJid === sourceJid
-            ? {
-                ...persistedContext,
-                targetJid: inputChatJid,
-                workspaceJid: inputChatJid,
-                sessionAgentId: runtimeAgentId ?? null,
-              }
-            : undefined;
-        bindActiveChannelTurn(scope, inputTurnId, context);
       }
       if (runtimeAgentId) {
         const agentRuntimeKey = inputChatJid?.includes('#agent:')

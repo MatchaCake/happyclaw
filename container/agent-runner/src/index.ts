@@ -67,6 +67,7 @@ import { trimSessionJsonl } from './session-trim.js';
 import { StreamEventProcessor } from './stream-processor.js';
 import {
   acknowledgeHappyClawOwnerProfileFirstWake,
+  activateMcpChannelTurn,
   createMcpTools,
   fetchHappyClawOwnerProfileTurn,
   fetchWorkspaceMemorySnapshot,
@@ -1734,6 +1735,10 @@ async function runQueryAttempt(
       );
       containerInput.messageTaskId = currentMessage.taskId ?? undefined;
     }
+    if (mcpToolsContext) {
+      mcpToolsContext.currentQueryRunId = containerInput.queryRunId;
+      activateMcpChannelTurn(mcpToolsContext);
+    }
   };
   activateCurrentInputTurn(coldInputTurnId);
   const [workspaceMemoryTurn, ownerProfileTurn] = mcpToolsContext
@@ -2162,10 +2167,16 @@ async function runQueryAttempt(
       ipcQueryWatcher.close();
       return;
     }
-    // _drain: finish current query then exit. Once a result has been received,
-    // the query is logically done but the MessageStream keeps the SDK alive.
-    // Treat drain as close at this point to release the container.
-    if (resultCount > 0 && shouldDrain()) {
+    // A held checkpoint is not completion. Drain only after every accepted
+    // input and its background notification/summary protocol have settled;
+    // otherwise switching a Bot/mode would kill the still-running Tasks.
+    if (
+      resultCount > 0 &&
+      durableInputCompletion.isCompleted &&
+      !ipcDeliveryTracker.hasPendingTurns &&
+      processor.getBlockingBackgroundProtocolCount() === 0 &&
+      shouldDrain()
+    ) {
       log('Drain sentinel detected after query result, ending stream');
       cancelBackgroundResultCompletion();
       clearBackgroundProtocolDebtWatchdog();

@@ -73,6 +73,12 @@ function setup(contextValue: ChannelTurnContext = feishuContext()) {
     isAdminHome: true,
     agentBuilderEnabled: false,
     currentInputTurnId: 'delivery-1',
+    // This unit exercises broker stamping after the activation ACK. The
+    // complete runner/host handshake is covered by agent-im-warm-context.
+    channelTurnActivation: {
+      inputTurnId: 'delivery-1',
+      ready: Promise.resolve(),
+    },
     workspaceIpc: root,
     workspaceGroup: root,
   };
