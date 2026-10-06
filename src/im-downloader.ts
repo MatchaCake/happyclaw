@@ -15,6 +15,40 @@ export class FileTooLargeError extends Error {
   }
 }
 
+function resolvedPathStaysInside(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return (
+    relative === '' ||
+    (!relative.startsWith(`..${path.sep}`) &&
+      relative !== '..' &&
+      !path.isAbsolute(relative))
+  );
+}
+
+/**
+ * `mkdir({recursive:true})` 会穿过目录符号链接。日期段可预测，而 O_EXCL
+ * 只拒绝叶子文件上的符号链接，所以工作区内预先放好的
+ * downloads/<channel>/<YYYY-MM-DD> 目录链接会把文件写到群组根之外。
+ * 写盘前要求 realpath(dir) 仍落在 realpath(groupRoot) 里面。
+ */
+function assertDownloadDirInsideGroup(groupRoot: string, dir: string): void {
+  let resolvedRoot: string;
+  let resolvedDir: string;
+  try {
+    resolvedRoot = fs.realpathSync(groupRoot);
+    resolvedDir = fs.realpathSync(dir);
+  } catch {
+    throw new Error(
+      `Refusing to save download outside the group workspace: ${dir}`,
+    );
+  }
+  if (!resolvedPathStaysInside(resolvedRoot, resolvedDir)) {
+    throw new Error(
+      `Refusing to save download outside the group workspace: ${dir}`,
+    );
+  }
+}
+
 /**
  * 清洗来自 IM 渠道的文件名，剥离用于 prompt 注入的字符。`path.basename` 不
  * 剥离这些字符，所以仅依赖它会把攻击载荷透传到 Agent prompt。
@@ -74,8 +108,10 @@ export async function saveDownloadedFile(
   }
 
   const dateStr = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-  const dir = path.join(GROUPS_DIR, groupFolder, 'downloads', channel, dateStr);
+  const groupRoot = path.join(GROUPS_DIR, groupFolder);
+  const dir = path.join(groupRoot, 'downloads', channel, dateStr);
   fs.mkdirSync(dir, { recursive: true });
+  assertDownloadDirInsideGroup(groupRoot, dir);
 
   // 同时清洗控制字符：returned relPath 会被插入 agent prompt，
   // 不能保留 \n / 反引号等可被滥用的字符。sanitize 失败 fallback 时
@@ -149,6 +185,5 @@ export async function saveDownloadedFile(
   }
 
   // 返回相对于群组工作区根目录的路径
-  const groupRoot = path.join(GROUPS_DIR, groupFolder);
   return path.relative(groupRoot, absPath).replace(/\\/g, '/');
 }
