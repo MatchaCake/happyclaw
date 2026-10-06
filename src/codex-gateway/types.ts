@@ -10,9 +10,9 @@ export interface CodexOAuthCredentials {
   refreshToken: string;
   /** epoch ms；由 expires_in 换算。 */
   expiresAt: number;
-  /** id_token JWT `auth.chatgpt_account_id` claim，上游请求头必需。 */
+  /** id_token JWT `https://api.openai.com/auth.chatgpt_account_id`；用于选择上游账号。 */
   accountId: string | null;
-  /** id_token JWT `auth.chatgpt_plan_type` claim（plus/pro/...）。 */
+  /** id_token JWT `https://api.openai.com/auth.chatgpt_plan_type` claim（plus/pro/...）。 */
   planType: string | null;
   email: string | null;
   updatedAt: string;

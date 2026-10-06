@@ -66,8 +66,14 @@ interface RawTokenResponse {
 }
 
 function toTokenResponse(raw: RawTokenResponse): CodexTokenResponse {
-  if (!raw.access_token) {
+  if (typeof raw.access_token !== 'string' || !raw.access_token.trim()) {
     throw new Error('Codex OAuth response missing access_token');
+  }
+  if (
+    raw.expires_in !== undefined &&
+    (!Number.isFinite(raw.expires_in) || raw.expires_in <= 0)
+  ) {
+    throw new Error('Codex OAuth response has invalid expires_in');
   }
   return {
     accessToken: raw.access_token,
@@ -145,9 +151,12 @@ function decodeJwtPayload(jwt: string): Record<string, unknown> | null {
   const parts = jwt.split('.');
   if (parts.length < 2) return null;
   try {
-    return JSON.parse(
+    const payload: unknown = JSON.parse(
       Buffer.from(parts[1], 'base64url').toString('utf-8'),
-    ) as Record<string, unknown>;
+    );
+    return payload && typeof payload === 'object' && !Array.isArray(payload)
+      ? (payload as Record<string, unknown>)
+      : null;
   } catch {
     return null;
   }
@@ -168,8 +177,18 @@ export function parseCodexIdToken(idToken: string | null): CodexIdTokenClaims {
   if (!payload) {
     return { accountId: null, planType: null, email: null };
   }
-  const auth = (payload.auth ?? null) as Record<string, unknown> | null;
-  const profile = (payload.profile ?? null) as Record<string, unknown> | null;
+  // Rust's IdClaims uses serde rename for these namespaced JWT keys. Keep
+  // the old unnamespaced shape for credentials from compatible gateways.
+  const claimRecord = (value: unknown): Record<string, unknown> | null =>
+    value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : null;
+  const auth =
+    claimRecord(payload['https://api.openai.com/auth']) ??
+    claimRecord(payload.auth);
+  const profile =
+    claimRecord(payload['https://api.openai.com/profile']) ??
+    claimRecord(payload.profile);
   const email =
     (typeof payload.email === 'string' && payload.email) ||
     (typeof profile?.email === 'string' && profile.email) ||

@@ -145,11 +145,31 @@ function messageToInputItems(message: Json): Array<Json> {
       case 'tool_result': {
         flushTextMessage();
         if (typeof rawBlock.tool_use_id !== 'string') break;
+        const images = contentBlocks(rawBlock.content)
+          .filter((block) => block.type === 'image')
+          .map((block) => imageToInputImage((block.source ?? {}) as Json))
+          .filter((image): image is Json => image !== null);
+        const text = toolResultToText(rawBlock.content);
         items.push({
           type: 'function_call_output',
           call_id: rawBlock.tool_use_id,
-          output: toolResultToText(rawBlock.content),
+          output: text || (images.length ? 'Image result follows.' : ''),
         });
+        if (images.length) {
+          // Codex's function output remains a string. Carry screenshots in the
+          // adjacent user message and identify their originating tool call.
+          items.push({
+            type: 'message',
+            role: 'user',
+            content: [
+              {
+                type: 'input_text',
+                text: `Images from tool result ${rawBlock.tool_use_id}:`,
+              },
+              ...images,
+            ],
+          });
+        }
         break;
       }
       default:
@@ -177,13 +197,15 @@ function convertTools(tools: Array<Json>): Array<Json> {
 
 function convertToolChoice(
   choice: Json | undefined,
-): Json | 'auto' | 'required' | undefined {
+): Json | 'auto' | 'none' | 'required' | undefined {
   if (!choice) return undefined;
   switch (choice.type) {
     case 'auto':
       return 'auto';
     case 'any':
       return 'required';
+    case 'none':
+      return 'none';
     case 'tool':
       return typeof choice.name === 'string'
         ? { type: 'function', name: choice.name }

@@ -442,15 +442,21 @@ export class ResponsesToAnthropicConverter {
     const response = (raw.response ?? {}) as Json;
     const usage = (response.usage ?? {}) as Json;
     const inputDetails = (usage.input_tokens_details ?? {}) as Json;
+    const tokenCount = (value: unknown): number =>
+      typeof value === 'number' && Number.isFinite(value)
+        ? Math.max(0, Math.trunc(value))
+        : 0;
+    const totalInput = tokenCount(usage.input_tokens);
+    const cachedInput = Math.min(
+      totalInput,
+      tokenCount(inputDetails.cached_tokens),
+    );
+    // Responses input_tokens includes cached_tokens. Anthropic's input_tokens
+    // excludes them; the SDK and our ledger add cache_read_input_tokens back.
     this.usage = {
-      input_tokens:
-        typeof usage.input_tokens === 'number' ? usage.input_tokens : 0,
-      output_tokens:
-        typeof usage.output_tokens === 'number' ? usage.output_tokens : 0,
-      cache_read_input_tokens:
-        typeof inputDetails.cached_tokens === 'number'
-          ? inputDetails.cached_tokens
-          : 0,
+      input_tokens: totalInput - cachedInput,
+      output_tokens: tokenCount(usage.output_tokens),
+      cache_read_input_tokens: cachedInput,
     };
 
     const events = this.closeAllBlocks();

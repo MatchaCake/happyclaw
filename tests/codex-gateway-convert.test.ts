@@ -558,3 +558,79 @@ describe('anthropicToResponses reasoning replay (P0-2)', () => {
     ]);
   });
 });
+
+describe('multimodal tool result round trip', () => {
+  test.each([true, false])(
+    'preserves the tool call identity and screenshot (%s text)',
+    (withText) => {
+      const toolResponse = aggregateResponsesStream(
+        [
+          { type: 'response.created', response: {} },
+          {
+            type: 'response.output_item.added',
+            item: {
+              type: 'function_call',
+              id: 'fc-screen',
+              call_id: 'call-screen',
+              name: 'screenshot',
+            },
+          },
+          {
+            type: 'response.output_item.done',
+            item: {
+              type: 'function_call',
+              id: 'fc-screen',
+              call_id: 'call-screen',
+              name: 'screenshot',
+              arguments: '{}',
+            },
+          },
+          { type: 'response.completed', response: {} },
+        ],
+        'gpt-6-sol',
+      );
+      const content = [
+        ...(withText
+          ? [{ type: 'text', text: 'Captured the active window' }]
+          : []),
+        {
+          type: 'image',
+          source: { type: 'base64', media_type: 'image/png', data: 'c2NyZWVu' },
+        },
+      ];
+      const request = anthropicToResponses(
+        {
+          messages: [
+            { role: 'assistant', content: toolResponse.content },
+            {
+              role: 'user',
+              content: [
+                { type: 'tool_result', tool_use_id: 'call-screen', content },
+              ],
+            },
+          ],
+        },
+        { targetModel: 'gpt-6-sol' },
+      );
+      expect(request.input[0]).toMatchObject({
+        type: 'function_call',
+        call_id: 'call-screen',
+      });
+      expect(request.input[1]).toEqual({
+        type: 'function_call_output',
+        call_id: 'call-screen',
+        output: withText
+          ? 'Captured the active window'
+          : 'Image result follows.',
+      });
+      expect(request.input[2]).toEqual({
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'input_text', text: 'Images from tool result call-screen:' },
+          { type: 'input_image', image_url: 'data:image/png;base64,c2NyZWVu' },
+        ],
+      });
+    },
+  );
+});

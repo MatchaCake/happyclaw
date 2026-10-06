@@ -6,6 +6,7 @@
 // token —— 真实 token 只在网关进程内部持有，不会下发给 Runner/容器。
 
 import { Hono } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
 
 import { logger } from '../logger.js';
 import { getProviderById } from '../runtime-config.js';
@@ -23,44 +24,37 @@ import {
   CodexUpstreamError,
   type AnthropicStreamEvent,
 } from './convert-response.js';
-import { CodexGatewayAuthError, resolveCodexAccess } from './token-manager.js';
+import {
+  CodexGatewayAuthError,
+  resolveCodexAccess,
+  resolveCodexProvider,
+} from './token-manager.js';
+import { CodexProviderRateLimiter } from './provider-rate-limit.js';
+import { CodexMessagesRequestSchema } from './request-validation.js';
 import { CODEX_BACKEND_RESPONSES_URL } from './types.js';
 
-export const codexGatewayApp = new Hono();
+export const codexGatewayApp = new Hono<{
+  Variables: { codexGatewayToken: string };
+}>();
 
 function sseEncode(event: AnthropicStreamEvent): string {
   return `event: ${event.event}\ndata: ${JSON.stringify(event.data)}\n\n`;
 }
 
-// ─── 网关 token 维度的固定窗口限流 ─────────────────────────────────
-// 网关 token 存在于每个 Runner 环境里（ANTHROPIC_AUTH_TOKEN），被提示注入
-// 或攻陷的 Agent 可以拿它直接消耗订阅。限流 + 成功请求日志给管理员留出
-// 发现与轮换的信号窗口。
-const RATE_LIMIT_WINDOW_MS = 60_000;
-const RATE_LIMIT_MAX_REQUESTS = 120;
-const rateLimitCounters = new Map<
-  string,
-  { windowStart: number; count: number }
->();
-
-function isRateLimited(gatewayToken: string): boolean {
-  const now = Date.now();
-  const counter = rateLimitCounters.get(gatewayToken);
-  if (!counter || now - counter.windowStart >= RATE_LIMIT_WINDOW_MS) {
-    rateLimitCounters.set(gatewayToken, { windowStart: now, count: 1 });
-    if (rateLimitCounters.size > 1024) {
-      // token 数量有界（= provider 数），这里只清理过期窗口防极端堆积。
-      for (const [key, entry] of rateLimitCounters) {
-        if (now - entry.windowStart >= RATE_LIMIT_WINDOW_MS) {
-          rateLimitCounters.delete(key);
-        }
-      }
-    }
-    return false;
-  }
-  counter.count += 1;
-  return counter.count > RATE_LIMIT_MAX_REQUESTS;
-}
+// Authenticate before allocating counters or reading a request body. Keying
+// by provider ID also preserves its budget across gateway-key rotations.
+const providerRateLimiter = new CodexProviderRateLimiter();
+const requestBodyLimit = bodyLimit({
+  maxSize: 32 * 1024 * 1024,
+  onError: (c) =>
+    c.json(
+      {
+        type: 'error',
+        error: { type: 'invalid_request_error', message: 'Payload too large' },
+      },
+      413,
+    ),
+});
 
 /** 成功代理请求的轻量审计日志：只记模型与 token 用量，不记消息内容。 */
 function logGatewaySuccess(
@@ -101,11 +95,18 @@ interface UpstreamSseLine {
 /** 逐行解析上游 SSE 文本为 (event, data) 对；data 以 JSON.parse 消费。 */
 async function* iterateUpstreamEvents(
   body: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
 ): AsyncGenerator<Record<string, unknown>> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
   let current: UpstreamSseLine = {};
+  let reachedEof = false;
+  const onAbort = () => {
+    void reader.cancel(signal.reason).catch(() => {});
+  };
+  signal.addEventListener('abort', onAbort, { once: true });
+  if (signal.aborted) onAbort();
 
   const flush = function* (): Generator<Record<string, unknown>> {
     if (current.data === undefined) return;
@@ -122,6 +123,7 @@ async function* iterateUpstreamEvents(
 
   try {
     for (;;) {
+      signal.throwIfAborted();
       let timer: ReturnType<typeof setTimeout> | undefined;
       const timeout = new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
@@ -135,9 +137,16 @@ async function* iterateUpstreamEvents(
       } finally {
         clearTimeout(timer);
       }
+      signal.throwIfAborted();
       const { value, done } = result;
-      if (done) break;
+      if (done) {
+        reachedEof = true;
+        break;
+      }
       buffer += decoder.decode(value, { stream: true });
+      if (buffer.length > 8 * 1024 * 1024) {
+        throw new Error('Upstream Codex SSE event exceeds size limit');
+      }
       const lines = buffer.split('\n');
       buffer = lines.pop() ?? '';
       for (const line of lines) {
@@ -152,6 +161,9 @@ async function* iterateUpstreamEvents(
           const chunk = trimmed.slice('data:'.length).trim();
           current.data =
             current.data === undefined ? chunk : `${current.data}\n${chunk}`;
+          if (current.data.length > 8 * 1024 * 1024) {
+            throw new Error('Upstream Codex SSE event exceeds size limit');
+          }
         }
       }
     }
@@ -168,263 +180,363 @@ async function* iterateUpstreamEvents(
     buffer = '';
     yield* flush();
   } finally {
+    signal.removeEventListener('abort', onAbort);
+    if (!reachedEof) await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
 }
 
-codexGatewayApp.post('/v1/messages', async (c) => {
-  const gatewayToken = extractGatewayToken(c.req.raw.headers);
-  if (!gatewayToken) {
-    return c.json(
-      {
-        type: 'error',
-        error: { type: 'authentication_error', message: 'Missing API key' },
-      },
-      401,
-    );
-  }
-
-  if (isRateLimited(gatewayToken)) {
-    logger.warn('Codex gateway: rate limit exceeded for gateway token');
-    return c.json(
-      {
-        type: 'error',
-        error: {
-          type: 'rate_limit_error',
-          message: 'Codex gateway rate limit exceeded, retry later',
+codexGatewayApp.post(
+  '/v1/messages',
+  async (c, next) => {
+    const gatewayToken = extractGatewayToken(c.req.raw.headers);
+    if (!gatewayToken) {
+      return c.json(
+        {
+          type: 'error',
+          error: { type: 'authentication_error', message: 'Missing API key' },
         },
-      },
-      429,
-    );
-  }
-
-  let access;
-  try {
-    access = await resolveCodexAccess(gatewayToken);
-  } catch (err) {
-    const message =
-      err instanceof CodexGatewayAuthError
-        ? err.message
-        : 'Codex authentication failed';
-    logger.warn({ err }, 'Codex gateway: auth failed');
-    return c.json(
-      { type: 'error', error: { type: 'authentication_error', message } },
-      401,
-    );
-  }
-
-  const provider = getProviderById(access.providerId);
-  const targetModel = resolveCodexModel(
-    undefined,
-    provider?.anthropicModel || '',
-  );
-  const configuredEffort = provider?.customEnv?.CODEX_REASONING_EFFORT;
-
-  let anthropicRequest: AnthropicRequestSubset;
-  let wantsStream = true;
-  try {
-    const raw = (await c.req.json()) as AnthropicRequestSubset & {
-      stream?: boolean;
-    };
-    anthropicRequest = raw;
-    wantsStream = raw.stream !== false;
-  } catch {
-    return c.json(
-      {
-        type: 'error',
-        error: { type: 'invalid_request_error', message: 'Invalid JSON body' },
-      },
-      400,
-    );
-  }
-
-  const requestModel = resolveCodexModel(anthropicRequest.model, targetModel);
-  const responsesRequest = anthropicToResponses(anthropicRequest, {
-    targetModel: requestModel,
-    // 目录钳制：存量配置里被上游移除的 effort 档（如 minimal）或模型不支持
-    // 的档位在请求侧归位，避免上游 400；与前端切模型归位逻辑语义一致。
-    // 目录用解析后的实时目录（上游同步结果优先，baked-in 兜底）。
-    reasoningEffort: clampCodexEffortWithCatalog(
-      getResolvedCodexCatalog().models,
-      requestModel,
-      configuredEffort,
-    ),
-    requestTools: !!anthropicRequest.tools?.length,
-  });
-
-  const controller = new AbortController();
-  const FETCH_TIMEOUT_MS = 30_000;
-  const fetchTimeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  c.req.raw.signal?.addEventListener('abort', () => controller.abort(), {
-    once: true,
-  });
-
-  let upstream: Response;
-  try {
-    upstream = await fetch(CODEX_BACKEND_RESPONSES_URL, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${access.accessToken}`,
-        'Content-Type': 'application/json',
-        Accept: 'text/event-stream',
-        ...(access.accountId ? { 'chatgpt-account-id': access.accountId } : {}),
-        originator: 'codex_cli_rs',
-      },
-      body: JSON.stringify(responsesRequest),
-      signal: controller.signal,
-    });
-    clearTimeout(fetchTimeout);
-  } catch (err) {
-    clearTimeout(fetchTimeout);
-    logger.warn({ err }, 'Codex gateway: upstream request failed');
-    return c.json(
-      {
-        type: 'error',
-        error: { type: 'api_error', message: 'Upstream Codex request failed' },
-      },
-      502,
-    );
-  }
-
-  if (!upstream.ok || !upstream.body) {
-    // 上游错误体可能回显请求片段（会话内容），截断后再进日志。
-    const detail = (await upstream.text().catch(() => '')).slice(0, 512);
-    logger.warn(
-      { status: upstream.status, detail },
-      'Codex gateway: upstream rejected request',
-    );
-    return c.json(
-      {
-        type: 'error',
-        error: {
-          type: 'api_error',
-          message: `Upstream Codex backend returned ${upstream.status}`,
-        },
-      },
-      upstream.status >= 400 && upstream.status < 600
-        ? (upstream.status as any)
-        : 502,
-    );
-  }
-
-  const converter = new ResponsesToAnthropicConverter(responsesRequest.model);
-
-  if (!wantsStream) {
-    const events: Record<string, unknown>[] = [];
-    // 非流式聚合需要一个整体上限：60s 只是块间超时，慢滴上游可以无限
-    // 拖住请求和 events 数组。上限对齐 Anthropic SDK 客户端默认 10 分钟。
-    const AGGREGATE_DEADLINE_MS = 600_000;
-    const deadline = setTimeout(
-      () => controller.abort(),
-      AGGREGATE_DEADLINE_MS,
-    );
-    try {
-      for await (const event of iterateUpstreamEvents(upstream.body)) {
-        events.push(event);
-      }
-      const aggregated = aggregateResponsesStream(
-        events,
-        responsesRequest.model,
+        401,
       );
-      logGatewaySuccess(responsesRequest.model, aggregated.usage);
-      return c.json({
-        id: aggregated.id,
-        type: 'message',
-        role: 'assistant',
-        model: aggregated.model,
-        content: aggregated.content,
-        stop_reason: aggregated.stopReason,
-        stop_sequence: null,
-        usage: aggregated.usage,
-      });
+    }
+
+    let provider;
+    try {
+      provider = resolveCodexProvider(gatewayToken);
     } catch (err) {
-      controller.abort();
-      if (err instanceof CodexUpstreamError) {
-        logger.warn(
-          { code: err.code, errorType: err.errorType },
-          'Codex gateway: upstream reported failure',
-        );
-        return c.json(
-          {
-            type: 'error',
-            error: { type: err.errorType, message: err.message },
+      const message =
+        err instanceof CodexGatewayAuthError
+          ? err.message
+          : 'Codex authentication failed';
+      return c.json(
+        {
+          type: 'error',
+          error: {
+            type: 'authentication_error',
+            message,
           },
-          err.status as 400 | 429 | 502,
-        );
-      }
-      const timedOut = err instanceof Error && err.name === 'AbortError';
-      logger.warn({ err }, 'Codex gateway: upstream stream failed');
+        },
+        401,
+      );
+    }
+    if (providerRateLimiter.isLimited(provider.id)) {
+      logger.warn(
+        { providerId: provider.id },
+        'Codex gateway: provider rate limit exceeded',
+      );
+      return c.json(
+        {
+          type: 'error',
+          error: {
+            type: 'rate_limit_error',
+            message: 'Codex gateway rate limit exceeded, retry later',
+          },
+        },
+        429,
+      );
+    }
+
+    c.set('codexGatewayToken', gatewayToken);
+    await next();
+  },
+  requestBodyLimit,
+  async (c) => {
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      return c.json(
+        {
+          type: 'error',
+          error: {
+            type: 'invalid_request_error',
+            message: 'Invalid JSON body',
+          },
+        },
+        400,
+      );
+    }
+    const validation = CodexMessagesRequestSchema.safeParse(raw);
+    if (!validation.success) {
+      return c.json(
+        {
+          type: 'error',
+          error: {
+            type: 'invalid_request_error',
+            message: 'Invalid messages request',
+          },
+        },
+        400,
+      );
+    }
+    const anthropicRequest: AnthropicRequestSubset = validation.data;
+    const wantsStream = validation.data.stream !== false;
+    const gatewayToken = c.get('codexGatewayToken');
+    let access;
+    try {
+      access = await resolveCodexAccess(gatewayToken);
+    } catch (err) {
+      const message =
+        err instanceof CodexGatewayAuthError
+          ? err.message
+          : 'Codex authentication failed';
+      logger.warn({ err }, 'Codex gateway: auth failed');
+      return c.json(
+        { type: 'error', error: { type: 'authentication_error', message } },
+        401,
+      );
+    }
+
+    const provider = getProviderById(access.providerId);
+    const targetModel = resolveCodexModel(
+      undefined,
+      provider?.anthropicModel || '',
+    );
+    const configuredEffort = provider?.customEnv?.CODEX_REASONING_EFFORT;
+
+    const requestModel = resolveCodexModel(anthropicRequest.model, targetModel);
+    const responsesRequest = anthropicToResponses(anthropicRequest, {
+      targetModel: requestModel,
+      // 目录钳制：存量配置里被上游移除的 effort 档（如 minimal）或模型不支持
+      // 的档位在请求侧归位，避免上游 400；与前端切模型归位逻辑语义一致。
+      // 目录用解析后的实时目录（上游同步结果优先，baked-in 兜底）。
+      reasoningEffort: clampCodexEffortWithCatalog(
+        getResolvedCodexCatalog().models,
+        requestModel,
+        configuredEffort,
+      ),
+      requestTools: !!anthropicRequest.tools?.length,
+    });
+
+    const controller = new AbortController();
+    const FETCH_TIMEOUT_MS = 30_000;
+    const fetchTimeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    let clientCancelled = false;
+    const onClientAbort = () => {
+      clientCancelled = true;
+      controller.abort();
+    };
+    c.req.raw.signal.addEventListener('abort', onClientAbort, { once: true });
+    if (c.req.raw.signal.aborted) onClientAbort();
+    const cleanup = () =>
+      c.req.raw.signal.removeEventListener('abort', onClientAbort);
+
+    let upstream: Response;
+    try {
+      upstream = await fetch(CODEX_BACKEND_RESPONSES_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${access.accessToken}`,
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream',
+          ...(access.accountId
+            ? { 'chatgpt-account-id': access.accountId }
+            : {}),
+          originator: 'codex_cli_rs',
+        },
+        body: JSON.stringify(responsesRequest),
+        signal: controller.signal,
+      });
+      clearTimeout(fetchTimeout);
+    } catch (err) {
+      clearTimeout(fetchTimeout);
+      cleanup();
+      logger.warn({ err }, 'Codex gateway: upstream request failed');
       return c.json(
         {
           type: 'error',
           error: {
             type: 'api_error',
-            message: timedOut
-              ? 'Upstream Codex stream timed out'
-              : 'Upstream Codex stream failed',
+            message: 'Upstream Codex request failed',
           },
         },
-        timedOut ? 504 : 502,
+        502,
       );
-    } finally {
-      clearTimeout(deadline);
     }
-  }
 
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controllerStream) {
-      const encoder = new TextEncoder();
+    if (!upstream.ok || !upstream.body) {
+      // Do not buffer or log an untrusted error body: it can be arbitrarily
+      // large, stall indefinitely, or echo user input and upstream secrets.
+      controller.abort();
+      await upstream.body?.cancel().catch(() => {});
+      cleanup();
+      logger.warn(
+        { status: upstream.status },
+        'Codex gateway: upstream rejected request',
+      );
+      return c.json(
+        {
+          type: 'error',
+          error: {
+            type: 'api_error',
+            message: `Upstream Codex backend returned ${upstream.status}`,
+          },
+        },
+        upstream.status >= 400 && upstream.status < 600
+          ? (upstream.status as any)
+          : 502,
+      );
+    }
+
+    const converter = new ResponsesToAnthropicConverter(responsesRequest.model);
+
+    if (!wantsStream) {
+      const events: Record<string, unknown>[] = [];
+      let eventBytes = 0;
+      // 非流式聚合需要一个整体上限：60s 只是块间超时，慢滴上游可以无限
+      // 拖住请求和 events 数组。上限对齐 Anthropic SDK 客户端默认 10 分钟。
+      const AGGREGATE_DEADLINE_MS = 600_000;
+      const deadline = setTimeout(
+        () => controller.abort(),
+        AGGREGATE_DEADLINE_MS,
+      );
       try {
-        for await (const upstreamEvent of iterateUpstreamEvents(
-          upstream.body!,
+        for await (const event of iterateUpstreamEvents(
+          upstream.body,
+          controller.signal,
         )) {
-          for (const outEvent of converter.handleEvent(upstreamEvent)) {
-            controllerStream.enqueue(encoder.encode(sseEncode(outEvent)));
+          eventBytes += Buffer.byteLength(JSON.stringify(event));
+          if (eventBytes > 32 * 1024 * 1024) {
+            throw new Error(
+              'Upstream Codex response exceeds aggregation limit',
+            );
           }
+          events.push(event);
         }
-        for (const outEvent of converter.finish()) {
-          controllerStream.enqueue(encoder.encode(sseEncode(outEvent)));
-        }
-        const failure = converter.getFailure();
-        if (failure) {
+        const aggregated = aggregateResponsesStream(
+          events,
+          responsesRequest.model,
+        );
+        logGatewaySuccess(responsesRequest.model, aggregated.usage);
+        return c.json({
+          id: aggregated.id,
+          type: 'message',
+          role: 'assistant',
+          model: aggregated.model,
+          content: aggregated.content,
+          stop_reason: aggregated.stopReason,
+          stop_sequence: null,
+          usage: aggregated.usage,
+        });
+      } catch (err) {
+        controller.abort();
+        if (err instanceof CodexUpstreamError) {
           logger.warn(
-            { code: failure.code, errorType: failure.type },
+            { code: err.code, errorType: err.errorType },
             'Codex gateway: upstream reported failure',
           );
-        } else {
-          logGatewaySuccess(responsesRequest.model, converter.getUsage());
+          return c.json(
+            {
+              type: 'error',
+              error: { type: err.errorType, message: err.message },
+            },
+            err.status as 400 | 429 | 502,
+          );
         }
-      } catch (err) {
-        logger.warn({ err }, 'Codex gateway: stream translation failed');
-        controllerStream.enqueue(
-          encoder.encode(
-            sseEncode({
-              event: 'error',
-              data: {
-                type: 'error',
-                error: {
-                  type: 'api_error',
-                  message: 'Codex gateway stream failed',
-                },
-              },
-            }),
-          ),
+        const timedOut = err instanceof Error && err.name === 'AbortError';
+        logger.warn({ err }, 'Codex gateway: upstream stream failed');
+        return c.json(
+          {
+            type: 'error',
+            error: {
+              type: 'api_error',
+              message: timedOut
+                ? 'Upstream Codex stream timed out'
+                : 'Upstream Codex stream failed',
+            },
+          },
+          timedOut ? 504 : 502,
         );
       } finally {
-        controllerStream.close();
+        clearTimeout(deadline);
+        cleanup();
       }
-    },
-    cancel() {
-      controller.abort();
-    },
-  });
+    }
 
-  return new Response(stream, {
-    status: 200,
-    headers: {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
-    },
-  });
-});
+    let streamCancelled = false;
+    let upstreamFinished = false;
+    const upstreamEvents = iterateUpstreamEvents(
+      upstream.body,
+      controller.signal,
+    );
+    const pendingEvents: AnthropicStreamEvent[] = [];
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      async pull(controllerStream) {
+        try {
+          // Consume upstream only when downstream has room; a slow/disconnected
+          // client cannot leave an unbounded queue of translated SSE chunks.
+          while (!pendingEvents.length && !upstreamFinished) {
+            const next = await upstreamEvents.next();
+            if (next.done) {
+              upstreamFinished = true;
+              pendingEvents.push(...converter.finish());
+              const failure = converter.getFailure();
+              if (failure) {
+                logger.warn(
+                  { code: failure.code, errorType: failure.type },
+                  'Codex gateway: upstream reported failure',
+                );
+              } else {
+                logGatewaySuccess(responsesRequest.model, converter.getUsage());
+              }
+            } else {
+              pendingEvents.push(...converter.handleEvent(next.value));
+            }
+          }
+          if (streamCancelled) return;
+          if (clientCancelled) {
+            cleanup();
+            controllerStream.close();
+            return;
+          }
+          const event = pendingEvents.shift();
+          if (event) {
+            controllerStream.enqueue(encoder.encode(sseEncode(event)));
+          } else {
+            cleanup();
+            controllerStream.close();
+          }
+        } catch (err) {
+          if (!streamCancelled) {
+            if (!clientCancelled) {
+              logger.warn({ err }, 'Codex gateway: stream translation failed');
+              controllerStream.enqueue(
+                encoder.encode(
+                  sseEncode({
+                    event: 'error',
+                    data: {
+                      type: 'error',
+                      error: {
+                        type: 'api_error',
+                        message: 'Codex gateway stream failed',
+                      },
+                    },
+                  }),
+                ),
+              );
+            }
+            controllerStream.close();
+          }
+          cleanup();
+        }
+      },
+      async cancel() {
+        streamCancelled = true;
+        clientCancelled = true;
+        controller.abort();
+        cleanup();
+        await upstreamEvents.return(undefined).catch(() => {});
+      },
+    });
+
+    return new Response(stream, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+      },
+    });
+  },
+);
