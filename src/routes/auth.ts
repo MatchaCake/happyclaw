@@ -5,6 +5,7 @@ import { readFile } from 'fs/promises';
 import path from 'path';
 import crypto from 'crypto';
 import { Hono } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
 import type { Variables } from '../web-context.js';
 import {
   authMiddleware,
@@ -67,6 +68,15 @@ import {
 import { getSystemSettings } from '../runtime-config.js';
 
 const authRoutes = new Hono<{ Variables: Variables }>();
+
+// The unauthenticated JSON endpoints (setup / login / register) buffer the
+// whole request body before any auth or login rate limit runs. Cap them per
+// route (64KB, same budget as /api/memory) rather than router-wide, so the
+// authenticated /avatar multipart upload keeps its own larger limit.
+const authJsonBodyLimit = bodyLimit({
+  maxSize: 64 * 1024,
+  onError: (c) => c.json({ error: 'Payload too large' }, 413),
+});
 
 // --- Helper Functions ---
 
@@ -137,7 +147,7 @@ authRoutes.get('/status', (c) => {
 });
 
 // Public: initial admin setup (only when no users exist)
-authRoutes.post('/setup', async (c) => {
+authRoutes.post('/setup', authJsonBodyLimit, async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const { username: rawUsername, password } = body as {
     username?: string;
@@ -229,7 +239,7 @@ authRoutes.post('/setup', async (c) => {
   );
 });
 
-authRoutes.post('/login', async (c) => {
+authRoutes.post('/login', authJsonBodyLimit, async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const validation = LoginSchema.safeParse(body);
   if (!validation.success) {
@@ -369,7 +379,7 @@ authRoutes.get('/register/status', (c) => {
   });
 });
 
-authRoutes.post('/register', async (c) => {
+authRoutes.post('/register', authJsonBodyLimit, async (c) => {
   if (getUserCount(true) === 0) {
     return c.json({ error: '系统尚未初始化，请先完成管理员设置。' }, 403);
   }
