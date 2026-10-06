@@ -13,6 +13,9 @@ if (!base || !cookieFile) {
 const cookie = fs.readFileSync(cookieFile, 'utf8').trim();
 const nonce = `ACCEPT_${Date.now().toString(36)}`;
 const ownedWorkspaces = [];
+const workspaceFolders = new Map();
+const ownedTasks = [];
+const ownedRuns = [];
 const cases = [];
 let profileId;
 let ws;
@@ -99,6 +102,7 @@ async function workspace(mode) {
     agent_profile_id: profileId,
   });
   ownedWorkspaces.push(created.jid);
+  workspaceFolders.set(created.jid, created.group.folder);
   assert.equal(created.group.execution_mode, mode);
   return created.jid;
 }
@@ -180,6 +184,69 @@ async function run() {
         b,
       ),
     ]);
+    const interruptAfter = events.length;
+    ws.send(
+      JSON.stringify({
+        type: 'send_message',
+        chatJid: jid,
+        content:
+          'Run Bash sleep 15 in the foreground. Wait until it finishes before replying.',
+      }),
+    );
+    await waitUntil(() =>
+      scopedEvents(jid, undefined, interruptAfter).some(
+        (event) => event.event?.eventType === 'tool_use_start',
+      ),
+    );
+    const interruptedMarker = `${nonce}_${mode}_INTERRUPT_FOLLOWUP`;
+    const followup = turn(
+      jid,
+      `Reply exactly ${interruptedMarker}`,
+      interruptedMarker,
+    );
+    // Wait for the durable receipt before interrupting the preceding query.
+    await waitUntil(() =>
+      scopedEvents(jid, undefined, interruptAfter).some(
+        (event) =>
+          event.type === 'new_message' &&
+          !event.message?.is_from_me &&
+          event.message?.content?.includes(interruptedMarker),
+      ),
+    );
+    const interrupted = await api(
+      'POST',
+      `/api/groups/${encodeURIComponent(jid)}/interrupt`,
+      {},
+    );
+    assert.equal(interrupted.interrupted, true);
+    await followup;
+    const taskMarker = `${nonce}_${mode}_SCHEDULED`;
+    const task = await api('POST', '/api/tasks', {
+      chat_jid: jid,
+      group_folder: workspaceFolders.get(jid),
+      schedule_type: 'interval',
+      schedule_value: '3600000',
+      context_mode: 'isolated',
+      execution_type: 'agent',
+      prompt: `Use a tool to write acceptance-scheduled.txt containing exactly ${taskMarker}, then reply exactly ${taskMarker}.`,
+    });
+    ownedTasks.push(task.taskId);
+    const run = await api(
+      'POST',
+      `/api/tasks/${encodeURIComponent(task.taskId)}/runs`,
+      { idempotency_key: nonce },
+    );
+    ownedRuns.push(run.runId);
+    await waitUntil(async () => {
+      const current = (
+        await api('GET', `/api/tasks/runs/${encodeURIComponent(run.runId)}`)
+      ).run;
+      if (['failed', 'cancelled', 'missed'].includes(current.status))
+        throw new Error(`Acceptance task status: ${current.status}`);
+      return ['success', 'delivered'].includes(current.status);
+    });
+    await verifyFile(jid, 'acceptance-scheduled.txt', taskMarker);
+    cases.push({ marker: taskMarker, passed: true, scheduler: true });
   }
   const host = ownedWorkspaces[0];
   const bg = `${nonce}_BACKGROUND_DONE`;
@@ -202,6 +269,47 @@ try {
 } finally {
   ws?.close();
   let cleanupFailed = false;
+  for (const runId of ownedRuns) {
+    try {
+      const current = (
+        await api('GET', `/api/tasks/runs/${encodeURIComponent(runId)}`)
+      ).run;
+      if (['queued', 'running', 'retry_wait'].includes(current.status)) {
+        await api(
+          'POST',
+          `/api/tasks/runs/${encodeURIComponent(runId)}/cancel`,
+          {},
+        );
+        await waitUntil(async () => {
+          const run = (
+            await api('GET', `/api/tasks/runs/${encodeURIComponent(runId)}`)
+          ).run;
+          return !['queued', 'running', 'retry_wait'].includes(run.status);
+        }, 30_000);
+      }
+    } catch {
+      cleanupFailed = true;
+      console.error('Acceptance run cleanup failed');
+    }
+  }
+  for (const taskId of ownedTasks) {
+    try {
+      const task = (await api('GET', '/api/tasks')).tasks.find(
+        (item) => item.id === taskId,
+      );
+      assert(task, 'Acceptance task is missing');
+      const deleted = await api(
+        'DELETE',
+        `/api/tasks/${encodeURIComponent(taskId)}?expected_revision=${task.revision}`,
+      );
+      await api('POST', '/api/tasks/purge', {
+        tasks: [{ id: taskId, expected_revision: deleted.task.revision }],
+      });
+    } catch {
+      cleanupFailed = true;
+      console.error('Acceptance task cleanup failed');
+    }
+  }
   for (const jid of ownedWorkspaces.reverse()) {
     try {
       await api('DELETE', `/api/groups/${encodeURIComponent(jid)}`);
