@@ -19,6 +19,7 @@ const ownedRuns = [];
 const cases = [];
 let profileId;
 let ws;
+let runPassed = false;
 const events = [];
 
 async function api(method, route, body) {
@@ -33,11 +34,11 @@ async function api(method, route, body) {
   return response.json();
 }
 
-async function waitUntil(predicate, timeoutMs = 180_000) {
+async function waitUntil(predicate, timeoutMs = 180_000, pollMs = 200) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await predicate()) return;
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
   }
   throw new Error('Acceptance condition timed out');
 }
@@ -62,22 +63,46 @@ async function turn(jid, prompt, marker, agentId) {
       content: prompt,
     }),
   );
-  await waitUntil(() =>
-    scopedEvents(jid, agentId, after).some(
+  let receipt;
+  await waitUntil(() => {
+    receipt = scopedEvents(jid, agentId, after).find(
       (event) =>
         event.type === 'new_message' &&
-        event.message?.is_from_me &&
-        event.message.sender !== '__system__' &&
-        event.message.content?.includes(marker),
+        !event.message?.is_from_me &&
+        event.message?.content === prompt,
+    )?.message;
+    return !!receipt;
+  }, 30_000);
+  const isFinal = (message) =>
+    message?.is_from_me &&
+    message.turn_id === receipt.id &&
+    message.source_kind === 'sdk_final' &&
+    message.finalization_reason === 'completed' &&
+    message.content?.trim() === marker;
+  await waitUntil(() =>
+    scopedEvents(jid, agentId, after).some(
+      (event) => event.type === 'new_message' && isFinal(event.message),
     ),
   );
   const route = `/api/groups/${encodeURIComponent(jid)}/messages${agentId ? `?agentId=${encodeURIComponent(agentId)}` : ''}`;
-  await waitUntil(async () => {
-    const history = await api('GET', route);
-    return history.messages.some(
-      (message) => message.is_from_me && message.content?.includes(marker),
-    );
-  }, 15_000);
+  await waitUntil(
+    async () => {
+      const history = await api('GET', route);
+      return history.messages.some(isFinal);
+    },
+    15_000,
+    1000,
+  );
+  await waitUntil(
+    async () => {
+      const status = await api('GET', '/api/monitor/status');
+      const actualJid = agentId ? `${jid}#agent:${agentId}` : jid;
+      const runner = status.groups.find((group) => group.jid === actualJid);
+      return !runner || (!runner.queryInFlight && !runner.pendingMessages);
+    },
+    60_000,
+    2000,
+  );
   const scoped = scopedEvents(jid, agentId, after);
   assert(
     scoped.some((event) => event.type === 'stream_event'),
@@ -132,10 +157,12 @@ async function run() {
   profileId = created.profile.id;
   ws = new WebSocket(`${base.replace(/^http/, 'ws')}/ws`, {
     headers: { Cookie: cookie },
+    handshakeTimeout: 30_000,
   });
   ws.on('message', (data) => {
     try {
-      events.push(JSON.parse(data.toString()));
+      const event = JSON.parse(data.toString());
+      if (ownedWorkspaces.includes(event.chatJid)) events.push(event);
     } catch {
       /* ignore non-JSON heartbeats */
     }
@@ -195,14 +222,26 @@ async function run() {
     );
     await waitUntil(() =>
       scopedEvents(jid, undefined, interruptAfter).some(
-        (event) => event.event?.eventType === 'tool_use_start',
+        (event) =>
+          event.event?.eventType === 'tool_use_start' &&
+          event.event.toolName === 'Bash',
       ),
+    );
+    const sleepRunner = (await api('GET', '/api/monitor/status')).groups.find(
+      (group) => group.jid === jid,
+    );
+    assert(
+      sleepRunner?.queryInFlight && sleepRunner.queryId,
+      'Sleep query is not active',
     );
     const interruptedMarker = `${nonce}_${mode}_INTERRUPT_FOLLOWUP`;
     const followup = turn(
       jid,
       `Reply exactly ${interruptedMarker}`,
       interruptedMarker,
+    ).then(
+      () => ({ success: true }),
+      (error) => ({ success: false, error }),
     );
     // Wait for the durable receipt before interrupting the preceding query.
     await waitUntil(() =>
@@ -210,7 +249,9 @@ async function run() {
         (event) =>
           event.type === 'new_message' &&
           !event.message?.is_from_me &&
-          event.message?.content?.includes(interruptedMarker),
+          event.message?.content?.includes(interruptedMarker) &&
+          event.message.delivery_status === 'queued' &&
+          event.message.delivery_run_id === sleepRunner.queryId,
       ),
     );
     const interrupted = await api(
@@ -219,7 +260,8 @@ async function run() {
       {},
     );
     assert.equal(interrupted.interrupted, true);
-    await followup;
+    const followupOutcome = await followup;
+    if (!followupOutcome.success) throw followupOutcome.error;
     const taskMarker = `${nonce}_${mode}_SCHEDULED`;
     const task = await api('POST', '/api/tasks', {
       chat_jid: jid,
@@ -237,26 +279,76 @@ async function run() {
       { idempotency_key: nonce },
     );
     ownedRuns.push(run.runId);
-    await waitUntil(async () => {
-      const current = (
-        await api('GET', `/api/tasks/runs/${encodeURIComponent(run.runId)}`)
-      ).run;
-      if (['failed', 'cancelled', 'missed'].includes(current.status))
-        throw new Error(`Acceptance task status: ${current.status}`);
-      return ['success', 'delivered'].includes(current.status);
-    });
+    await waitUntil(
+      async () => {
+        const current = (
+          await api('GET', `/api/tasks/runs/${encodeURIComponent(run.runId)}`)
+        ).run;
+        if (['failed', 'cancelled', 'missed'].includes(current.status))
+          throw new Error(`Acceptance task status: ${current.status}`);
+        if (!['success', 'delivered'].includes(current.status)) return false;
+        assert(
+          current.result?.includes(taskMarker),
+          'Scheduled model result is missing its marker',
+        );
+        return true;
+      },
+      180_000,
+      2000,
+    );
     await verifyFile(jid, 'acceptance-scheduled.txt', taskMarker);
     cases.push({ marker: taskMarker, passed: true, scheduler: true });
   }
   const host = ownedWorkspaces[0];
   const bg = `${nonce}_BACKGROUND_DONE`;
+  const backgroundAfter = events.length;
   await turn(
     host,
     `Run Bash with run_in_background=true to execute: sleep 2; printf '${bg}' > acceptance-background.txt. Wait for the actual background task completion notification, read acceptance-background.txt, and only then reply exactly ${bg}.`,
     bg,
   );
   await verifyFile(host, 'acceptance-background.txt', bg);
-  console.log(JSON.stringify({ passed: true, cases }, null, 2));
+  const backgroundEvents = scopedEvents(host, undefined, backgroundAfter);
+  const notification = backgroundEvents.findIndex(
+    (event) =>
+      event.event?.eventType === 'task_notification' &&
+      event.event.taskStatus === 'completed' &&
+      event.event.isBackground === true,
+  );
+  assert(notification >= 0, 'No actual background completion notification');
+  assert(
+    backgroundEvents
+      .slice(notification + 1)
+      .some(
+        (event) =>
+          event.type === 'new_message' &&
+          event.message?.source_kind === 'sdk_final' &&
+          event.message.finalization_reason === 'completed' &&
+          event.message.content?.trim() === bg,
+      ),
+    'Background final response preceded its completion',
+  );
+  const cloned = await api('POST', '/api/groups', {
+    name: `${nonce} public git clone`,
+    execution_mode: 'container',
+    agent_profile_id: profileId,
+    init_git_url: 'https://github.com/octocat/Hello-World.git',
+  });
+  ownedWorkspaces.push(cloned.jid);
+  const readme = await fetch(
+    `${base}/api/groups/${encodeURIComponent(cloned.jid)}/files/download/${Buffer.from('README').toString('base64url')}`,
+    {
+      headers: { Cookie: cookie },
+      signal: AbortSignal.timeout(15_000),
+    },
+  );
+  assert.equal(readme.status, 200);
+  assert(
+    (await readme.text()).includes('Hello World'),
+    'Git clone did not preserve the public repository file',
+  );
+  cases.push({ marker: `${nonce}_PUBLIC_GIT_CLONE`, passed: true });
+  runPassed = true;
 }
 
 try {
@@ -330,4 +422,15 @@ try {
     }
   }
   if (cleanupFailed) process.exitCode = 1;
+  console.log(
+    JSON.stringify(
+      {
+        passed: runPassed && !cleanupFailed,
+        cleanupPassed: !cleanupFailed,
+        cases,
+      },
+      null,
+      2,
+    ),
+  );
 }
