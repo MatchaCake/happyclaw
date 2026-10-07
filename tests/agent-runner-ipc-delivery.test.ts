@@ -15,6 +15,7 @@ import {
   requeueIpcInputMessages,
   resolveLogicalQueryInputTurnId,
   scheduledGroupRunIdFromIpcMessages,
+  sdkResultConsumedUserMessageUuids,
   shouldAcceptIpcMessagesDuringQuery,
   serializeIpcInputMessage,
   type IpcDeliveryReceipt,
@@ -187,6 +188,83 @@ describe('agent-runner IPC delivery turn tracker', () => {
     expect(tracker.completeNextTurn().map((r) => r.cursor.id)).toEqual(['2']);
     expect(tracker.pendingTurnCount).toBe(0);
     expect(tracker.hasPendingTurns).toBe(false);
+  });
+
+  test('completes queued turns the SDK merged into an already finished turn', () => {
+    // Reproduces the 2026-10-07 stuck stream: A starts, B/C/D are piped while
+    // A is busy, the CLI folds C and D into one turn, and background
+    // notifications produce extra results. One-result-per-turn accounting left
+    // C and D pending until the 30 min idle timeout.
+    const a = message('1');
+    const tracker = new IpcTurnDeliveryTracker([a]);
+    tracker.bindSdkMessageUuid([a], 'uuid-a');
+    for (const id of ['2', '3', '4']) {
+      const queuedMessage = message(id);
+      tracker.acceptTurn([queuedMessage]);
+      tracker.bindSdkMessageUuid([queuedMessage], `uuid-${id}`);
+    }
+    expect(tracker.pendingTurnCount).toBe(4);
+
+    // Withheld result (background tasks still running) consumed A, B, C, D.
+    tracker.observeAnsweredSdkUuids(['uuid-a', 'uuid-2']);
+    tracker.observeAnsweredSdkUuids(['uuid-3', 'uuid-4']);
+    expect(tracker.completeAnsweredTurns().map((r) => r.cursor.id)).toEqual([
+      '1',
+      '2',
+      '3',
+      '4',
+    ]);
+    expect(tracker.hasPendingTurns).toBe(false);
+    expect(tracker.unacknowledgedMessages).toEqual([]);
+  });
+
+  test('does not complete a queued turn the SDK has not consumed yet', () => {
+    const a = message('1');
+    const b = message('2');
+    const c = message('3');
+    const tracker = new IpcTurnDeliveryTracker([a]);
+    tracker.bindSdkMessageUuid([a], 'uuid-a');
+    tracker.acceptTurn([b]);
+    tracker.bindSdkMessageUuid([b], 'uuid-b');
+    tracker.acceptTurn([c]);
+    tracker.bindSdkMessageUuid([c], 'uuid-c');
+
+    // C was consumed, but B still waits ahead of it: keep FIFO ownership.
+    tracker.observeAnsweredSdkUuids(['uuid-a', 'uuid-c']);
+    expect(tracker.completeAnsweredTurns().map((r) => r.cursor.id)).toEqual([
+      '1',
+    ]);
+    expect(tracker.currentTurnDeliveryId).toBe('delivery-2');
+    expect(tracker.completeAnsweredTurns().map((r) => r.cursor.id)).toEqual([
+      '2',
+      '3',
+    ]);
+    expect(tracker.hasPendingTurns).toBe(false);
+  });
+
+  test('falls back to one result per turn when the CLI echoes no uuids', () => {
+    const tracker = new IpcTurnDeliveryTracker([]);
+    const b = message('2');
+    tracker.acceptTurn([b]);
+    tracker.bindSdkMessageUuid([b], 'uuid-b');
+    tracker.observeAnsweredSdkUuids(
+      sdkResultConsumedUserMessageUuids({ type: 'result' }),
+    );
+    expect(tracker.completeAnsweredTurns()).toEqual([]);
+    expect(tracker.pendingTurnCount).toBe(1);
+  });
+
+  test('reads consumed user message uuids from SDK results', () => {
+    expect(
+      sdkResultConsumedUserMessageUuids({
+        user_message_uuid: 'b',
+        user_message_uuids: ['a', 'b', 7],
+      }),
+    ).toEqual(['a', 'b', 'b']);
+    expect(
+      sdkResultConsumedUserMessageUuids({ user_message_uuid: 'a' }),
+    ).toEqual(['a']);
+    expect(sdkResultConsumedUserMessageUuids({})).toEqual([]);
   });
 
   test('after interrupt, exposes only the next turn and not every later turn', () => {
