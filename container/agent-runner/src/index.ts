@@ -170,6 +170,7 @@ import {
   BackgroundProtocolDebtWatchdog,
   DurableInputTurnCompletion,
   isMergedBackgroundCompletionPlaceholder,
+  isSdkBookkeepingFrame,
   QuiescentResultGate,
   shouldFailIncompleteQueryExit,
 } from './background-task-drain.js';
@@ -2933,7 +2934,9 @@ async function runQueryAttempt(
     }
     for await (const message of q) {
       firstResponseWatchdog.observe(message.type);
+      const bookkeepingFrame = isSdkBookkeepingFrame(message);
       const preservesObservedBackgroundResult =
+        bookkeepingFrame ||
         (message.type === 'system' &&
           (message.subtype === 'background_tasks_changed' ||
             message.subtype === 'task_notification' ||
@@ -2947,6 +2950,10 @@ async function runQueryAttempt(
         pendingBackgroundResult = undefined;
         processor.invalidateObservedBackgroundResult();
       }
+      // activityObserved() cancelled the quiet-period timer; a bookkeeping
+      // frame changes no drain state, so restart it or the Result waits for
+      // the idle close.
+      if (bookkeepingFrame) scheduleBackgroundResultCompletion();
       if (providerFailurePublished) {
         continue;
       }
