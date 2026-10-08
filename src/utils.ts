@@ -18,6 +18,18 @@ export function stripAgentInternalTags(text: string): string {
 }
 
 /**
+ * True when the agent deliberately answered with nothing but non-empty
+ * `<internal>`/`<process>` blocks — a complete, intentionally silent final
+ * (e.g. a scheduled pipeline stage confirming "done" without notifying).
+ */
+export function isInternalOnlyAgentOutput(
+  text: string | null | undefined,
+): boolean {
+  if (!text?.trim() || stripAgentInternalTags(text) !== '') return false;
+  return /<(internal|process)>\s*\S[\s\S]*?<\/\1>/.test(text);
+}
+
+/**
  * Detect whether an agent output is system-maintenance noise that should
  * be suppressed from IM delivery when sourceKind is 'auto_continue'.
  *
@@ -130,7 +142,9 @@ export function isRealpathInside(
     } catch {
       return false;
     }
-    return realTarget === realRoot || realTarget.startsWith(realRoot + path.sep);
+    return (
+      realTarget === realRoot || realTarget.startsWith(realRoot + path.sep)
+    );
   });
 }
 
@@ -162,7 +176,9 @@ export function isSecureRequest(c: any): boolean {
   try {
     const url = new URL(c.req.url, 'http://localhost');
     if (url.protocol === 'https:') return true;
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
   return false;
 }
 
