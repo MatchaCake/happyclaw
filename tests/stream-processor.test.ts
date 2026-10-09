@@ -218,6 +218,94 @@ describe('StreamEventProcessor observability mapping', () => {
     expect(processor.canCompleteObservedBackgroundResult()).toBe(false);
   });
 
+  test('background tasks started inside a sub-agent never create main-Agent completion debt', () => {
+    const { processor } = makeProcessor();
+    // Main Agent launches a background research sub-agent.
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'agent-research',
+      tool_use_id: 'toolu_agent',
+      description: 'Research',
+      task_type: 'local_agent',
+      is_backgrounded: true,
+      spawn_depth: 1,
+    });
+    // The sub-agent issues background Bash calls (parent_tool_use_id set), one
+    // seen via partial stream events and one only via the full message.
+    processor.processStreamEvent({
+      type: 'stream_event',
+      parent_tool_use_id: 'toolu_agent',
+      event: {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', name: 'Bash', id: 'toolu_bash_1' },
+      },
+    });
+    processor.processSubAgentMessage({
+      type: 'assistant',
+      parent_tool_use_id: 'toolu_agent',
+      message: {
+        content: [
+          { type: 'tool_use', name: 'Bash', id: 'toolu_bash_2', input: {} },
+        ],
+      },
+    });
+    for (const [taskId, toolUseId] of [
+      ['bash-1', 'toolu_bash_1'],
+      ['bash-2', 'toolu_bash_2'],
+    ]) {
+      processor.processSystemMessage({
+        type: 'system',
+        subtype: 'task_started',
+        task_id: taskId,
+        tool_use_id: toolUseId,
+        description: taskId,
+        task_type: 'local_bash',
+        is_backgrounded: true,
+      });
+      processor.processSystemMessage({
+        type: 'system',
+        subtype: 'task_notification',
+        task_id: taskId,
+        tool_use_id: toolUseId,
+        status: 'completed',
+        summary: `${taskId} done`,
+      });
+    }
+    // A nested Agent spawn (depth 2) belongs to the sub-agent as well.
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'agent-nested',
+      description: 'nested',
+      task_type: 'local_agent',
+      spawn_depth: 2,
+    });
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_notification',
+      task_id: 'agent-nested',
+      status: 'completed',
+      summary: 'nested done',
+    });
+    expect(processor.getBlockingBackgroundCompletionDebtCount()).toBe(0);
+
+    // Only the main Agent's own Task notification is an obligation.
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_notification',
+      task_id: 'agent-research',
+      tool_use_id: 'toolu_agent',
+      status: 'completed',
+      summary: 'research done',
+    });
+    expect(processor.getBlockingBackgroundCompletionDebtCount()).toBe(1);
+    processor.observeBackgroundNotificationActivity();
+    expect(processor.observeBackgroundResult('task-notification')).toBe(true);
+    expect(processor.getBlockingBackgroundProtocolCount()).toBe(0);
+  });
+
   test('treats stopped and aborted task_updated as terminal SDK statuses', () => {
     const { processor } = makeProcessor();
 

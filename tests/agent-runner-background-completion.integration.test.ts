@@ -7,7 +7,10 @@ import { pathToFileURL } from 'node:url';
 
 import { afterAll, describe, expect, test } from 'vitest';
 
-import { isMergedBackgroundCompletionPlaceholder } from '../container/agent-runner/src/background-task-drain.js';
+import {
+  isMergedBackgroundCompletionPlaceholder,
+  isSdkBookkeepingFrame,
+} from '../container/agent-runner/src/background-task-drain.js';
 
 const runnerRoot = path.resolve('container/agent-runner');
 const runnerRequire = createRequire(path.join(runnerRoot, 'package.json'));
@@ -297,4 +300,92 @@ describe('Claude Code merged background-task completions', () => {
     ]);
     expect(mainCalls).toBe(3);
   }, 40_000);
+
+  test('a uuid-stamped user turn emits command_lifecycle after its Result', async () => {
+    const server = http.createServer((request, response) => {
+      request.resume();
+      request.on('end', () => {
+        const url = request.url ?? '';
+        if (!url.includes('/v1/messages') || url.includes('count_tokens')) {
+          response.writeHead(200, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({ input_tokens: 1 }));
+          return;
+        }
+        sendMessage(
+          response,
+          'msg_lifecycle',
+          [{ type: 'text', text: 'LIFECYCLE_DONE' }],
+          'end_turn',
+        );
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', () => resolve());
+    });
+    const address = server.address();
+    if (!address || typeof address === 'string') {
+      throw new Error('fake Anthropic server did not expose a TCP port');
+    }
+    fs.mkdirSync(cwd, { recursive: true });
+    fs.mkdirSync(configDir, { recursive: true });
+
+    let closeInput: () => void = () => {};
+    const inputClosed = new Promise<void>((resolve) => {
+      closeInput = resolve;
+    });
+    async function* input() {
+      yield {
+        type: 'user' as const,
+        message: { role: 'user' as const, content: 'hello' },
+        parent_tool_use_id: null,
+        session_id: '',
+        uuid: '00000000-0000-4000-8000-00000000c0de' as const,
+      };
+      await inputClosed;
+    }
+
+    const types: string[] = [];
+    const guard = setTimeout(() => closeInput(), 20_000);
+    try {
+      const conversation = runnerSdk.query({
+        prompt: input(),
+        options: {
+          pathToClaudeCodeExecutable: runnerClaudeExecutable,
+          cwd,
+          model: 'claude-sonnet-4-5-20250929',
+          env: fakeProviderEnv(`http://127.0.0.1:${address.port}`),
+          permissionMode: 'bypassPermissions',
+          allowDangerouslySkipPermissions: true,
+          settingSources: [],
+        },
+      });
+      let resultSeen = false;
+      for await (const message of conversation) {
+        types.push(
+          isSdkBookkeepingFrame(message) ? 'command_lifecycle' : message.type,
+        );
+        if (message.type === 'result') resultSeen = true;
+        if (resultSeen && isSdkBookkeepingFrame(message)) closeInput();
+      }
+    } finally {
+      clearTimeout(guard);
+      closeInput();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+
+    // The runner's quiet-period gate must survive this trailing frame;
+    // treating it as Agent activity stranded drain-ready Results until the
+    // 30 min idle close.
+    expect(types.lastIndexOf('command_lifecycle')).toBeGreaterThan(
+      types.indexOf('result'),
+    );
+    expect(isSdkBookkeepingFrame({ type: 'result' })).toBe(false);
+    expect(
+      isSdkBookkeepingFrame({ type: 'system', subtype: 'hook_response' }),
+    ).toBe(true);
+    expect(
+      isSdkBookkeepingFrame({ type: 'system', subtype: 'task_notification' }),
+    ).toBe(false);
+  }, 30_000);
 });

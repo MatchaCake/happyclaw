@@ -1159,7 +1159,7 @@ export function closeRunnerAfterRotatingProviderTurn(
   rotationAlreadyScheduled: boolean,
   output: Pick<
     ContainerOutput,
-    'providerFailure' | 'inputTurnCompleted' | 'pendingBgTasks'
+    'providerFailure' | 'inputTurnCompleted' | 'pendingBgTasks' | 'queryIdle'
   >,
   closeRunner: () => void,
 ): boolean {
@@ -1171,7 +1171,12 @@ export function closeRunnerAfterRotatingProviderTurn(
     // A runner still holding background Tasks must stay alive: closing stdin
     // would kill the sub-agents and drop their completion summary. Rotation
     // is retried on the next healthy completion once they have settled.
-    (output.pendingBgTasks ?? 0) > 0
+    (output.pendingBgTasks ?? 0) > 0 ||
+    // The result completed turn A while a follow-up IPC turn B was already
+    // piped into the same SDK stream. Closing now strands B without its own
+    // result, so the host treats the close as in-flight and replays/duplicates
+    // A's reply. Rotate on B's completion instead.
+    output.queryIdle === false
   ) {
     return false;
   }

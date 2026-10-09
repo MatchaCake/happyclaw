@@ -604,6 +604,42 @@ describe('scheduled task workspace/session contract', () => {
     );
   });
 
+  test('treats a deliberate <internal>-only final as a silent isolated success', async () => {
+    const taskId = createTask({ id: 'task-internal-only-isolated-result' });
+    const groups = {
+      [GROUP_JID]: db.getRegisteredGroup(GROUP_JID)!,
+    };
+    runContainerAgentMock.mockImplementationOnce(
+      async (_group, input, onProcess) => {
+        onProcess?.({} as never, `container-${input.taskRunId}`, null);
+        return {
+          status: 'success',
+          result: '<internal>Stage 3 done：已启动，见 launch.json</internal>',
+          inputTurnCompleted: true,
+        };
+      },
+    );
+    const { deps, waitForRun } = makeDeps(groups);
+
+    const trigger = triggerTaskNow(taskId, deps);
+    await waitForRun();
+
+    expect(db.getTaskRunById(trigger.runId!)).toMatchObject({
+      status: 'success',
+      error: null,
+    });
+    expect(deps.storeResultAndNotify).toHaveBeenCalledWith(
+      GROUP_JID,
+      expect.stringContaining('以内部确认静默完成'),
+      expect.objectContaining({ sourceKind: 'scheduled_task_result' }),
+    );
+    expect(deps.storeResultAndNotify).not.toHaveBeenCalledWith(
+      GROUP_JID,
+      expect.stringContaining('Stage 3 done'),
+      expect.anything(),
+    );
+  });
+
   test('resume accepts only future one-shot schedules', () => {
     const future = new Date(Date.now() + 60_000).toISOString();
     const past = new Date(Date.now() - 60_000).toISOString();

@@ -199,6 +199,12 @@ export class StreamEventProcessor {
     }
   >();
 
+  // tool_use_ids issued inside a sub-agent (raw parent_tool_use_id != null).
+  // A background task started by one of these tools reports its completion
+  // to that sub-agent, never to the main Agent, so it must not create
+  // main-Agent completion debt.
+  private readonly subAgentToolUseIds = new Set<string>();
+
   // Sub-agent active tools per parent task ID
   private readonly activeSubAgentToolsByTask = new Map<string, Set<string>>();
 
@@ -501,6 +507,7 @@ export class StreamEventProcessor {
       const block = event.content_block;
 
       if (block?.type === 'tool_use') {
+        if (isNested && block.id) this.subAgentToolUseIds.add(block.id);
         this.handleToolUseStart(block, parentToolUseId, isNested, event.index);
       } else if (block?.type === 'text') {
         this.handleTextBlockStart(parentToolUseId, isNested);
@@ -1055,7 +1062,10 @@ export class StreamEventProcessor {
         message.task_id;
       const desc = message.description || message.prompt || '';
       if (message.task_id && !message.skip_transcript) {
-        this.backgroundDrain.taskStarted(message.task_id);
+        this.backgroundDrain.taskStarted(
+          message.task_id,
+          !this.isSubAgentOwnedTask(message),
+        );
         this.pendingSdkTasks.set(message.task_id, {
           description: desc,
           taskType:
@@ -1402,6 +1412,16 @@ export class StreamEventProcessor {
    */
   processSubAgentMessage(message: any): boolean {
     const msgParentToolUseId = message.parent_tool_use_id ?? null;
+    if (msgParentToolUseId && message.type === 'assistant') {
+      const content = message.message?.content;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block?.type === 'tool_use' && typeof block.id === 'string') {
+            this.subAgentToolUseIds.add(block.id);
+          }
+        }
+      }
+    }
     if (!msgParentToolUseId || !this.taskToolUseIds.has(msgParentToolUseId)) {
       if (
         msgParentToolUseId &&
@@ -1839,6 +1859,9 @@ export class StreamEventProcessor {
     output_file?: string;
     usage?: any;
   }): void {
+    if (this.isSubAgentOwnedTask(message)) {
+      this.backgroundDrain.markNonBlocking(message.task_id);
+    }
     this.backgroundDrain.taskNotification(message.task_id);
     this.settlePendingSdkTask(
       message.task_id,
@@ -1903,6 +1926,25 @@ export class StreamEventProcessor {
     }
     // Clean up the mapping entry
     this.sdkTaskIdToToolUseId.delete(message.task_id);
+  }
+
+  /**
+   * A task started from inside a sub-agent (its Bash/Agent tool call has a
+   * non-null parent_tool_use_id, or it is a depth>1 agent spawn) delivers its
+   * completion notification to that sub-agent. The main Agent will never run
+   * a notification turn for it; the parent Task's own notification is the
+   * main-Agent obligation.
+   */
+  private isSubAgentOwnedTask(message: {
+    tool_use_id?: string;
+    spawn_depth?: number;
+  }): boolean {
+    if (typeof message.spawn_depth === 'number' && message.spawn_depth > 1) {
+      return true;
+    }
+    return (
+      !!message.tool_use_id && this.subAgentToolUseIds.has(message.tool_use_id)
+    );
   }
 
   private settlePendingSdkTask(
