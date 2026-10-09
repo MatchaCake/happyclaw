@@ -102,7 +102,7 @@ import {
   buildAgentProfilePrompt,
   hasAgentProfilePrompts,
 } from './agent-profile-prompts.js';
-import { stripAgentInternalTags } from './utils.js';
+import { isInternalOnlyAgentOutput, stripAgentInternalTags } from './utils.js';
 import {
   markIsolatedTaskRunIpcComplete,
   tryCleanupCompletedIsolatedTaskRunIpc,
@@ -519,6 +519,8 @@ export function formatScheduledTaskWorkspaceResult(input: {
   result: string | null;
   error: string | null;
   status?: 'success' | 'failed' | 'cancelled';
+  /** The Agent finished with only <internal> blocks on purpose. */
+  internalOnly?: boolean;
 }): string {
   const status =
     input.status ?? (input.error ? ('failed' as const) : ('success' as const));
@@ -549,7 +551,9 @@ export function formatScheduledTaskWorkspaceResult(input: {
       ? '本次运行已由用户取消。'
       : input.error
         ? '本次运行没有留下可展示的业务结果，请查看执行日志。'
-        : '本次运行已结束，但 Agent 没有返回可展示的业务结果。';
+        : input.internalOnly
+          ? 'Agent 已按任务要求以内部确认静默完成，没有面向用户的输出。'
+          : '本次运行已结束，但 Agent 没有返回可展示的业务结果。';
   return `${title}\n\n${metadata.join('\n')}\n\n${emptyNotice}`;
 }
 
@@ -1137,9 +1141,13 @@ async function runTaskInner(
       const durableRun = options.durableRun;
       const runId = durableRun.id;
       const cleanedResult = result ? stripAgentInternalTags(result) : null;
+      // An all-<internal> final is a deliberate silent completion that task
+      // prompts ask for ("Stage N done" without notifying anyone), not a
+      // missing business result.
+      const internalOnly = isInternalOnlyAgentOutput(result);
       const durableOutcomeError =
         error ||
-        (cleanedResult?.trim()
+        (cleanedResult?.trim() || internalOnly
           ? null
           : '定时任务已结束，但 Agent 没有返回可展示的完整业务结果。');
       const workspaceResult = formatScheduledTaskWorkspaceResult({
@@ -1147,6 +1155,7 @@ async function runTaskInner(
         runId,
         result: cleanedResult,
         error: durableOutcomeError,
+        internalOnly,
       });
       preparedDurableWorkspaceCommit = () =>
         completeIsolatedTaskRunWithWorkspaceResultIntent({

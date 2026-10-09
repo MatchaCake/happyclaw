@@ -120,6 +120,31 @@ describe('automatic enabled-model pool', () => {
     expect(closeRunner).toHaveBeenCalledOnce();
   });
 
+  test('rotation waits for follow-up turns already piped into the runner', () => {
+    const closeRunner = vi.fn();
+    // Turn A completed, but turn B is still pending in the same SDK stream.
+    expect(
+      closeRunnerAfterRotatingProviderTurn(
+        true,
+        false,
+        { providerFailure: false, inputTurnCompleted: true, queryIdle: false },
+        closeRunner,
+      ),
+    ).toBe(false);
+    expect(closeRunner).not.toHaveBeenCalled();
+
+    // B's own healthy result leaves the query idle and schedules rotation.
+    expect(
+      closeRunnerAfterRotatingProviderTurn(
+        true,
+        false,
+        { providerFailure: false, inputTurnCompleted: true, queryIdle: true },
+        closeRunner,
+      ),
+    ).toBe(true);
+    expect(closeRunner).toHaveBeenCalledOnce();
+  });
+
   test.each(['round-robin', 'weighted-round-robin'] as const)(
     'transient replay stays on its first provider under %s',
     (strategy) => {

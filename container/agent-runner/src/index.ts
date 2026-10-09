@@ -16,7 +16,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID, type UUID } from 'node:crypto';
 import { fileURLToPath } from 'url';
 import { execFileSync } from 'child_process';
 import { createRequire } from 'module';
@@ -87,6 +87,7 @@ import {
 } from './runtime-mcp-policy.js';
 import {
   IpcTurnDeliveryTracker,
+  sdkResultConsumedUserMessageUuids,
   ipcReceiptInputIdentity,
   IpcTurnOutputCorrelation,
   isHealthyInputTurnCompletion,
@@ -169,6 +170,7 @@ import {
   BackgroundProtocolDebtWatchdog,
   DurableInputTurnCompletion,
   isMergedBackgroundCompletionPlaceholder,
+  isSdkBookkeepingFrame,
   QuiescentResultGate,
   shouldFailIncompleteQueryExit,
 } from './background-task-drain.js';
@@ -731,6 +733,7 @@ class MessageStream {
     text: string,
     images?: Array<{ data: string; mimeType?: string }>,
     decorateText?: (text: string) => string,
+    uuid?: UUID,
   ): string[] {
     // stream.done=true 后禁止写入已关闭的 SDK transport，否则触发 "ProcessTransport is not ready for writing"
     if (this.done) {
@@ -798,6 +801,9 @@ class MessageStream {
       message: { role: 'user', content },
       parent_tool_use_id: null,
       session_id: '',
+      // Client uuid: the CLI echoes it in result.user_message_uuids, which
+      // tells the delivery tracker which queued inputs a turn consumed.
+      ...(uuid ? { uuid } : {}),
     });
     this.waiting?.();
     return rejectedReasons;
@@ -1849,7 +1855,17 @@ async function runQueryAttempt(
       ? anchorUserTurn(withOwnerProfile)
       : withOwnerProfile;
   };
-  const initialRejected = stream.push(prompt, images, decorateInitialUserTurn);
+  const initialSdkUuid = randomUUID();
+  ipcDeliveryTracker.bindSdkMessageUuid(
+    ipcDeliveryTracker.currentTurnMessages,
+    initialSdkUuid,
+  );
+  const initialRejected = stream.push(
+    prompt,
+    images,
+    decorateInitialUserTurn,
+    initialSdkUuid,
+  );
   const decorateStreamEvent = (event: StreamEvent): StreamEvent => ({
     ...event,
     queryRunId: containerInput.queryRunId,
@@ -2332,19 +2348,26 @@ async function runQueryAttempt(
           msg.queryRunId || containerInput.queryRunId,
         );
       }
-      const rejected = stream.push(msg.text, msg.images, (message) => {
-        const withChannelContext = decorateChannelUserTurn(
-          message,
-          queuedChannelContext,
-        );
-        const withWorkspaceMemory = workspaceMemoryTurn.block
-          ? `${workspaceMemoryTurn.block}\n\n${withChannelContext}`
-          : withChannelContext;
-        const withOwnerProfile = ownerProfileTurn.block
-          ? `${ownerProfileTurn.block}\n\n${withWorkspaceMemory}`
-          : withWorkspaceMemory;
-        return anchorUserTurn(withOwnerProfile);
-      });
+      const sdkUuid = randomUUID();
+      ipcDeliveryTracker.bindSdkMessageUuid([msg], sdkUuid);
+      const rejected = stream.push(
+        msg.text,
+        msg.images,
+        (message) => {
+          const withChannelContext = decorateChannelUserTurn(
+            message,
+            queuedChannelContext,
+          );
+          const withWorkspaceMemory = workspaceMemoryTurn.block
+            ? `${workspaceMemoryTurn.block}\n\n${withChannelContext}`
+            : withChannelContext;
+          const withOwnerProfile = ownerProfileTurn.block
+            ? `${ownerProfileTurn.block}\n\n${withWorkspaceMemory}`
+            : withWorkspaceMemory;
+          return anchorUserTurn(withOwnerProfile);
+        },
+        sdkUuid,
+      );
       for (const reason of rejected) {
         emit({
           status: 'success',
@@ -2482,7 +2505,7 @@ async function runQueryAttempt(
       clearBackgroundProtocolDebtWatchdog();
     }
     const ipcReceipts = inputTurnCompleted
-      ? ipcDeliveryTracker.completeNextTurn()
+      ? ipcDeliveryTracker.completeAnsweredTurns()
       : undefined;
     const queryIdle = inputTurnCompleted && !ipcDeliveryTracker.hasPendingTurns;
     const activeIpcReceipts =
@@ -2911,7 +2934,9 @@ async function runQueryAttempt(
     }
     for await (const message of q) {
       firstResponseWatchdog.observe(message.type);
+      const bookkeepingFrame = isSdkBookkeepingFrame(message);
       const preservesObservedBackgroundResult =
+        bookkeepingFrame ||
         (message.type === 'system' &&
           (message.subtype === 'background_tasks_changed' ||
             message.subtype === 'task_notification' ||
@@ -2925,6 +2950,10 @@ async function runQueryAttempt(
         pendingBackgroundResult = undefined;
         processor.invalidateObservedBackgroundResult();
       }
+      // activityObserved() cancelled the quiet-period timer; a bookkeeping
+      // frame changes no drain state, so restart it or the Result waits for
+      // the idle close.
+      if (bookkeepingFrame) scheduleBackgroundResultCompletion();
       if (providerFailurePublished) {
         continue;
       }
@@ -3536,6 +3565,11 @@ async function runQueryAttempt(
           `Result #${resultCount}: subtype=${resultSubtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`,
         );
         const resultMsg = message as unknown as Record<string, unknown>;
+        if (resultSubtype === 'success') {
+          ipcDeliveryTracker.observeAnsweredSdkUuids(
+            sdkResultConsumedUserMessageUuids(resultMsg),
+          );
+        }
         const limitDecision = decideProviderLimitAction({
           result: textResult ?? null,
           canFallback: PROVIDER_FALLBACK_MODELS.canActivateFallback,

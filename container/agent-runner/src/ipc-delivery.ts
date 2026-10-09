@@ -206,13 +206,33 @@ export function latestIpcInputMessage(
   return latest ?? messages[messages.length - 1];
 }
 
-/** Associates each accepted IPC batch with exactly one subsequent healthy SDK
- * result. Errors, interrupts, pending-background results and truncation do not
- * call completeNextTurn, so their messages remain replayable. */
+/** Client uuids of every user message a finished SDK turn consumed. Older
+ * CLIs only echo `user_message_uuid`; turns without client uuids echo none. */
+export function sdkResultConsumedUserMessageUuids(
+  result: Record<string, unknown>,
+): string[] {
+  const uuids = Array.isArray(result.user_message_uuids)
+    ? result.user_message_uuids.filter(
+        (value): value is string => typeof value === 'string',
+      )
+    : [];
+  if (typeof result.user_message_uuid === 'string') {
+    uuids.push(result.user_message_uuid);
+  }
+  return uuids;
+}
+
+/** Associates each accepted IPC batch with a subsequent healthy SDK result:
+ * one result per batch, except that batches the SDK merged into an already
+ * finished turn complete together (see completeAnsweredTurns). Errors,
+ * interrupts, pending-background results and truncation do not complete a
+ * turn, so their messages remain replayable. */
 export class IpcTurnDeliveryTracker {
   readonly unacknowledgedMessages: IpcInputMessage[];
   private readonly turns: IpcInputMessage[][];
   private readonly seenInputIdentities = new Set<string>();
+  private readonly sdkUuidByMessage = new WeakMap<IpcInputMessage, string>();
+  private readonly answeredSdkUuids = new Set<string>();
 
   constructor(initialMessages: IpcInputMessage[] = []) {
     const accepted = this.filterUnseen(initialMessages);
@@ -308,6 +328,43 @@ export class IpcTurnDeliveryTracker {
     return completed
       .map((message) => message.receipt)
       .filter((receipt): receipt is IpcDeliveryReceipt => !!receipt);
+  }
+
+  /** Record the SDK client uuid stamped on the user message that carries
+   * these IPC inputs into the SDK stream. */
+  bindSdkMessageUuid(
+    messages: readonly IpcInputMessage[],
+    sdkUuid: string,
+  ): void {
+    for (const message of messages) {
+      this.sdkUuidByMessage.set(message, sdkUuid);
+    }
+  }
+
+  /** Record `user_message_uuids` from a finished SDK turn. The CLI merges
+   * user messages queued while it is busy into one turn, so one result can
+   * answer several accepted IPC turns. */
+  observeAnsweredSdkUuids(sdkUuids: Iterable<string>): void {
+    for (const sdkUuid of sdkUuids) this.answeredSdkUuids.add(sdkUuid);
+  }
+
+  /** Complete the current turn plus every directly following turn whose user
+   * message a finished SDK turn already consumed. Those turns will never get
+   * a result of their own; counting them one result per turn would keep the
+   * stream open until the idle timeout and report them as interrupted. */
+  completeAnsweredTurns(): IpcDeliveryReceipt[] {
+    const receipts = this.completeNextTurn();
+    while (this.turns.length > 0 && this.isAnswered(this.turns[0]!)) {
+      receipts.push(...this.completeNextTurn());
+    }
+    return receipts;
+  }
+
+  private isAnswered(turn: readonly IpcInputMessage[]): boolean {
+    return turn.some((message) => {
+      const sdkUuid = this.sdkUuidByMessage.get(message);
+      return sdkUuid !== undefined && this.answeredSdkUuids.has(sdkUuid);
+    });
   }
 }
 

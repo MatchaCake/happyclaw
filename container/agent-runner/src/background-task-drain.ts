@@ -27,6 +27,27 @@ export function isMergedBackgroundCompletionPlaceholder(
 }
 
 /**
+ * SDK frames that may trail a Result without being Agent activity:
+ * - `command_lifecycle`: the CLI reports the queue lifecycle of every
+ *   uuid-stamped user message, and its `completed` frame follows the Result.
+ * - `system` hook frames: Stop hooks settle before the Result, so a hook frame
+ *   after it is a late async hook (e.g. an async SessionStart hook).
+ * They must neither invalidate a drain-ready Result candidate nor leave it
+ * unscheduled, or the Result waits for the idle close.
+ */
+export function isSdkBookkeepingFrame(message: unknown): boolean {
+  if (!message || typeof message !== 'object') return false;
+  const frame = message as { type?: unknown; subtype?: unknown };
+  if (frame.type === 'command_lifecycle') return true;
+  return (
+    frame.type === 'system' &&
+    (frame.subtype === 'hook_started' ||
+      frame.subtype === 'hook_progress' ||
+      frame.subtype === 'hook_response')
+  );
+}
+
+/**
  * Tracks the protocol gap between "a background task is no longer live" and
  * "the main Agent has consumed that completion notification and finished its
  * follow-up turn".
