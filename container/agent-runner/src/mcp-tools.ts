@@ -14,7 +14,7 @@ import { z } from 'zod';
 import fs from 'fs';
 import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
-import { formatIsoLocal } from './utils.js';
+import { formatIsoLocal, formatLocalScheduleTimestamp } from './utils.js';
 import {
   normalizeChannelTurnContext,
   type ChannelTurnContext,
@@ -1419,6 +1419,138 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
               {
                 type: 'text' as const,
                 text: 'Timeout waiting for schedule_task confirmation. 任务可能已创建也可能未创建——请先用 list_tasks 核实，不要直接重试以免重复创建。',
+              },
+            ],
+            isError: true,
+          };
+        }
+      },
+    ),
+
+    // --- run_background_task ---
+    tool(
+      'run_background_task',
+      `Hand off a long-running piece of work to a DURABLE background task and return immediately.
+
+Use this instead of spawning an in-conversation sub-agent whenever the work is
+slow and must survive interruptions: research, data collection, multi-step
+builds/migrations, batch processing, long test runs, deployments, etc.
+
+WHY THIS AND NOT A SUB-AGENT: a sub-agent spawned inside the current turn shares
+this runner's model session. If the upstream provider rotates or the process
+restarts mid-run, that session is reset and the sub-agent's work is lost with no
+recovery. A background task is registered as a one-shot (\`once\`) ISOLATED
+scheduled run, so it inherits the scheduler's durable machinery: a fenced
+execution lease, automatic re-run of missed one-shot work after a restart, and
+bounded exponential backoff on failure. The task runs in a fresh, independent
+session inside THIS workspace (same files, mounts, skills, and Agent profile)
+and is cleaned up after it finishes.
+
+BEHAVIOR: the task is queued to start right away (subject to workspace capacity)
+and this tool returns a task id without waiting for completion. The task's own
+output is delivered separately when it finishes — do NOT block this turn waiting
+for it. Track progress with list_tasks / list_task_runs, or cancel with
+cancel_task using the returned id.
+
+Write \`prompt\` as a direct, self-contained imperative describing the whole job;
+the background session does not see this conversation's history.`,
+      {
+        prompt: z
+          .string()
+          .min(1)
+          .describe(
+            'The complete, self-contained instruction the background task should execute. The task runs in a fresh isolated session with no access to this conversation, so include every detail it needs.',
+          ),
+        execution_mode: z
+          .enum(['host', 'container'])
+          .optional()
+          .describe(
+            'Execution mode: host runs directly on the server (admin only), container runs in Docker isolation. Defaults to the workspace execution mode.',
+          ),
+        target_group_jid: z
+          .string()
+          .optional()
+          .describe(
+            '(Admin home only) JID of the workspace to run the task in. Defaults to the current workspace.',
+          ),
+      },
+      async (args) => {
+        if (!args.prompt?.trim()) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: 'run_background_task requires a non-empty prompt describing the work to perform.',
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        // Model the background task as a due-now `once` + `isolated` agent run so
+        // it rides the scheduler's durable lease / restart backfill / backoff
+        // path instead of the fragile in-runner sub-agent session.
+        const scheduleValue = formatLocalScheduleTimestamp();
+        const targetJid =
+          hasCrossGroupAccess && args.target_group_jid
+            ? args.target_group_jid
+            : ctx.chatJid;
+        const requestId = newRequestId();
+        const data: Record<string, unknown> & { requestId: string } = {
+          type: 'schedule_task',
+          requestId,
+          prompt: args.prompt,
+          schedule_type: 'once',
+          schedule_value: scheduleValue,
+          context_mode: 'isolated',
+          execution_type: 'agent',
+          targetJid,
+          createdBy: ctx.groupFolder,
+          timestamp: new Date().toISOString(),
+        };
+        if (args.execution_mode) {
+          data.execution_mode = args.execution_mode;
+        }
+        try {
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            data,
+            'schedule_task_result',
+          );
+          if (!result.success) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Failed to start background task: ${result.error || 'Unknown error'}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          const taskId = (result.taskId as string) ?? '?';
+          const dup = result.duplicate
+            ? ' （已存在完全相同的活动任务，复用了它，未重复创建）'
+            : '';
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Background task started id=${taskId}. It runs durably in an isolated session and will deliver its own result when done. Track with list_task_runs or cancel with cancel_task id=${taskId}.${dup}`,
+              },
+            ],
+            structuredContent: {
+              success: true,
+              task_id: taskId,
+              duplicate: Boolean(result.duplicate),
+            },
+          };
+        } catch {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: 'Timeout waiting for background task confirmation. 任务可能已创建也可能未创建——请先用 list_tasks 核实，不要直接重试以免重复创建。',
               },
             ],
             isError: true,

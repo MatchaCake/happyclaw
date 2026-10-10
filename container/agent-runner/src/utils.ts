@@ -421,6 +421,20 @@ export function formatLocalNow(d: Date = new Date()): string {
 }
 
 /**
+ * 当前时刻的本地 wall-clock 串（不带 Z/offset），形如 2026-06-12T10:50:00。
+ *
+ * 专供 `schedule_task` 的 `once` schedule_value 使用：主服务侧用 `new Date(value)`
+ * 按进程本地时区解释该串，容器 entrypoint 已把 TZ 注入成与主服务一致，故此串
+ * 回到主服务重新解析得到同一时刻。用于把「立即执行的一次性后台任务」登记成
+ * 一个 due-now 的 once 任务，从而继承 scheduler 的租约 / 重启补跑 / 退避。
+ */
+export function formatLocalScheduleTimestamp(d: Date = new Date()): string {
+  const tz = currentTimeZone();
+  const { date, time } = localDateTimeParts(d, tz);
+  return `${date}T${time}`;
+}
+
+/**
  * 把一个 UTC ISO 串（如存储层的 next_run）转成本地时区的可读串，供回执/列表展示。
  * 形如：2026-06-12 10:50:00 (+08:00)。空/非法输入分别返回 'N/A' / 原样。
  */
