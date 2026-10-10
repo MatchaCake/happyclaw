@@ -18,6 +18,7 @@ export type TaskExecutionDefinition = Pick<
   | 'script_command'
   | 'created_by'
   | 'notify_channels'
+  | 'origin'
 >;
 
 function canonicalNotifyChannels(channels: string[] | null | undefined) {
@@ -28,7 +29,11 @@ export function buildTaskExecutionFingerprint(
   task: TaskExecutionDefinition,
 ): string {
   return JSON.stringify({
-    version: 1,
+    version: 2,
+    // Origin is part of task identity: a durable background run registered by
+    // the agent must never silently reuse (and later cancel) an identical
+    // user-authored schedule, and vice versa.
+    origin: task.origin ?? 'user',
     groupFolder: task.group_folder,
     chatJid: task.chat_jid,
     prompt: task.prompt,

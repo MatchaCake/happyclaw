@@ -7,6 +7,7 @@ import type { Variables } from '../web-context.js';
 import { authMiddleware } from '../middleware/auth.js';
 import {
   MAX_TASK_PROMPT_LENGTH,
+  TaskBatchDeleteSchema,
   TaskCreateSchema,
   TaskPatchSchema,
   TaskPurgeSchema,
@@ -20,6 +21,7 @@ import {
   getTaskRunLogs,
   updateTaskWithRevision,
   softDeleteTaskWithRevision,
+  softDeleteTasksWithRevisions,
   restoreTaskWithRevision,
   permanentlyDeleteTasksWithRevisions,
   getTaskRunById,
@@ -384,6 +386,85 @@ tasksRoutes.post('/purge', authMiddleware, async (c) => {
     );
   }
 
+  return c.json({
+    success: true,
+    deleted_count: mutation.task_ids.length,
+    task_ids: mutation.task_ids,
+  });
+});
+
+// Batch soft-delete: move several live tasks to the trash in one atomic call.
+// Built so /tasks can clean up finished agent-background registrations
+// (origin='agent_background') in bulk instead of one DELETE per card, but it
+// accepts any set of deletable tasks. Same per-task gates as DELETE /:id.
+tasksRoutes.post('/batch-delete', authMiddleware, async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const validation = TaskBatchDeleteSchema.safeParse(body);
+  if (!validation.success) {
+    return c.json(
+      { error: 'Invalid request body', details: validation.error.format() },
+      400,
+    );
+  }
+
+  const authUser = c.get('user') as AuthUser;
+  const uniqueTasks = Array.from(
+    new Map(validation.data.tasks.map((task) => [task.id, task])).values(),
+  );
+  const runningTaskIds = getRunningTaskIds();
+  for (const requested of uniqueTasks) {
+    const task = getTaskById(requested.id);
+    if (!task || !canViewTask(task, authUser)) {
+      return c.json({ error: 'Task not found' }, 404);
+    }
+    if (task.deleted_at) {
+      return c.json(
+        {
+          error: '任务已在回收站中，请刷新后重试。',
+          code: 'TASK_ALREADY_DELETED',
+          current_task: task,
+        },
+        409,
+      );
+    }
+    if (task.execution_type === 'script' && authUser.role !== 'admin') {
+      return c.json({ error: '只有管理员可以删除脚本类型任务' }, 403);
+    }
+    if (runningTaskIds.includes(task.id)) {
+      return c.json(
+        {
+          error: '任务正在排队或运行中，请先停止当前运行再删除。',
+          code: 'TASK_HAS_ACTIVE_RUN',
+          current_run: getActiveTaskRunForTask(task.id) ?? null,
+        },
+        409,
+      );
+    }
+  }
+
+  const mutation = softDeleteTasksWithRevisions(
+    uniqueTasks.map((task) => ({
+      id: task.id,
+      expectedRevision: task.expected_revision,
+    })),
+  );
+  if (mutation.status === 'not_found') {
+    return c.json({ error: 'Task not found' }, 404);
+  }
+  if (mutation.status === 'conflict') {
+    return revisionConflict(c, mutation.task);
+  }
+  if (mutation.status === 'active_run') {
+    return c.json(
+      {
+        error: '任务正在排队或运行中，请先停止当前运行再删除。',
+        code: 'TASK_HAS_ACTIVE_RUN',
+        current_run: mutation.run,
+      },
+      409,
+    );
+  }
+  notifyTaskSchedulerChanged();
   return c.json({
     success: true,
     deleted_count: mutation.task_ids.length,

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { Clock, Plus, RefreshCw, Search, Trash2, X } from 'lucide-react';
 import { TaskCard } from '../components/tasks/TaskCard';
 import { CreateTaskForm } from '../components/tasks/CreateTaskForm';
@@ -16,7 +16,7 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 
 type TaskView = 'current' | 'trash';
 type PendingTaskAction =
-  | { kind: 'trash'; ids: [string] }
+  | { kind: 'trash'; ids: string[] }
   | { kind: 'purge'; ids: string[] };
 
 function taskTitle(task: ScheduledTask): string {
@@ -37,6 +37,7 @@ export function TasksPage() {
     createTask,
     updateTaskStatus,
     deleteTask,
+    batchDeleteTasks,
     restoreTask,
     purgeTasks,
     runTaskNow,
@@ -193,10 +194,16 @@ export function TasksPage() {
     });
     try {
       if (pendingAction.kind === 'trash') {
-        await deleteTask(pendingAction.ids[0]);
+        if (pendingAction.ids.length === 1) {
+          await deleteTask(pendingAction.ids[0]);
+        } else {
+          await batchDeleteTasks(pendingAction.ids);
+        }
         useGroupsStore.getState().loadGroups();
         showToast(
-          '任务已移到回收站',
+          pendingAction.ids.length === 1
+            ? '任务已移到回收站'
+            : `已将 ${pendingAction.ids.length} 个任务移到回收站`,
           '任务不会再触发，运行历史仍可查看和恢复。',
         );
       } else {
@@ -247,23 +254,66 @@ export function TasksPage() {
   };
   const filteredLiveTasks = liveTasks.filter(matchesQuery);
   const filteredDeletedTasks = deletedTasks.filter(matchesQuery);
-  const currentSections = [
+  // Agent-registered background runs (run_background_task) are aggregated in
+  // their own section so they don't drown out hand-made schedules.
+  const isBackgroundTask = (task: ScheduledTask) =>
+    task.origin === 'agent_background';
+  const filteredScheduleTasks = filteredLiveTasks.filter(
+    (task) => !isBackgroundTask(task),
+  );
+  // Finished background registrations are safe to clear in bulk: they will
+  // never fire again, and trashing keeps their run history restorable.
+  const cleanableBackgroundTasks = filteredLiveTasks.filter(
+    (task) =>
+      isBackgroundTask(task) &&
+      task.status === 'completed' &&
+      task.permissions?.can_delete !== false &&
+      !runningTaskIds.has(task.id) &&
+      !task.current_run,
+  );
+  const currentSections: Array<{
+    key: string;
+    title: string;
+    tasks: ScheduledTask[];
+    action?: ReactNode;
+  }> = [
     {
       key: 'active',
       title: '已启用',
-      tasks: filteredLiveTasks.filter((task) => task.status === 'active'),
+      tasks: filteredScheduleTasks.filter((task) => task.status === 'active'),
     },
     {
       key: 'paused',
       title: '已暂停',
-      tasks: filteredLiveTasks.filter((task) => task.status === 'paused'),
+      tasks: filteredScheduleTasks.filter((task) => task.status === 'paused'),
     },
     {
       key: 'other',
       title: '其他',
-      tasks: filteredLiveTasks.filter(
+      tasks: filteredScheduleTasks.filter(
         (task) => task.status !== 'active' && task.status !== 'paused',
       ),
+    },
+    {
+      key: 'background',
+      title: 'Agent 后台任务',
+      tasks: filteredLiveTasks.filter(isBackgroundTask),
+      action:
+        cleanableBackgroundTasks.length > 0 ? (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() =>
+              setPendingAction({
+                kind: 'trash',
+                ids: cleanableBackgroundTasks.map((task) => task.id),
+              })
+            }
+          >
+            <Trash2 />
+            清理已结束（{cleanableBackgroundTasks.length}）
+          </Button>
+        ) : undefined,
     },
   ];
 
@@ -325,15 +375,18 @@ export function TasksPage() {
                 key={section.key}
                 aria-labelledby={`${section.key}-tasks`}
               >
-                <h2
-                  id={`${section.key}-tasks`}
-                  className="mb-3 text-sm font-semibold text-foreground"
-                >
-                  {section.title}
-                  <span className="ml-1.5 font-normal text-muted-foreground">
-                    {section.tasks.length}
-                  </span>
-                </h2>
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                  <h2
+                    id={`${section.key}-tasks`}
+                    className="text-sm font-semibold text-foreground"
+                  >
+                    {section.title}
+                    <span className="ml-1.5 font-normal text-muted-foreground">
+                      {section.tasks.length}
+                    </span>
+                  </h2>
+                  {section.action}
+                </div>
                 <div className="space-y-3">
                   {section.tasks.map((task) => (
                     <TaskCard
@@ -526,7 +579,9 @@ export function TasksPage() {
             ? pendingCount === 1
               ? `永久删除“${pendingTask ? taskTitle(pendingTask) : '这个任务'}”？`
               : `清空回收站中的 ${pendingCount} 个任务？`
-            : `将“${pendingTask ? taskTitle(pendingTask) : '这个任务'}”移到回收站？`
+            : pendingCount === 1
+              ? `将“${pendingTask ? taskTitle(pendingTask) : '这个任务'}”移到回收站？`
+              : `将 ${pendingCount} 个已结束的后台任务移到回收站？`
         }
         message={
           pendingIsPurge
@@ -538,7 +593,9 @@ export function TasksPage() {
             ? pendingCount === 1
               ? '永久删除任务'
               : `永久删除 ${pendingCount} 个任务`
-            : '移到回收站'
+            : pendingCount === 1
+              ? '移到回收站'
+              : `移入回收站 ${pendingCount} 个任务`
         }
         confirmVariant="danger"
         loading={actionLoading}

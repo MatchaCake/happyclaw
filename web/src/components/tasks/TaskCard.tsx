@@ -158,6 +158,11 @@ export function TaskCard({
 
             {/* Badges */}
             <div className="flex flex-wrap items-center gap-1.5 mb-2">
+              {task.origin === 'agent_background' && (
+                <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-indigo-100 dark:bg-indigo-900/40 text-indigo-800 dark:text-indigo-300">
+                  Agent 后台
+                </span>
+              )}
               {task.execution_type === 'script' && (
                 <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 dark:bg-blue-900/40 text-blue-800 dark:text-blue-300">
                   脚本

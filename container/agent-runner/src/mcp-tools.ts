@@ -1504,6 +1504,9 @@ the background session does not see this conversation's history.`,
           schedule_value: scheduleValue,
           context_mode: 'isolated',
           execution_type: 'agent',
+          // Stored provenance: lets /tasks and list_tasks separate these
+          // ephemeral background runs from user-authored schedules.
+          origin: 'agent_background',
           targetJid,
           createdBy: ctx.groupFolder,
           timestamp: new Date().toISOString(),
@@ -1562,13 +1565,19 @@ the background session does not see this conversation's history.`,
     // --- list_tasks ---
     tool(
       'list_tasks',
-      "List all scheduled tasks. From admin home: shows all tasks. From other groups: shows only that group's tasks.",
+      "List all scheduled tasks. From admin home: shows all tasks. From other groups: shows only that group's tasks. Tasks registered via run_background_task are marked [background]; filter with `origin`.",
       {
         include_deleted: z
           .boolean()
           .default(false)
           .describe(
             'Include soft-deleted tasks so they can be inspected/restored',
+          ),
+        origin: z
+          .enum(['user', 'agent_background'])
+          .optional()
+          .describe(
+            "Only return tasks with this provenance: 'user' for hand-made schedules, 'agent_background' for run_background_task registrations. Omit for all.",
           ),
       },
       async (args) => {
@@ -1582,6 +1591,7 @@ the background session does not see this conversation's history.`,
               groupFolder: ctx.groupFolder,
               isAdminHome: hasCrossGroupAccess,
               includeDeleted: args.include_deleted,
+              ...(args.origin ? { origin: args.origin } : {}),
               timestamp: new Date().toISOString(),
             },
             'list_tasks_result',
@@ -1605,6 +1615,7 @@ the background session does not see this conversation's history.`,
             status: string;
             next_run: string | null;
             revision: number;
+            origin?: string;
             current_run?: { id: string; status: string } | null;
             deleted_at?: string | null;
           }>;
@@ -1618,7 +1629,7 @@ the background session does not see this conversation's history.`,
           const formatted = tasks
             .map(
               (t) =>
-                `- [${t.id}] rev=${t.revision}${t.deleted_at ? ' [deleted]' : ''} ${t.prompt.slice(0, 50)}... (${t.schedule_type}: ${t.schedule_value}) - ${t.current_run?.status || t.status}, next: ${t.next_run ? formatIsoLocal(t.next_run) : '-'}`,
+                `- [${t.id}] rev=${t.revision}${t.deleted_at ? ' [deleted]' : ''}${t.origin === 'agent_background' ? ' [background]' : ''} ${t.prompt.slice(0, 50)}... (${t.schedule_type}: ${t.schedule_value}) - ${t.current_run?.status || t.status}, next: ${t.next_run ? formatIsoLocal(t.next_run) : '-'}`,
             )
             .join('\n');
           return {

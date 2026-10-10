@@ -143,6 +143,26 @@ async function purgeTasks(
   };
 }
 
+async function batchDeleteTasks(
+  tasks: Array<{ id: string; expected_revision?: number }>,
+) {
+  const response = await tasksRoutes.request('/batch-delete', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      tasks: tasks.map((task) => ({
+        id: task.id,
+        expected_revision:
+          task.expected_revision ?? db.getTaskById(task.id)?.revision,
+      })),
+    }),
+  });
+  return {
+    status: response.status,
+    body: await response.json().catch(() => ({})),
+  };
+}
+
 async function patchTask(
   id: string,
   body: Record<string, unknown>,
@@ -192,6 +212,11 @@ beforeEach(() => {
     'purge-live-route-task',
     'purge-stale-route-task-a',
     'purge-stale-route-task-b',
+    'batch-delete-bg-task-a',
+    'batch-delete-bg-task-b',
+    'batch-delete-stale-task-a',
+    'batch-delete-stale-task-b',
+    'batch-delete-foreign-task',
     'route-move-task',
     'delivered-group-list-task',
   ]) {
@@ -759,6 +784,74 @@ describe('tasks route ownership and cleanup contract', () => {
     });
     expect(db.getTaskById('purge-stale-route-task-a')?.deleted_at).toBeTruthy();
     expect(db.getTaskById('purge-stale-route-task-b')?.deleted_at).toBeTruthy();
+  });
+
+  test('batch-delete moves finished background registrations to the trash atomically', async () => {
+    for (const id of ['batch-delete-bg-task-a', 'batch-delete-bg-task-b']) {
+      createTask(id, OWNER_ID, {
+        schedule_type: 'once',
+        schedule_value: '2026-01-01T09:00:00',
+        next_run: null,
+        status: 'completed',
+        origin: 'agent_background',
+      } as Partial<Parameters<typeof db.createTask>[0]>);
+    }
+    asUser(OWNER_ID);
+
+    const response = await batchDeleteTasks([
+      { id: 'batch-delete-bg-task-a' },
+      { id: 'batch-delete-bg-task-b' },
+    ]);
+    expect(response).toMatchObject({
+      status: 200,
+      body: {
+        success: true,
+        deleted_count: 2,
+        task_ids: ['batch-delete-bg-task-a', 'batch-delete-bg-task-b'],
+      },
+    });
+    for (const id of ['batch-delete-bg-task-a', 'batch-delete-bg-task-b']) {
+      const stored = db.getTaskById(id);
+      expect(stored?.deleted_at).toBeTruthy();
+      // Trashing keeps provenance so the recycle bin can still bucket it.
+      expect(stored?.origin).toBe('agent_background');
+    }
+
+    // Already-trashed tasks need purge, not another batch delete.
+    const repeat = await batchDeleteTasks([{ id: 'batch-delete-bg-task-a' }]);
+    expect(repeat).toMatchObject({
+      status: 409,
+      body: { code: 'TASK_ALREADY_DELETED' },
+    });
+  });
+
+  test('batch-delete is atomic on revision conflict and hides foreign tasks', async () => {
+    createTask('batch-delete-stale-task-a', OWNER_ID);
+    createTask('batch-delete-stale-task-b', OWNER_ID);
+    asUser(OWNER_ID);
+
+    const staleRevision =
+      db.getTaskById('batch-delete-stale-task-b')!.revision + 1;
+    const staleResponse = await batchDeleteTasks([
+      { id: 'batch-delete-stale-task-a' },
+      { id: 'batch-delete-stale-task-b', expected_revision: staleRevision },
+    ]);
+    expect(staleResponse).toMatchObject({
+      status: 409,
+      body: { code: 'TASK_REVISION_CONFLICT' },
+    });
+    // Atomic: the valid half of the batch must not be trashed either.
+    expect(db.getTaskById('batch-delete-stale-task-a')?.deleted_at).toBeNull();
+    expect(db.getTaskById('batch-delete-stale-task-b')?.deleted_at).toBeNull();
+
+    // Another member must not learn the task exists (404, not 403).
+    createTask('batch-delete-foreign-task', OWNER_ID);
+    asUser('mallory');
+    const foreignResponse = await batchDeleteTasks([
+      { id: 'batch-delete-foreign-task' },
+    ]);
+    expect(foreignResponse.status).toBe(404);
+    expect(db.getTaskById('batch-delete-foreign-task')?.deleted_at).toBeNull();
   });
 
   test('restoring a soft-deleted task is independent of other owned tasks', async () => {

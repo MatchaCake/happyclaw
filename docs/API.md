@@ -348,6 +348,8 @@ Legacy 渠道 facade 位于 `/api/config/user-im/*`，涵盖飞书、Telegram、
 ## 定时任务
 
 - `GET|POST /api/tasks`
+- `POST /api/tasks/purge`，批量永久删除回收站任务
+- `POST /api/tasks/batch-delete`，批量移入回收站（revision 防并发，整批原子）
 - `PATCH|DELETE /api/tasks/:id`
 - `POST /api/tasks/:id/restore`
 - `POST /api/tasks/:id/runs`
@@ -368,6 +370,12 @@ Legacy 渠道 facade 位于 `/api/config/user-im/*`，涵盖飞书、Telegram、
 
 PATCH 修改 `chat_jid` 时会同时更新任务的具体 `delivery_route_jid`。已经物化的 Run
 在 `definition_snapshot` 中冻结原投递路由，不会因后续任务编辑而切换目标。
+
+任务定义带不可编辑的 `origin` 来源字段：`user` 表示人工创建（Web、REST、
+`schedule_task` MCP），`agent_background` 表示 Agent 通过 `run_background_task`
+登记的一次性后台运行。`/tasks` 页面将后者聚合为独立分区并支持批量清理；
+`list_tasks` MCP 工具以 `[background]` 标注并支持按 `origin` 过滤。来源参与任务
+执行指纹，不同来源的相同定义不会互相去重复用。
 
 ## Skills、MCP 和 Plugins
 

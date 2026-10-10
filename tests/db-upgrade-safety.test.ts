@@ -151,7 +151,7 @@ describe('database upgrade safety gate', () => {
     process.env.HAPPYCLAW_MIGRATION_BACKUP_DIR = migrationBackups;
     const backupsBeforeCurrentOnlyRefusal = fs.readdirSync(migrationBackups);
     expect(() => db.initDatabase({ requireCurrentSchema: true })).toThrow(
-      'Database must already be schema v75',
+      'Database must already be schema v76',
     );
     expect(fs.readdirSync(migrationBackups)).toEqual(
       backupsBeforeCurrentOnlyRefusal,
@@ -190,9 +190,10 @@ describe('schema version head', () => {
     // one assertion that fails when the head moves, forcing whoever bumps it
     // to confirm the matching migration block — and a test covering it —
     // actually landed. Update the literal in the same commit as the migration.
-    // v75: adds mount-specific interaction overrides and records the SDK
-    // session's interaction contract without changing workspace defaults.
-    // Migration and restart coverage: channel-mount-interaction-mode.test.ts.
-    expect(db.CURRENT_SCHEMA_VERSION).toBe(75);
+    // v76: records scheduled-task provenance (origin: user | agent_background)
+    // so /tasks and list_tasks can separate run_background_task registrations
+    // from user-authored schedules.
+    // Migration coverage: schema-v76-task-origin.test.ts.
+    expect(db.CURRENT_SCHEMA_VERSION).toBe(76);
   });
 });

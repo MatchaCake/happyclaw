@@ -29,6 +29,12 @@ export interface ScheduledTask {
   revision?: number;
   updated_at?: string;
   deleted_at?: string | null;
+  /**
+   * Task provenance: 'user' for hand-made schedules (Web/REST/schedule_task),
+   * 'agent_background' for ephemeral once runs registered by the agent's
+   * run_background_task tool. Older servers omit the field — treat as 'user'.
+   */
+  origin?: 'user' | 'agent_background';
   current_run?: TaskRun | null;
   last_run_summary?: TaskRun | null;
   permissions?: TaskPermissions;
@@ -126,6 +132,8 @@ interface TasksState {
   updateTaskStatus: (id: string, status: 'active' | 'paused') => Promise<void>;
   updateTask: (id: string, fields: Record<string, unknown>) => Promise<void>;
   deleteTask: (id: string, revision?: number) => Promise<void>;
+  /** Atomic batch move-to-trash; built for bulk cleanup of finished Agent 后台任务. */
+  batchDeleteTasks: (ids: string[]) => Promise<number>;
   restoreTask: (id: string, revision?: number) => Promise<void>;
   purgeTasks: (ids: string[]) => Promise<number>;
   loadLogs: (taskId: string) => Promise<void>;
@@ -260,6 +268,31 @@ export const useTasksStore = create<TasksState>((set, get) => ({
       await api.delete(`/api/tasks/${id}${query}`);
       set({ error: null });
       await get().loadTasks();
+    } catch (err) {
+      set({ error: extractErrorMessage(err) });
+      throw err;
+    }
+  },
+
+  batchDeleteTasks: async (ids: string[]) => {
+    const uniqueIds = Array.from(new Set(ids));
+    if (uniqueIds.length === 0) return 0;
+    try {
+      const tasksById = new Map(get().tasks.map((task) => [task.id, task]));
+      const requestedTasks = uniqueIds.map((id) => {
+        const task = tasksById.get(id);
+        if (!task || task.deleted_at || !task.revision) {
+          throw new Error('任务状态已经变化，请刷新后重试。');
+        }
+        return { id, expected_revision: task.revision };
+      });
+      const data = await api.post<{ deleted_count: number }>(
+        '/api/tasks/batch-delete',
+        { tasks: requestedTasks },
+      );
+      set({ error: null });
+      await get().loadTasks();
+      return data.deleted_count;
     } catch (err) {
       set({ error: extractErrorMessage(err) });
       throw err;

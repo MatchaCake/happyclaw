@@ -299,6 +299,8 @@ Agent MCP 调用没有 Cookie，但必须携带由主进程创建的运行上下
   Container 隔离。
 - `group` 模式注入主 Session；`isolated` 使用独立 Session、IPC 和运行记录。
 - 立即运行使用 idempotency key；取消只影响对应 Run。
+- 批量操作（`/api/tasks/purge`、`/api/tasks/batch-delete`）逐任务套用与单任务
+  删除相同的可见性、Script-admin 与运行中校验，整批原子，任一失败全部回滚。
 
 定时任务的 IPC/MCP 面授权与 Web 面同源，均为 `canAccessGroup`，**admin 不提供
 全局旁路**：

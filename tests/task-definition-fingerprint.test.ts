@@ -84,6 +84,28 @@ describe('scheduled-task execution fingerprint', () => {
       findDuplicateActiveAgentTask([existing], definition()),
     ).toBeUndefined();
   });
+
+  test('does not deduplicate across origins', () => {
+    // An agent-registered background run must never silently reuse (and later
+    // cancel) an identical user-authored schedule, and vice versa.
+    const existing = task();
+
+    expect(
+      findDuplicateActiveAgentTask(
+        [existing],
+        definition({ origin: 'agent_background' }),
+      ),
+    ).toBeUndefined();
+  });
+
+  test('treats a missing origin as user for backward compatibility', () => {
+    const existing = task();
+    delete (existing as { origin?: string }).origin;
+
+    expect(
+      findDuplicateActiveAgentTask([existing], definition({ origin: 'user' })),
+    ).toBe(existing);
+  });
 });
 
 describe('target-bound task execution mode', () => {

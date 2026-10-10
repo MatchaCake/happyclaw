@@ -219,6 +219,9 @@ describe('scheduled-task MCP V2 contract', () => {
       schedule_type: 'once',
       context_mode: 'isolated',
       execution_type: 'agent',
+      // Stored provenance so /tasks and list_tasks can separate these from
+      // user-authored schedules.
+      origin: 'agent_background',
       prompt: 'crawl the docs site and summarize every page',
     });
     // schedule_value is a local wall-clock string (no Z/offset) so the host

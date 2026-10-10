@@ -583,7 +583,17 @@ export interface ScheduledTask {
   updated_at: string;
   /** Soft deletion keeps task history queryable while removing future fires. */
   deleted_at: string | null;
+  /**
+   * Where this task definition came from. `user` covers everything a person
+   * authored (Web UI, REST, the schedule_task MCP tool acting on the user's
+   * behalf); `agent_background` marks the ephemeral due-now once runs that
+   * `run_background_task` registers, so /tasks and list_tasks can separate
+   * them from hand-made schedules. Immutable provenance — not editable.
+   */
+  origin?: TaskOrigin;
 }
+
+export type TaskOrigin = 'user' | 'agent_background';
 
 export type TaskRunTrigger = 'scheduled' | 'manual' | 'backfill';
 

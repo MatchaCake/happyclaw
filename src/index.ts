@@ -12900,6 +12900,8 @@ async function processTaskIpc(
     execution_type?: string;
     execution_mode?: string;
     script_command?: string;
+    /** Task provenance for schedule_task: 'user' | 'agent_background'. */
+    origin?: string;
     groupFolder?: string;
     chatJid?: string;
     targetJid?: string;
@@ -13726,6 +13728,22 @@ async function processTaskIpc(
             ? data.context_mode
             : 'isolated';
 
+        // Provenance is a closed set: an unknown value must fail loudly rather
+        // than be silently stored (or coerced) and later mis-bucketed in
+        // /tasks and list_tasks aggregation.
+        if (
+          data.origin !== undefined &&
+          data.origin !== 'user' &&
+          data.origin !== 'agent_background'
+        ) {
+          failSchedule(
+            `Invalid origin: ${String(data.origin)}. Expected 'user' or 'agent_background'.`,
+          );
+          break;
+        }
+        const taskOrigin: 'user' | 'agent_background' =
+          data.origin === 'agent_background' ? 'agent_background' : 'user';
+
         // Resolve the effective execution mode before compatibility deduplication.
         // The requested mode is part of task identity: otherwise an identical
         // prompt could silently reuse a task running across a different security
@@ -13780,6 +13798,7 @@ async function processTaskIpc(
           script_command: data.script_command ?? null,
           created_by: taskCreatedBy,
           notify_channels: null,
+          origin: taskOrigin,
         });
         if (dupExisting) {
           logger.info(
@@ -13827,10 +13846,18 @@ async function processTaskIpc(
           created_at: new Date().toISOString(),
           created_by: taskCreatedBy,
           notify_channels: null,
+          origin: taskOrigin,
         });
         notifyTaskSchedulerChanged();
         logger.info(
-          { taskId, sourceGroup, targetFolder, contextMode, execType },
+          {
+            taskId,
+            sourceGroup,
+            targetFolder,
+            contextMode,
+            execType,
+            origin: taskOrigin,
+          },
           'Task created via IPC',
         );
         writeTaskResult(tasksDir, 'schedule_task', data.requestId, {
@@ -14518,7 +14545,15 @@ async function processTaskIpc(
           const filteredTasks = allTasks.filter((t) =>
             ipcActorCanManageTask(t),
           );
-          const taskList = filteredTasks.map((t) => ({
+          // Optional provenance filter: rows written before the origin column
+          // existed are user-authored, so a missing value counts as 'user'.
+          const originFiltered =
+            data.origin === 'user' || data.origin === 'agent_background'
+              ? filteredTasks.filter(
+                  (t) => (t.origin ?? 'user') === data.origin,
+                )
+              : filteredTasks;
+          const taskList = originFiltered.map((t) => ({
             id: t.id,
             groupFolder: t.group_folder,
             prompt: t.prompt,
@@ -14528,6 +14563,7 @@ async function processTaskIpc(
             next_run: t.next_run,
             revision: t.revision,
             deleted_at: t.deleted_at,
+            origin: t.origin ?? 'user',
             current_run: getActiveTaskRunForTask(t.id) ?? null,
           }));
           const resultData = JSON.stringify({ success: true, tasks: taskList });

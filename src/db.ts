@@ -689,7 +689,8 @@ export function initDatabase(
       runner_id TEXT,
       revision INTEGER NOT NULL DEFAULT 1,
       updated_at TEXT NOT NULL DEFAULT '',
-      deleted_at TEXT
+      deleted_at TEXT,
+      origin TEXT NOT NULL DEFAULT 'user'
     );
     CREATE INDEX IF NOT EXISTS idx_next_run ON scheduled_tasks(next_run);
     CREATE INDEX IF NOT EXISTS idx_status ON scheduled_tasks(status);
@@ -1392,6 +1393,13 @@ export function initDatabase(
     'INTEGER NOT NULL DEFAULT 0',
   );
   ensureColumn('scheduled_tasks', 'created_by', 'TEXT');
+  // v75 -> v76: record where a task definition came from. `run_background_task`
+  // registers ephemeral due-now once runs that would otherwise be
+  // indistinguishable from user-authored schedules in /tasks and list_tasks;
+  // the stored origin lets both surfaces separate and aggregate them. Rows
+  // written before the column existed were all user/UI-authored, which is
+  // exactly the 'user' default.
+  ensureColumn('scheduled_tasks', 'origin', "TEXT NOT NULL DEFAULT 'user'");
   ensureColumn('scheduled_tasks', 'execution_type', "TEXT DEFAULT 'agent'");
   ensureColumn('scheduled_tasks', 'script_command', 'TEXT');
   ensureColumn('scheduled_tasks', 'notify_channels', 'TEXT');
@@ -1651,6 +1659,7 @@ export function initDatabase(
     'revision',
     'updated_at',
     'deleted_at',
+    'origin',
   ]);
   assertSchema(
     'registered_groups',
@@ -4724,8 +4733,8 @@ export function createTask(task: CreateTaskInput): void {
   const updatedAt = task.updated_at ?? task.created_at;
   db.prepare(
     `
-    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, execution_type, script_command, execution_mode, next_run, status, created_at, created_by, notify_channels, revision, updated_at, deleted_at, delivery_route_jid)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, execution_type, script_command, execution_mode, next_run, status, created_at, created_by, notify_channels, revision, updated_at, deleted_at, delivery_route_jid, origin)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `,
   ).run(
     task.id,
@@ -4751,6 +4760,7 @@ export function createTask(task: CreateTaskInput): void {
     // Fall back to chat_jid so a caller that has no concrete route still records
     // an explicit binding rather than leaving execution to re-derive one.
     task.delivery_route_jid ?? task.chat_jid,
+    task.origin ?? 'user',
   );
 }
 
@@ -4782,6 +4792,8 @@ function mapTaskRow(row: unknown): ScheduledTask {
   r.prompt = toUtf8String(r.prompt);
   if (r.script_command !== undefined)
     r.script_command = toUtf8StringOrNull(r.script_command);
+  // Rows written before the origin column existed were all user-authored.
+  if (r.origin !== 'agent_background') r.origin = 'user';
   return r as ScheduledTask;
 }
 
@@ -5037,6 +5049,12 @@ export type TaskPermanentDeleteMutationResult =
   | { status: 'active_run'; task: ScheduledTask; run: TaskRun }
   | { status: 'not_found'; task_id: string };
 
+export type TaskBatchSoftDeleteMutationResult =
+  | { status: 'deleted'; task_ids: string[] }
+  | { status: 'conflict'; task: ScheduledTask }
+  | { status: 'active_run'; task: ScheduledTask; run: TaskRun }
+  | { status: 'not_found'; task_id: string };
+
 /**
  * Optimistic mutation used by V2 REST/MCP callers. Legacy updateTask remains
  * available while all in-process clients migrate to this contract.
@@ -5231,6 +5249,65 @@ export function permanentlyDeleteTasksWithRevisions(
         if (result.changes !== 1) {
           throw new Error(
             `Failed to permanently delete task ${task.id} after validation`,
+          );
+        }
+      }
+
+      return {
+        status: 'deleted',
+        task_ids: currentTasks.map((task) => task.id),
+      };
+    })
+    .immediate();
+}
+
+/**
+ * Soft-delete a batch of live task definitions atomically. Built for bulk
+ * cleanup of finished agent-background registrations on /tasks, but valid for
+ * any deletable set. A stale revision, an already-deleted task, or an active
+ * run aborts the whole batch so a cleanup sweep cannot silently skip records.
+ */
+export function softDeleteTasksWithRevisions(
+  tasks: Array<{ id: string; expectedRevision: number }>,
+): TaskBatchSoftDeleteMutationResult {
+  return db
+    .transaction((): TaskBatchSoftDeleteMutationResult => {
+      const currentTasks: ScheduledTask[] = [];
+      for (const requested of tasks) {
+        const current = getTaskById(requested.id);
+        if (!current || current.deleted_at) {
+          return { status: 'not_found', task_id: requested.id };
+        }
+        if (current.revision !== requested.expectedRevision) {
+          return { status: 'conflict', task: current };
+        }
+        const activeRun = getActiveTaskRunForTask(requested.id);
+        if (activeRun) {
+          return { status: 'active_run', task: current, run: activeRun };
+        }
+        currentTasks.push(current);
+      }
+
+      const now = new Date().toISOString();
+      const softDelete = db.prepare(
+        `UPDATE scheduled_tasks
+         SET deleted_at = ?, status = 'paused', next_run = NULL,
+             revision = revision + 1, updated_at = ?
+         WHERE id = ? AND revision = ? AND deleted_at IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM task_runs
+             WHERE task_id = scheduled_tasks.id
+               AND status IN ('queued','running','retry_wait')
+           )`,
+      );
+      for (const task of currentTasks) {
+        const result = softDelete.run(now, now, task.id, task.revision);
+        if (result.changes !== 1) {
+          // Unreachable while the immediate transaction holds the write lock;
+          // throwing (not returning) keeps the batch all-or-nothing by
+          // rolling back any rows already updated.
+          throw new Error(
+            `Failed to soft-delete task ${task.id} after validation`,
           );
         }
       }
