@@ -377,6 +377,13 @@ PATCH 修改 `chat_jid` 时会同时更新任务的具体 `delivery_route_jid`�
 `list_tasks` MCP 工具以 `[background]` 标注并支持按 `origin` 过滤。来源参与任务
 执行指纹，不同来源的相同定义不会互相去重复用。
 
+Run 对象携带结构化进度快照字段：`progress_summary`、`progress_percent`、
+`progress_updated_at`，由隔离后台/定时运行内的 Agent 通过 `report_task_progress`
+MCP 工具上报（覆盖式，最新一次为准），仅在 Run 处于 `running` 状态时可更新；
+终态 Run 保留最后一次快照，重试产生的新 attempt 从空进度开始。运行归属只由
+IPC 命名空间推导，普通会话或伪造的 runId 无法写入任意 Run 的进度。设计背景见
+`docs/background-task-progress.md`。
+
 ## Skills、MCP 和 Plugins
 
 Skills：

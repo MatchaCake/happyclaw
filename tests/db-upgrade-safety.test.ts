@@ -151,7 +151,7 @@ describe('database upgrade safety gate', () => {
     process.env.HAPPYCLAW_MIGRATION_BACKUP_DIR = migrationBackups;
     const backupsBeforeCurrentOnlyRefusal = fs.readdirSync(migrationBackups);
     expect(() => db.initDatabase({ requireCurrentSchema: true })).toThrow(
-      'Database must already be schema v76',
+      'Database must already be schema v77',
     );
     expect(fs.readdirSync(migrationBackups)).toEqual(
       backupsBeforeCurrentOnlyRefusal,
@@ -190,10 +190,11 @@ describe('schema version head', () => {
     // one assertion that fails when the head moves, forcing whoever bumps it
     // to confirm the matching migration block — and a test covering it —
     // actually landed. Update the literal in the same commit as the migration.
-    // v76: records scheduled-task provenance (origin: user | agent_background)
-    // so /tasks and list_tasks can separate run_background_task registrations
-    // from user-authored schedules.
-    // Migration coverage: schema-v76-task-origin.test.ts.
-    expect(db.CURRENT_SCHEMA_VERSION).toBe(76);
+    // v77: adds overwrite-style progress snapshot columns to task_runs
+    // (progress_summary / progress_percent / progress_updated_at) so durable
+    // background/scheduled runs can surface live progress reported via the
+    // report_task_progress MCP tool.
+    // Migration coverage: schema-v77-task-run-progress.test.ts.
+    expect(db.CURRENT_SCHEMA_VERSION).toBe(77);
   });
 });

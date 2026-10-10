@@ -56,6 +56,19 @@ export function TaskCard({
       /^(queued|running|recovering|retry_wait|delivered)$/,
     );
 
+  const formatRelativeTime = (
+    iso: string | null | undefined,
+  ): string | null => {
+    if (!iso) return null;
+    const time = new Date(iso).getTime();
+    if (Number.isNaN(time)) return null;
+    const seconds = Math.max(0, Math.round((Date.now() - time) / 1000));
+    if (seconds < 60) return '刚刚';
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes} 分钟前`;
+    return `${Math.floor(minutes / 60)} 小时前`;
+  };
+
   const runStatusLabel = (run: TaskRun): string => {
     switch (run.status) {
       case 'queued':
@@ -220,6 +233,25 @@ export function TaskCard({
               {task.last_run_summary?.notification_status === 'uncertain' && (
                 <span className="ml-2 text-xs text-warning">送达待确认</span>
               )}
+              {/* Live progress snapshot reported by the running agent */}
+              {currentRun?.status === 'running' &&
+                currentRun.progress_summary && (
+                  <p
+                    className="mt-1.5 truncate text-xs text-muted-foreground"
+                    title={currentRun.progress_summary}
+                  >
+                    {currentRun.progress_percent != null
+                      ? `${currentRun.progress_percent}% · `
+                      : ''}
+                    {currentRun.progress_summary}
+                    {formatRelativeTime(currentRun.progress_updated_at) && (
+                      <span>
+                        {' '}
+                        · {formatRelativeTime(currentRun.progress_updated_at)}
+                      </span>
+                    )}
+                  </p>
+                )}
             </div>
           </div>
         </button>

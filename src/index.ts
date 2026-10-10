@@ -157,6 +157,7 @@ import {
   deleteRouterState,
   getTaskById,
   getTaskRunById,
+  updateTaskRunProgress,
   getActiveTaskRunForTask,
   finalizeDeliveredGroupTaskRun,
   recordGroupWorkspaceProjectionFailureAndFinalize,
@@ -12929,6 +12930,10 @@ async function processTaskIpc(
     queryRunId?: string;
     activationSequence?: number;
     scheduledTaskRunId?: string;
+    // For report_task_progress (run identity always comes from the verified
+    // IPC namespace, never from these payload fields).
+    summary?: string;
+    percent?: number;
     operation?: string;
     params?: Record<string, unknown>;
     // Workspace Memory v2. Workspace/actor/sourceType are never accepted from
@@ -14506,6 +14511,53 @@ async function processTaskIpc(
       writeTaskResult(tasksDir, 'list_task_runs', data.requestId, {
         success: true,
         runs: getMergedTaskRunHistory(task.id, limit),
+      });
+      break;
+    }
+
+    case 'report_task_progress': {
+      // Trust boundary: the durable run identity comes exclusively from the
+      // isolated IPC namespace (task-run-<uuid>-attempt-<n>) this request was
+      // read from. `durableTaskRunId` is non-null only after
+      // resolveScheduledTaskIpcRunId verified that the run exists, is
+      // isolated, and belongs to this workspace. Requiring it to equal the
+      // namespace-derived id additionally excludes the group-mode correlation
+      // path, so an ordinary conversation agent (or a forged payload runId)
+      // can never write progress onto an arbitrary occurrence.
+      const namespaceRunId = extractDurableTaskRunIdFromNamespace(ipcTaskId);
+      if (!namespaceRunId || durableTaskRunId !== namespaceRunId) {
+        writeTaskResult(tasksDir, 'report_task_progress', data.requestId, {
+          success: false,
+          error:
+            'Progress reporting is only available inside a background/scheduled task run.',
+        });
+        break;
+      }
+      const summary =
+        typeof data.summary === 'string' ? data.summary.trim() : '';
+      if (!summary) {
+        writeTaskResult(tasksDir, 'report_task_progress', data.requestId, {
+          success: false,
+          error: 'summary must be a non-empty string.',
+        });
+        break;
+      }
+      const percent =
+        typeof data.percent === 'number' &&
+        Number.isInteger(data.percent) &&
+        data.percent >= 0 &&
+        data.percent <= 100
+          ? data.percent
+          : null;
+      // updated=false means the run already left `running` (finished,
+      // cancelled, or re-leased); the stale snapshot is dropped silently.
+      const updated = updateTaskRunProgress(namespaceRunId, {
+        summary: summary.slice(0, 300),
+        percent,
+      });
+      writeTaskResult(tasksDir, 'report_task_progress', data.requestId, {
+        success: true,
+        updated,
       });
       break;
     }

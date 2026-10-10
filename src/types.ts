@@ -681,6 +681,16 @@ export interface TaskRun {
   notification_summary: TaskRunNotificationSummary | null;
   notification_attempt: number;
   notification_available_at: string | null;
+  /**
+   * Latest agent-reported progress snapshot (`report_task_progress` MCP tool,
+   * overwrite semantics). Only updated while the run is `running`; a terminal
+   * run keeps its last snapshot, a retried run starts with NULL.
+   */
+  progress_summary: string | null;
+  /** Optional 0-100 completion estimate accompanying `progress_summary`. */
+  progress_percent: number | null;
+  /** When the current progress snapshot was written (ISO timestamp). */
+  progress_updated_at: string | null;
 }
 
 export interface ClaimedTaskRun extends TaskRun {

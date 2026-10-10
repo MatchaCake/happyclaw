@@ -1444,6 +1444,15 @@ export function initDatabase(
     'notification_generation',
     'INTEGER NOT NULL DEFAULT 0',
   );
+  // v76 -> v77: structured progress reporting for durable background/scheduled
+  // runs. The isolated agent calls the `report_task_progress` MCP tool at
+  // milestones; the host overwrites this single snapshot (latest wins) so the
+  // /tasks poll loop can show live progress without an append-only events
+  // table or retention policy. NULL on legacy rows simply means "no progress
+  // was ever reported", which is accurate.
+  ensureColumn('task_runs', 'progress_summary', 'TEXT');
+  ensureColumn('task_runs', 'progress_percent', 'INTEGER');
+  ensureColumn('task_runs', 'progress_updated_at', 'TEXT');
   // Old rows predate updated_at; created_at is the least-surprising baseline.
   db.prepare(
     "UPDATE scheduled_tasks SET updated_at = created_at WHERE updated_at = '' OR updated_at IS NULL",
@@ -5495,6 +5504,9 @@ interface TaskRunRow {
   notification_lease_expires_at: string | null;
   notification_lease_payload: string | null;
   notification_generation: number;
+  progress_summary: string | null;
+  progress_percent: number | null;
+  progress_updated_at: string | null;
 }
 
 function taskDefinitionSnapshot(
@@ -5850,6 +5862,8 @@ export function claimNextTaskRun(
         `UPDATE task_runs
          SET status = 'running', lease_owner = ?, lease_token = ?,
              lease_expires_at = ?, attempt = attempt + 1,
+             progress_summary = NULL, progress_percent = NULL,
+             progress_updated_at = NULL,
              updated_at = ?
          WHERE id = ? AND (
            (status IN ('queued','retry_wait') AND available_at <= ?)
@@ -5999,11 +6013,37 @@ export function releaseTaskRunForRetry(
       `UPDATE task_runs
        SET status = 'retry_wait', available_at = ?, error = ?,
            attempt = ${attemptExpr},
+           progress_summary = NULL, progress_percent = NULL,
+           progress_updated_at = NULL,
            lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
        WHERE id = ? AND status = 'running' AND lease_owner = ?
          AND lease_token = ?`,
     )
     .run(availableAt, error, now, id, owner, token);
+  return result.changes === 1;
+}
+
+/**
+ * Overwrite the single live progress snapshot of a running occurrence. Guarded
+ * by `status = 'running'` so a report from a finished, cancelled, or
+ * retry-waiting run is dropped instead of resurrecting stale progress; the
+ * claim and retry-release paths additionally clear these columns so a new
+ * attempt never inherits the previous attempt's progress. Terminal runs keep
+ * their last snapshot untouched as the historical record.
+ */
+export function updateTaskRunProgress(
+  runId: string,
+  progress: { summary: string; percent?: number | null },
+): boolean {
+  const now = new Date().toISOString();
+  const result = db
+    .prepare(
+      `UPDATE task_runs
+       SET progress_summary = ?, progress_percent = ?,
+           progress_updated_at = ?, updated_at = ?
+       WHERE id = ? AND status = 'running'`,
+    )
+    .run(progress.summary, progress.percent ?? null, now, now, runId);
   return result.changes === 1;
 }
 

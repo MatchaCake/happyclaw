@@ -260,6 +260,73 @@ describe('scheduled-task MCP V2 contract', () => {
     expect(fs.existsSync(path.join(root, 'tasks'))).toBe(false);
   });
 
+  test('report_task_progress sends the trimmed snapshot over IPC', async () => {
+    const { root, tools } = setup();
+    const report = tools.find((tool) => tool.name === 'report_task_progress')!;
+    const pending = report.handler(
+      { summary: '  Crawled 40/120 pages  ', percent: 33 },
+      {} as never,
+    );
+    const request = await readRequest(root);
+    expect(request).toMatchObject({
+      type: 'report_task_progress',
+      summary: 'Crawled 40/120 pages',
+      percent: 33,
+    });
+    writeResult(root, 'report_task_progress', request.requestId as string, {
+      success: true,
+      updated: true,
+    });
+    const result = await pending;
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain('Progress recorded');
+  });
+
+  test('report_task_progress host rejection is informational, not a tool error', async () => {
+    const { root, tools } = setup();
+    const report = tools.find((tool) => tool.name === 'report_task_progress')!;
+    const pending = report.handler({ summary: 'phase 1 done' }, {} as never);
+    const request = await readRequest(root);
+    expect(request.percent).toBeUndefined();
+    writeResult(root, 'report_task_progress', request.requestId as string, {
+      success: false,
+      error:
+        'Progress reporting is only available inside a background/scheduled task run.',
+    });
+    const result = await pending;
+    // Progress is best-effort telemetry: a host-side rejection must not fail
+    // the agent's turn.
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0].text).toContain('Progress not recorded');
+
+    // Consume the first request file so the next readRequest sees only the
+    // second report.
+    const tasksDir = path.join(root, 'tasks');
+    for (const name of fs.readdirSync(tasksDir)) {
+      if (!name.includes('_result_')) fs.unlinkSync(path.join(tasksDir, name));
+    }
+
+    const stale = report.handler({ summary: 'phase 2 done' }, {} as never);
+    const staleRequest = await readRequest(root);
+    writeResult(
+      root,
+      'report_task_progress',
+      staleRequest.requestId as string,
+      { success: true, updated: false },
+    );
+    const staleResult = await stale;
+    expect(staleResult.isError).toBeUndefined();
+    expect(staleResult.content[0].text).toContain('no longer running');
+  });
+
+  test('report_task_progress rejects a blank summary before touching IPC', async () => {
+    const { root, tools } = setup();
+    const report = tools.find((tool) => tool.name === 'report_task_progress')!;
+    const rejected = await report.handler({ summary: '   ' }, {} as never);
+    expect(rejected).toMatchObject({ isError: true });
+    expect(fs.existsSync(path.join(root, 'tasks'))).toBe(false);
+  });
+
   test('run-now timeout exposes the generated idempotency key for safe retry', async () => {
     vi.useFakeTimers();
     const { root, tools } = setup();

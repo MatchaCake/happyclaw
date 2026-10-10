@@ -906,9 +906,39 @@ export function TaskDetail({ task }: TaskDetailProps) {
                       ) : ['queued', 'running', 'recovering'].includes(
                           log.status,
                         ) ? (
-                        <span className="text-muted-foreground">
-                          {log.status === 'queued' ? '排队中...' : '执行中...'}
-                        </span>
+                        (() => {
+                          // Live progress snapshot: prefer the merged-history
+                          // row; fall back to current_run (the /tasks poll
+                          // refreshes it more often than the logs).
+                          const progressSource =
+                            log.status === 'running'
+                              ? log.progress_summary
+                                ? log
+                                : String(task.current_run?.id ?? '') ===
+                                      String(log.id) &&
+                                    task.current_run?.progress_summary
+                                  ? task.current_run
+                                  : null
+                              : null;
+                          return (
+                            <span className="text-muted-foreground">
+                              {log.status === 'queued'
+                                ? '排队中...'
+                                : '执行中...'}
+                              {progressSource?.progress_summary && (
+                                <span
+                                  className="mt-0.5 block max-w-xs truncate"
+                                  title={progressSource.progress_summary}
+                                >
+                                  {progressSource.progress_percent != null
+                                    ? `${progressSource.progress_percent}% · `
+                                    : ''}
+                                  {progressSource.progress_summary}
+                                </span>
+                              )}
+                            </span>
+                          );
+                        })()
                       ) : (
                         ''
                       )}

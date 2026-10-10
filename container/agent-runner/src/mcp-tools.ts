@@ -2200,6 +2200,97 @@ the background session does not see this conversation's history.`,
       },
     ),
 
+    // --- report_task_progress ---
+    tool(
+      'report_task_progress',
+      `Report structured progress for the CURRENT durable background/scheduled task run.
+
+Only meaningful when you are executing inside a background task (started via
+run_background_task) or an isolated scheduled run; in an ordinary conversation
+the host rejects the report and nothing is recorded. Call it at meaningful
+milestones (finished a phase, collected N of M items), NOT after every small
+step. Each call OVERWRITES the previous snapshot — the latest summary/percent
+is what users see on the /tasks page while the run is live, and the final
+snapshot is kept with the run history after it ends.`,
+      {
+        summary: z
+          .string()
+          .min(1)
+          .max(300)
+          .describe(
+            'Short human-readable progress line (1-300 chars), e.g. "Crawled 40/120 pages, summarizing section 3".',
+          ),
+        percent: z
+          .number()
+          .int()
+          .min(0)
+          .max(100)
+          .optional()
+          .describe('Optional overall completion estimate, integer 0-100.'),
+      },
+      async (args) => {
+        const summary = args.summary.trim();
+        if (!summary) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: 'report_task_progress requires a non-empty summary.',
+              },
+            ],
+            isError: true,
+          };
+        }
+        const requestId = newRequestId();
+        try {
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            {
+              type: 'report_task_progress',
+              requestId,
+              summary,
+              ...(args.percent !== undefined ? { percent: args.percent } : {}),
+              timestamp: new Date().toISOString(),
+            },
+            'report_task_progress_result',
+          );
+          // Host-side rejections (not a background run, run already finished)
+          // are informational: progress is best-effort telemetry and must not
+          // fail the agent's actual work.
+          if (!result.success) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Progress not recorded: ${result.error || 'Unknown error'} Continue with the task.`,
+                },
+              ],
+            };
+          }
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text:
+                  result.updated === false
+                    ? 'Progress not recorded (the run is no longer running). Continue with the task.'
+                    : `Progress recorded${args.percent !== undefined ? ` (${args.percent}%)` : ''}.`,
+              },
+            ],
+          };
+        } catch {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: 'Timeout reporting progress; it may or may not have been recorded. Do not retry immediately — continue with the task.',
+              },
+            ],
+          };
+        }
+      },
+    ),
+
     // --- register_group ---
     tool(
       'register_group',
