@@ -81,6 +81,7 @@ import {
 } from './workspace-memory-context.js';
 import { loadHappyClawOwnerProfileTurnContext } from './owner-profile-context.js';
 import { createWorkspaceMemoryWriteGuard } from './workspace-memory-runtime.js';
+import { createDurableTaskDispatchGuard } from './durable-task-dispatch-guard.js';
 import {
   parseAgentMcpPolicyMode,
   resolveAgentMcpPolicy,
@@ -2860,7 +2861,10 @@ async function runQueryAttempt(
       hooks: {
         PreToolUse: [
           {
-            hooks: [createWorkspaceMemoryWriteGuard()],
+            hooks: [
+              createWorkspaceMemoryWriteGuard(),
+              createDurableTaskDispatchGuard(),
+            ],
           },
         ],
         PreCompact: [
