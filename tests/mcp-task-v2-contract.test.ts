@@ -200,6 +200,63 @@ describe('scheduled-task MCP V2 contract', () => {
     });
   });
 
+  test('run_background_task registers a due-now once/isolated agent run', async () => {
+    const { root, tools } = setup();
+    expect(tools.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining(['run_background_task']),
+    );
+    const runBackground = tools.find(
+      (tool) => tool.name === 'run_background_task',
+    )!;
+    const pending = runBackground.handler(
+      { prompt: 'crawl the docs site and summarize every page' },
+      {} as never,
+    );
+    const request = await readRequest(root);
+
+    expect(request).toMatchObject({
+      type: 'schedule_task',
+      schedule_type: 'once',
+      context_mode: 'isolated',
+      execution_type: 'agent',
+      prompt: 'crawl the docs site and summarize every page',
+    });
+    // schedule_value is a local wall-clock string (no Z/offset) so the host
+    // parses it in its own timezone and the once run is due immediately.
+    expect(String(request.schedule_value)).toMatch(
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/,
+    );
+
+    writeResult(root, 'schedule_task', request.requestId as string, {
+      success: true,
+      taskId: 'bg-run-1',
+      nextRun: '2026-08-01T01:00:00.000Z',
+    });
+    await expect(pending).resolves.toMatchObject({
+      content: [
+        expect.objectContaining({ text: expect.stringContaining('bg-run-1') }),
+      ],
+      structuredContent: {
+        success: true,
+        task_id: 'bg-run-1',
+        duplicate: false,
+      },
+    });
+  });
+
+  test('run_background_task rejects an empty prompt before touching IPC', async () => {
+    const { root, tools } = setup();
+    const runBackground = tools.find(
+      (tool) => tool.name === 'run_background_task',
+    )!;
+    const rejected = await runBackground.handler(
+      { prompt: '   ' },
+      {} as never,
+    );
+    expect(rejected).toMatchObject({ isError: true });
+    expect(fs.existsSync(path.join(root, 'tasks'))).toBe(false);
+  });
+
   test('run-now timeout exposes the generated idempotency key for safe retry', async () => {
     vi.useFakeTimers();
     const { root, tools } = setup();
